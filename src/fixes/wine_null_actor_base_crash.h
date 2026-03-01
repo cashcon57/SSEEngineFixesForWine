@@ -17,7 +17,7 @@
 // Fix: hook the CALL to 37791 from 36630, skip when PlayerCharacter has
 // no parentCell. Also keep lower-level guards as safety nets.
 //
-// 36630+0xD7 is return from 37791, CALL at 36630+0xD2.
+// 36630+0xD7 is return from 37791, FF 15 indirect CALL at 36630+0xD1 (6 bytes).
 // 37791 returns void (caller reads a global after the return).
 
 namespace Fixes::WineNullActorBaseCrash
@@ -68,10 +68,10 @@ namespace Fixes::WineNullActorBaseCrash
     {
 #ifdef SKYRIM_AE
         // Primary: skip entire function 37791 when player has no cell
-        // CALL at 36630+0xD2 (return at 36630+0xD7)
+        // FF 15 indirect CALL at 36630+0xD1 (6 bytes: FF 15 xx xx xx xx)
         {
-            REL::Relocation target{ REL::ID(36630), 0xD2 };
-            detail::_original37791 = target.write_call<5>(detail::Hook37791);
+            REL::Relocation target{ REL::ID(36630), 0xD1 };
+            detail::_original37791 = target.write_call<6>(detail::Hook37791);
             logger::info("installed Wine null parentcell fix (skip 37791)"sv);
         }
 
