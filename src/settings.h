@@ -49,6 +49,7 @@ namespace Settings
         static REX::TOML::Bool bTreeReflections("Fixes", "bTreeReflections", true);
         static REX::TOML::Bool bVerticalLookSensitivity("Fixes", "bVerticalLookSensitivity", true);
         static REX::TOML::Bool bWeaponBlockScaling("Fixes", "bWeaponBlockScaling", true);
+        static REX::TOML::Bool bWineNullActorBaseCrash("Fixes", "bWineNullActorBaseCrash", true);
     }
 
     namespace Patches

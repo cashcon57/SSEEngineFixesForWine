@@ -36,6 +36,7 @@
 #include "torch_landscape.h"
 #include "vertical_look_sensitivity.h"
 #include "weapon_block_scaling.h"
+#include "wine_null_actor_base_crash.h"
 
 namespace Fixes
 {
@@ -148,5 +149,8 @@ namespace Fixes
 
         if (Settings::Fixes::bWeaponBlockScaling.GetValue())
             WeaponBlockScaling::Install();
+
+        if (Settings::Fixes::bWineNullActorBaseCrash.GetValue())
+            WineNullActorBaseCrash::Install();
     }
 }
