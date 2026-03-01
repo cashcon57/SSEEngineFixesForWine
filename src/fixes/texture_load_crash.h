@@ -44,7 +44,7 @@ namespace Fixes::TextureLoadCrash
                     logger::warn("texture load failed with unknown result code {:X} - file path {}"sv, static_cast<std::uint32_t>(result), string.c_str());
                 }
             } else {
-                texture->unk20 = 1;
+                texture->refCount = 1;
                 a_texture->rendererTexture = texture;
             }
             BSResourceNiBinaryStream_dtor(stream);
