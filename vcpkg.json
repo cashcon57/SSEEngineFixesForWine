@@ -1,0 +1,16 @@
+{
+  "name": "sse-engine-fixes-for-wine",
+  "version-string": "1.0.0",
+  "description": "SSE Engine Fixes for Wine — Wine/Proton/CrossOver-compatible fork of SSE Engine Fixes",
+  "homepage": "https://github.com/corkscrewmodding/SSEEngineFixesForWine",
+  "license": "MIT",
+  "dependencies": [
+    "rsm-binary-io",
+    "spdlog",
+    "xbyak",
+    "simpleini",
+    "toml11",
+    "safetyhook"
+  ],
+  "builtin-baseline": "4bb07a326d9b9bce3703272a509e5bc25dd9cfd5"
+}

@@ -1,0 +1,144 @@
+# SSE Engine Fixes for Wine — Configuration
+# Wine/Proton/CrossOver-compatible fork of SSE Engine Fixes by aers
+# https://github.com/corkscrewmodding/SSEEngineFixesForWine
+#
+# Override any setting by creating SSEEngineFixesForWineCustom.toml
+# in the same directory — it will take priority over this file.
+
+[General]
+# Enable verbose (trace-level) logging
+bVerboseLogging = false
+# Clean orphaned SKSE co-save files on game load
+bCleanSKSECoSaves = false
+
+[Fixes]
+# Fix downward aiming with bows
+bArcheryDownwardAiming = true
+# Fix crash from animation loading with signed values
+bAnimationLoadSignedCrash = true
+# Fix crash related to Bethesda.net integration
+bBethesdaNetCrash = true
+# Fix crash when loading BGSKeyword forms
+bBGSKeywordFormLoadCrash = true
+# Fix BSLighting ambient specular calculation
+bBSLightingAmbientSpecular = true
+# Fix BSLightingShader force alpha test issue
+bBSLightingShaderForceAlphaTest = true
+# Fix BSLightingShader parallax rendering bug
+bBSLightingShaderParallaxBug = true
+# Fix BSLightingShaderProperty shadow map issue
+bBSLightingShaderPropertyShadowMap = true
+# Fix BSTempEffect NiRTTI type info
+bBSTempEffectNiRTTI = true
+# Fix calendar day-skipping bug
+bCalendarSkipping = true
+# Fix cell initialization issue
+bCellInit = true
+# Fix climate data loading bug
+bClimateLoad = true
+# Fix conjuration enchantment absorb interaction
+bConjurationEnchantAbsorbs = true
+# Fix null pointer crash when creating armor nodes
+bCreateArmorNodeNullPtrCrash = true
+# Fix perks being applied twice
+bDoublePerkApply = true
+# Fix shout equip event spam
+bEquipShoutEventSpam = true
+# Fix ESL flagged CELL record loading bug
+bESLCELLLoadBug = true
+# Fix null pointer crash in FaceGen morph data
+bFaceGenMorphDataHeadNullPtrCrash = true
+# Fix GetKeywordItemCount condition function
+bGetKeywordItemCount = true
+# Fix GHeap leak detection crash
+bGHeapLeakDetectionCrash = true
+# Fix global time multiplier issue
+bGlobalTime = true
+# Fix null pointer crash in hit data initialization
+bInitializeHitDataNullPtrCrash = true
+# Fix lip sync timing
+bLipSync = true
+# Fix various memory access errors
+bMemoryAccessErrors = true
+# Fix MO5S typo in engine code
+bMO5STypo = true
+# Fix music track overlap
+bMusicOverlap = true
+# Fix NiTimeController with no target
+bNiControllerNoTarget = true
+# Fix null process crash
+bNullProcessCrash = true
+# Fix perk fragment IsRunning check
+bPerkFragmentIsRunning = true
+# Fix precomputed navmesh path issues
+bPrecomputedPaths = true
+# Fix removed spell book crash
+bRemovedSpellBook = true
+# Fix save game screenshot capture
+bSaveScreenshots = true
+# Fix saved Havok data load initialization
+bSavedHavokDataLoadInit = true
+# Fix null pointer crash in ShadowSceneNode
+bShadowSceneNodeNullPtrCrash = true
+# Fix texture loading crash
+bTextureLoadCrash = true
+# Fix torch landscape lighting
+bTorchLandscape = true
+# Fix tree water reflections
+bTreeReflections = true
+# Fix vertical look sensitivity being halved
+bVerticalLookSensitivity = true
+# Fix weapon block scaling calculation
+bWeaponBlockScaling = true
+
+[Patches]
+# Disable character generation precaching (may improve load times)
+bDisableChargenPrecache = false
+# Disable snow shader flag on materials
+bDisableSnowFlag = false
+# Enable achievements even with mods installed
+bEnableAchievementsWithMods = true
+# Cache form lookups for faster loading (Wine-safe sharded implementation)
+bFormCaching = true
+# Expand INI setting collection capacity
+bINISettingCollection = true
+# Increase CRT max open file handles (less critical under Wine)
+bMaxStdIO = true
+# Make quicksaves behave like regular saves
+bRegularQuicksaves = false
+# Clean exit without hanging
+bSafeExit = true
+# Preserve added sound categories across saves
+bSaveAddedSoundCategories = true
+# Maximum save game file size in MB
+iSaveGameMaxSize = 128
+# Prevent scroll wheel from switching 1st/3rd person
+bScrollingDoesntSwitchPOV = false
+# Multiplier for sleep/wait time passage (1.0 = default)
+fSleepWaitTimeModifier = 1.0
+# Cache tree LOD references for faster rendering
+bTreeLodReferenceCaching = true
+# Enable waterflow animation
+bWaterflowAnimation = true
+# Waterflow animation speed
+fWaterflowSpeed = 20.0
+
+# Note: [MemoryManager] is intentionally omitted.
+# The TBB allocator replacement used by the original SSE Engine Fixes
+# is incompatible with Wine/CrossOver/Proton.
+
+[Warnings]
+# Warn when texture loading fails
+bTextureLoadFailed = true
+# Warn when precomputed paths have errors
+bPrecomputedPathHasErrors = true
+# Warn when approaching reference handle limit
+bRefHandleLimit = true
+# Reference handle warning threshold at main menu
+bRefrMainMenuLimit = 800000
+# Reference handle warning threshold in loaded game
+bRefrLoadedGameLimit = 1000000
+
+[Debug]
+# Print detailed precomputed path information
+bPrintDetailedPrecomputedPathInfo = false

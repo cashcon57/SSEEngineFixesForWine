@@ -1,0 +1,109 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  BUILD_TYPE: Release
+  VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/vcpkg-cache
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    strategy:
+      matrix:
+        include:
+          - preset: AE
+            define: -DBUILD_SKYRIMAE=ON
+            suffix: AE-1.6.1170
+          - preset: SE
+            define: -DBUILD_SKYRIMAE=OFF
+            suffix: SE-1.5.97
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: '4bb07a326d9b9bce3703272a509e5bc25dd9cfd5'
+
+      - name: Create vcpkg binary cache directory
+        run: mkdir -p "${{ env.VCPKG_DEFAULT_BINARY_CACHE }}"
+        shell: bash
+
+      - name: Cache vcpkg packages
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
+          key: vcpkg-${{ matrix.preset }}-${{ hashFiles('vcpkg.json') }}
+          restore-keys: vcpkg-${{ matrix.preset }}-
+
+      - name: Configure CMake
+        run: >
+          cmake -B build
+          -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
+          -DVCPKG_TARGET_TRIPLET=x64-windows-static
+          -DCMAKE_TOOLCHAIN_FILE=${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake
+          -DCOPY_BUILD=OFF
+          ${{ matrix.define }}
+
+      - name: Build
+        run: cmake --build build --config ${{ env.BUILD_TYPE }}
+
+      - name: Package
+        run: |
+          mkdir -p artifact/SKSE/Plugins
+          cp build/${{ env.BUILD_TYPE }}/SSEEngineFixesForWine.dll artifact/SKSE/Plugins/
+          if (Test-Path "build/${{ env.BUILD_TYPE }}/SSEEngineFixesForWine.pdb") {
+            cp build/${{ env.BUILD_TYPE }}/SSEEngineFixesForWine.pdb artifact/SKSE/Plugins/
+          }
+          cp SSEEngineFixesForWine.toml artifact/SKSE/Plugins/
+        shell: pwsh
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SSEEngineFixesForWine-${{ matrix.suffix }}
+          path: artifact/
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download AE artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: SSEEngineFixesForWine-AE-1.6.1170
+          path: SSEEngineFixesForWine-AE
+
+      - name: Download SE artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: SSEEngineFixesForWine-SE-1.5.97
+          path: SSEEngineFixesForWine-SE
+
+      - name: Create archives
+        run: |
+          cd SSEEngineFixesForWine-AE && zip -r ../SSEEngineFixesForWine-AE-1.6.1170.zip . && cd ..
+          cd SSEEngineFixesForWine-SE && zip -r ../SSEEngineFixesForWine-SE-1.5.97.zip . && cd ..
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            SSEEngineFixesForWine-AE-1.6.1170.zip
+            SSEEngineFixesForWine-SE-1.5.97.zip
+          generate_release_notes: true

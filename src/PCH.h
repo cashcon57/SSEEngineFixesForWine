@@ -1,0 +1,76 @@
+#pragma once
+
+#include <string_view>
+
+#include <RE/Skyrim.h>
+#include <REX/REX/INI.h>
+#include <REX/REX/TOML.h>
+#include <REX/W32/OLE32.h>
+#include <REX/W32/SHELL32.h>
+#include <SKSE/SKSE.h>
+
+#define WIN32_LEAN_AND_MEAN
+
+#define NOGDICAPMASKS
+#define NOVIRTUALKEYCODES
+// define NOWINMESSAGES
+#define NOWINSTYLES
+#define NOSYSMETRICS
+#define NOMENUS
+#define NOICONS
+#define NOKEYSTATES
+#define NOSYSCOMMANDS
+#define NORASTEROPS
+#define NOSHOWWINDOW
+#define OEMRESOURCE
+#define NOATOM
+#define NOCLIPBOARD
+#define NOCOLOR
+// #define NOCTLMGR
+#define NODRAWTEXT
+#define NOGDI
+#define NOKERNEL
+// #define NOUSER
+// #define NONLS
+// #define NOMB
+#define NOMEMMGR
+#define NOMETAFILE
+#define NOMINMAX
+// #define NOMSG
+#define NOOPENFILE
+#define NOSCROLL
+#define NOSERVICE
+#define NOSOUND
+#define NOTEXTMETRIC
+#define NOWH
+#define NOWINOFFSETS
+#define NOCOMM
+#define NOKANJI
+#define NOHELP
+#define NOPROFILER
+#define NODEFERWINDOWPOS
+#define NOMCX
+
+#include "windows.h"
+
+#include <ShlObj.h>
+
+#include <shared_mutex>
+#include <unordered_map>
+
+#include <safetyhook.hpp>
+#include <xbyak/xbyak.h>
+
+namespace logger = SKSE::log;
+
+using namespace std::literals;
+
+#include "settings.h"
+
+#include "Version.h"
+
+#ifdef SKYRIM_AE
+#    define VAR_NUM(se, ae) ae
+#else
+#    define VAR_NUM(se, ae) se
+#endif

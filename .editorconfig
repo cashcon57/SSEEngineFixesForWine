@@ -1,0 +1,10 @@
+[*]
+charset = utf-8
+
+[*.{cmake,h,hpp,hxx,c,cpp,cxx}]
+indent_style = space
+indent_size = 4
+
+[*.{json,yml}]
+indent_style = space
+indent_size = 2
