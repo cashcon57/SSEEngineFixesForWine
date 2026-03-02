@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "form_caching.h"
+#include "max_stdio.h"
 #include "memory_manager.h"
 #include "../settings.h"
 
@@ -939,6 +940,12 @@ namespace Patches::EditorIdCache
                     REL::Relocation<void**> tdhReloc{ RELOCATION_ID(514141, 400269) };
                     auto rawPtr = *reinterpret_cast<const std::uintptr_t*>(tdhReloc.address());
                     logger::info("  TDH: null (raw ptr at reloc: 0x{:X})", rawPtr);
+                }
+
+                // CRT stdio limit check
+                if (Patches::MaxStdIO::g_getmaxstdio) {
+                    auto maxStdio = Patches::MaxStdIO::g_getmaxstdio();
+                    logger::info("  maxStdio: {}", maxStdio);
                 }
 
                 // Memory allocator stats (if active)
