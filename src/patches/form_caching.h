@@ -45,6 +45,11 @@ namespace Patches::FormCaching
         inline std::atomic<std::uint64_t> g_openTESSuccesses{ 0 };
         inline std::atomic<std::uint64_t> g_addCompileIndexCalls{ 0 };
         inline std::atomic<std::uint64_t> g_seekNextFormCalls{ 0 };
+        inline std::atomic<std::uint64_t> g_closeTESCalls{ 0 };
+        inline std::atomic<std::uint64_t> g_seekNextSubrecordCalls{ 0 };
+        inline std::atomic<std::uint64_t> g_readDataCalls{ 0 };
+        inline std::atomic<std::uint64_t> g_readDataBytes{ 0 };
+        inline std::atomic<bool> g_seekNextFormReturnedFalse{ false };
 
         struct ShardedCache
         {
@@ -290,6 +295,48 @@ namespace Patches::FormCaching
             return g_hk_SeekNextForm.call<bool>(a_self, a_skipIgnored);
         }
 
+        // ================================================================
+        // v1.22.3: Hook TESFile::CloseTES — detect if files are closed
+        // after catalog scan (would indicate catalog is a separate pass)
+        // ================================================================
+        inline SafetyHookInline g_hk_CloseTES;
+
+        inline void TESFile_CloseTES(RE::TESFile* a_self, bool a_force)
+        {
+            auto count = g_closeTESCalls.fetch_add(1, std::memory_order_relaxed);
+            if (count < 5 || (count > 0 && count % 1000 == 0)) {
+                logger::info("  CloseTES #{}: file='{}' force={}",
+                    count + 1, a_self ? a_self->fileName : "null", a_force);
+            }
+            g_hk_CloseTES.call(a_self, a_force);
+        }
+
+        // ================================================================
+        // v1.22.3: Hook TESFile::SeekNextSubrecord — counts subrecord
+        // iteration. The loading pass reads subrecords within each form.
+        // A high count means the game is reading form data, not just headers.
+        // ================================================================
+        inline SafetyHookInline g_hk_SeekNextSubrecord;
+
+        inline bool TESFile_SeekNextSubrecord(RE::TESFile* a_self)
+        {
+            g_seekNextSubrecordCalls.fetch_add(1, std::memory_order_relaxed);
+            return g_hk_SeekNextSubrecord.call<bool>(a_self);
+        }
+
+        // ================================================================
+        // v1.22.3: Hook TESFile::ReadData — counts bytes read from files.
+        // Shows total I/O volume (header-only = small, full load = huge).
+        // ================================================================
+        inline SafetyHookInline g_hk_ReadData;
+
+        inline bool TESFile_ReadData(RE::TESFile* a_self, void* a_buf, std::uint32_t a_inLength)
+        {
+            g_readDataCalls.fetch_add(1, std::memory_order_relaxed);
+            g_readDataBytes.fetch_add(a_inLength, std::memory_order_relaxed);
+            return g_hk_ReadData.call<bool>(a_self, a_buf, a_inLength);
+        }
+
         inline void ReplaceFormMapFunctions()
         {
             const REL::Relocation getForm{ RELOCATION_ID(14461, 14617) };
@@ -356,10 +403,26 @@ namespace Patches::FormCaching
             logger::info("form caching: SeekNextForm hook at 0x{:X} (offset 0x{:X})"sv,
                 SeekNextForm.address(), SeekNextForm.address() - REL::Module::get().base());
 
+            // v1.22.3: Hook CloseTES to detect file close after catalog
+            const REL::Relocation CloseTES{ RELOCATION_ID(13857, 13933) };
+            g_hk_CloseTES = safetyhook::create_inline(CloseTES.address(), TESFile_CloseTES);
+            logger::info("form caching: CloseTES hook at 0x{:X} (offset 0x{:X})"sv,
+                CloseTES.address(), CloseTES.address() - REL::Module::get().base());
+
+            // v1.22.3: Hook SeekNextSubrecord to count subrecord reads
+            const REL::Relocation SeekNextSubrecord{ RELOCATION_ID(13903, 13990) };
+            g_hk_SeekNextSubrecord = safetyhook::create_inline(SeekNextSubrecord.address(), TESFile_SeekNextSubrecord);
+            logger::info("form caching: SeekNextSubrecord hook at 0x{:X}"sv, SeekNextSubrecord.address());
+
+            // v1.22.3: Hook ReadData to count bytes read
+            const REL::Relocation ReadData{ RELOCATION_ID(13904, 13991) };
+            g_hk_ReadData = safetyhook::create_inline(ReadData.address(), TESFile_ReadData);
+            logger::info("form caching: ReadData hook at 0x{:X}"sv, ReadData.address());
+
             // Log all hook addresses for verification
-            logger::info("form caching: hook summary — GetForm=0x{:X} AddForm=0x{:X} OpenTES=0x{:X} AddCompileIdx=0x{:X} SeekNextForm=0x{:X}"sv,
+            logger::info("form caching: hook summary — GetForm=0x{:X} AddForm=0x{:X} OpenTES=0x{:X} AddCompileIdx=0x{:X} SeekNextForm=0x{:X} CloseTES=0x{:X}"sv,
                 getForm.address(), AddForm.address(), OpenTES.address(),
-                AddCompileIndex.address(), SeekNextForm.address());
+                AddCompileIndex.address(), SeekNextForm.address(), CloseTES.address());
         }
     }
 

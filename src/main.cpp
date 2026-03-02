@@ -189,9 +189,11 @@ extern "C" __declspec(dllexport) bool SKSEAPI SKSEPlugin_Load(const SKSE::LoadIn
     Patches::Install();
     Fixes::Install();
 
-    // v1.22.0: Start loading monitor — logs pipeline state every 5 seconds
-    // until kDataLoaded fires. This gives us a timeline of what happens during
-    // the ~51 second loading period.
+    // v1.22.3: Verify plugins.txt is readable from within the game process
+    Patches::EditorIdCache::VerifyPluginsTxt();
+
+    // v1.22.0: Start loading monitor — logs pipeline state every 2 seconds
+    // (switches to 200ms after TDH appears) until kDataLoaded fires.
     Patches::EditorIdCache::LoadingMonitor::Start();
 
     const auto messaging = SKSE::GetMessagingInterface();

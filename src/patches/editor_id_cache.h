@@ -5,6 +5,7 @@
 #include <atomic>
 #include <chrono>
 #include <shared_mutex>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -726,6 +727,126 @@ namespace Patches::EditorIdCache
     }
 
     // ================================================================
+    // v1.22.3: Verify plugins.txt is readable from within the game process
+    // Uses Win32 APIs (same path resolution the game would use) to read
+    // and parse plugins.txt, logging the result for diagnostics.
+    // ================================================================
+    inline void VerifyPluginsTxt()
+    {
+        logger::info("=== PLUGINS.TXT VERIFICATION ==="sv);
+
+        // Get %LOCALAPPDATA% path (same as the game uses)
+        WCHAR localAppData[MAX_PATH] = {};
+        HRESULT hr = SHGetFolderPathW(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, localAppData);
+        if (hr != S_OK) {
+            logger::error("  SHGetFolderPathW(CSIDL_LOCAL_APPDATA) failed: hr=0x{:X}", static_cast<unsigned>(hr));
+            return;
+        }
+
+        // Log the resolved path
+        char pathNarrow[MAX_PATH * 2] = {};
+        WideCharToMultiByte(CP_UTF8, 0, localAppData, -1, pathNarrow, sizeof(pathNarrow), NULL, NULL);
+        logger::info("  LOCALAPPDATA = '{}'", pathNarrow);
+
+        std::wstring path = localAppData;
+        path += L"\\Skyrim Special Edition\\Plugins.txt";
+
+        char pathNarrow2[MAX_PATH * 2] = {};
+        WideCharToMultiByte(CP_UTF8, 0, path.c_str(), -1, pathNarrow2, sizeof(pathNarrow2), NULL, NULL);
+        logger::info("  plugins.txt path = '{}'", pathNarrow2);
+
+        // Open the file using Win32 API (same as the game would)
+        HANDLE hFile = CreateFileW(path.c_str(), GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+
+        if (hFile == INVALID_HANDLE_VALUE) {
+            DWORD err = GetLastError();
+            logger::error("  CreateFileW FAILED: error={} ({})",
+                err, err == 2 ? "FILE_NOT_FOUND" :
+                     err == 3 ? "PATH_NOT_FOUND" :
+                     err == 5 ? "ACCESS_DENIED" : "other");
+            return;
+        }
+
+        DWORD fileSize = GetFileSize(hFile, NULL);
+        logger::info("  file size: {} bytes", fileSize);
+
+        if (fileSize == 0 || fileSize > 10 * 1024 * 1024) {
+            logger::error("  file size abnormal, skipping read");
+            CloseHandle(hFile);
+            return;
+        }
+
+        // Read entire file
+        std::vector<char> buf(fileSize + 1, 0);
+        DWORD bytesRead = 0;
+        if (!ReadFile(hFile, buf.data(), fileSize, &bytesRead, NULL)) {
+            DWORD err = GetLastError();
+            logger::error("  ReadFile FAILED: error={}", err);
+            CloseHandle(hFile);
+            return;
+        }
+        CloseHandle(hFile);
+        logger::info("  read {} bytes successfully", bytesRead);
+
+        // Analyze content
+        std::string content(buf.data(), bytesRead);
+
+        // Check line endings
+        bool hasCR = content.find('\r') != std::string::npos;
+        bool hasLF = content.find('\n') != std::string::npos;
+        logger::info("  line endings: CR={} LF={} ({})",
+            hasCR, hasLF,
+            hasCR && hasLF ? "CRLF" : (hasLF ? "LF only" : (hasCR ? "CR only" : "none")));
+
+        // Parse lines
+        std::istringstream stream(content);
+        std::string line;
+        std::size_t totalLines = 0;
+        std::size_t enabledCount = 0;
+        std::size_t disabledCount = 0;
+        std::size_t commentCount = 0;
+        std::size_t emptyCount = 0;
+        std::string firstEnabled, lastEnabled;
+
+        while (std::getline(stream, line)) {
+            // Strip \r if present (handles both LF and CRLF)
+            if (!line.empty() && line.back() == '\r')
+                line.pop_back();
+
+            ++totalLines;
+
+            if (line.empty()) { ++emptyCount; continue; }
+            if (line[0] == '#') { ++commentCount; continue; }
+
+            if (line[0] == '*') {
+                ++enabledCount;
+                std::string name = line.substr(1);
+                if (firstEnabled.empty()) firstEnabled = name;
+                lastEnabled = name;
+            } else {
+                ++disabledCount;
+            }
+        }
+
+        logger::info("  parsed: {} lines, {} enabled, {} disabled, {} comments, {} empty",
+            totalLines, enabledCount, disabledCount, commentCount, emptyCount);
+
+        if (!firstEnabled.empty())
+            logger::info("  first enabled: '{}'", firstEnabled);
+        if (!lastEnabled.empty())
+            logger::info("  last enabled: '{}'", lastEnabled);
+
+        if (enabledCount == 0)
+            logger::error("  >>> ZERO enabled plugins! The game has nothing to load!");
+        else
+            logger::info("  plugins.txt looks valid: {} active plugins", enabledCount);
+
+        logger::info("=== END PLUGINS.TXT VERIFICATION ==="sv);
+    }
+
+    // ================================================================
     // v1.22.0: Loading Timeline Monitor
     // Periodically logs the state of form loading during the ~51 second
     // load period. This answers: "Are forms ever created during loading,
@@ -736,17 +857,20 @@ namespace Patches::EditorIdCache
         inline std::atomic<bool> g_running{ false };
         inline std::thread g_thread;
         inline std::atomic<bool> g_tdhSeen{ false };
+        inline std::atomic<bool> g_loadingFilesEverTrue{ false };
 
         inline void MonitorThread()
         {
-            logger::info("=== LOADING MONITOR STARTED (2s interval) ==="sv);
+            logger::info("=== LOADING MONITOR STARTED (2s, then 200ms after TDH) ==="sv);
             int tick = 0;
             auto startTime = std::chrono::high_resolution_clock::now();
 
             while (g_running.load(std::memory_order_relaxed)) {
-                // Sleep 2 seconds (in 100ms increments so we can stop quickly)
-                for (int i = 0; i < 20 && g_running.load(std::memory_order_relaxed); ++i) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                // Before TDH appears: 2s intervals. After TDH: 200ms intervals.
+                int sleepMs = g_tdhSeen.load(std::memory_order_relaxed) ? 200 : 2000;
+                int sleepChunks = sleepMs / 50;
+                for (int i = 0; i < sleepChunks && g_running.load(std::memory_order_relaxed); ++i) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
                 }
 
                 if (!g_running.load(std::memory_order_relaxed)) break;
@@ -756,15 +880,18 @@ namespace Patches::EditorIdCache
                     std::chrono::high_resolution_clock::now() - startTime).count();
                 logger::info("--- MONITOR tick {} ({:.1f}s) ---", tick, elapsed / 1000.0);
 
-                // Form pipeline counters
-                logger::info("  AddForm:{} OpenTES:{}/{} CompileIdx:{} SeekForm:{} Clear:{} Init:{}",
+                // Form pipeline counters (all 10 hooks)
+                logger::info("  AddForm:{} OpenTES:{}/{} CompileIdx:{} SeekForm:{} Close:{} Init:{} Subrec:{} RdData:{}({:.1f}MB)",
                     Patches::FormCaching::detail::g_addFormCalls.load(std::memory_order_relaxed),
                     Patches::FormCaching::detail::g_openTESSuccesses.load(std::memory_order_relaxed),
                     Patches::FormCaching::detail::g_openTESCalls.load(std::memory_order_relaxed),
                     Patches::FormCaching::detail::g_addCompileIndexCalls.load(std::memory_order_relaxed),
                     Patches::FormCaching::detail::g_seekNextFormCalls.load(std::memory_order_relaxed),
-                    Patches::FormCaching::detail::g_clearDataCalls.load(std::memory_order_relaxed),
-                    Patches::FormCaching::detail::g_initFormDataCalls.load(std::memory_order_relaxed));
+                    Patches::FormCaching::detail::g_closeTESCalls.load(std::memory_order_relaxed),
+                    Patches::FormCaching::detail::g_initFormDataCalls.load(std::memory_order_relaxed),
+                    Patches::FormCaching::detail::g_seekNextSubrecordCalls.load(std::memory_order_relaxed),
+                    Patches::FormCaching::detail::g_readDataCalls.load(std::memory_order_relaxed),
+                    static_cast<double>(Patches::FormCaching::detail::g_readDataBytes.load(std::memory_order_relaxed)) / (1024.0 * 1024.0));
 
                 // allForms hash map size (read-only, safe for concurrent access)
                 {
@@ -776,7 +903,7 @@ namespace Patches::EditorIdCache
                     }
                 }
 
-                // TDH state — detect first appearance
+                // TDH state — detect first appearance + high-freq loadingFiles check
                 auto* tdh = RE::TESDataHandler::GetSingleton();
                 if (tdh) {
                     if (!g_tdhSeen.exchange(true)) {
@@ -784,12 +911,28 @@ namespace Patches::EditorIdCache
                             elapsed / 1000.0, (void*)tdh);
                     }
 
+                    // Check loadingFiles at every tick (200ms after TDH appears)
+                    bool isLoading = tdh->loadingFiles;
+                    if (isLoading && !g_loadingFilesEverTrue.exchange(true)) {
+                        logger::info("  >>> loadingFiles BECAME TRUE at {:.1f}s! <<<", elapsed / 1000.0);
+                    }
+
                     auto tdhAddr = reinterpret_cast<std::uintptr_t>(tdh);
                     if (!IsBadReadPtr(reinterpret_cast<const void*>(tdhAddr + 0xD70), 0x30)) {
                         auto regCount = *reinterpret_cast<const std::uint32_t*>(tdhAddr + 0xD80);
                         auto eslCount = *reinterpret_cast<const std::uint32_t*>(tdhAddr + 0xD98);
-                        logger::info("  compiled: {} reg + {} ESL | loadingFiles: {} | files: (use final dump)",
-                            regCount, eslCount, tdh->loadingFiles);
+
+                        // Count files in BSSimpleList (only occasionally to avoid overhead)
+                        std::size_t fileCount = 0;
+                        if (tick % 5 == 0) {
+                            for (auto& file : tdh->files) {
+                                if (file) ++fileCount;
+                            }
+                        }
+
+                        logger::info("  compiled: {} reg + {} ESL | loadingFiles: {} | files: {}",
+                            regCount, eslCount, isLoading,
+                            tick % 5 == 0 ? std::to_string(fileCount) : std::string("(skip)"));
                     }
                 } else {
                     // TDH doesn't exist yet — check raw pointer to detect transitions
@@ -844,6 +987,15 @@ namespace Patches::EditorIdCache
                 Patches::FormCaching::detail::g_clearDataCalls.load());
             logger::info("  InitializeFormDataStructures: {} calls",
                 Patches::FormCaching::detail::g_initFormDataCalls.load());
+            logger::info("  CloseTES: {} calls",
+                Patches::FormCaching::detail::g_closeTESCalls.load());
+            logger::info("  SeekNextSubrecord: {} calls",
+                Patches::FormCaching::detail::g_seekNextSubrecordCalls.load());
+            logger::info("  ReadData: {} calls ({:.1f}MB total)",
+                Patches::FormCaching::detail::g_readDataCalls.load(),
+                static_cast<double>(Patches::FormCaching::detail::g_readDataBytes.load()) / (1024.0 * 1024.0));
+            logger::info("  loadingFiles ever true: {}",
+                g_loadingFilesEverTrue.load());
 
             // Check compile indices of files in TDH
             auto* tdh = RE::TESDataHandler::GetSingleton();
