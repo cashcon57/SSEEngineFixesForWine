@@ -735,28 +735,32 @@ namespace Patches::EditorIdCache
     {
         inline std::atomic<bool> g_running{ false };
         inline std::thread g_thread;
+        inline std::atomic<bool> g_tdhSeen{ false };
 
         inline void MonitorThread()
         {
-            logger::info("=== LOADING MONITOR STARTED ==="sv);
+            logger::info("=== LOADING MONITOR STARTED (2s interval) ==="sv);
             int tick = 0;
+            auto startTime = std::chrono::high_resolution_clock::now();
 
             while (g_running.load(std::memory_order_relaxed)) {
-                // Sleep 5 seconds (in 100ms increments so we can stop quickly)
-                for (int i = 0; i < 50 && g_running.load(std::memory_order_relaxed); ++i) {
+                // Sleep 2 seconds (in 100ms increments so we can stop quickly)
+                for (int i = 0; i < 20 && g_running.load(std::memory_order_relaxed); ++i) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 }
 
                 if (!g_running.load(std::memory_order_relaxed)) break;
 
                 ++tick;
-                logger::info("--- MONITOR tick {} ({}s) ---", tick, tick * 5);
+                auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::high_resolution_clock::now() - startTime).count();
+                logger::info("--- MONITOR tick {} ({:.1f}s) ---", tick, elapsed / 1000.0);
 
                 // Form pipeline counters
-                logger::info("  AddFormToDataHandler: {} calls ({} null)",
+                logger::info("  AddForm: {} | OpenTES: {} ok/{} total | ClearData: {} | InitFormData: {}",
                     Patches::FormCaching::detail::g_addFormCalls.load(std::memory_order_relaxed),
-                    Patches::FormCaching::detail::g_addFormNullCalls.load(std::memory_order_relaxed));
-                logger::info("  ClearData: {} calls, InitFormData: {} calls",
+                    Patches::FormCaching::detail::g_openTESSuccesses.load(std::memory_order_relaxed),
+                    Patches::FormCaching::detail::g_openTESCalls.load(std::memory_order_relaxed),
                     Patches::FormCaching::detail::g_clearDataCalls.load(std::memory_order_relaxed),
                     Patches::FormCaching::detail::g_initFormDataCalls.load(std::memory_order_relaxed));
 
@@ -770,16 +774,26 @@ namespace Patches::EditorIdCache
                     }
                 }
 
-                // compiledFileCollection sizes (raw offset reads)
+                // TDH state — detect first appearance
                 auto* tdh = RE::TESDataHandler::GetSingleton();
                 if (tdh) {
+                    if (!g_tdhSeen.exchange(true)) {
+                        logger::info("  >>> TDH FIRST SEEN at {:.1f}s! addr={:p}",
+                            elapsed / 1000.0, (void*)tdh);
+                    }
+
                     auto tdhAddr = reinterpret_cast<std::uintptr_t>(tdh);
                     if (!IsBadReadPtr(reinterpret_cast<const void*>(tdhAddr + 0xD70), 0x30)) {
                         auto regCount = *reinterpret_cast<const std::uint32_t*>(tdhAddr + 0xD80);
                         auto eslCount = *reinterpret_cast<const std::uint32_t*>(tdhAddr + 0xD98);
-                        logger::info("  compiledFileCollection: {} regular, {} ESL", regCount, eslCount);
+                        logger::info("  compiled: {} reg + {} ESL | loadingFiles: {} | files: (use final dump)",
+                            regCount, eslCount, tdh->loadingFiles);
                     }
-                    logger::info("  loadingFiles: {}", tdh->loadingFiles);
+                } else {
+                    // TDH doesn't exist yet — check raw pointer to detect transitions
+                    REL::Relocation<void**> tdhReloc{ RELOCATION_ID(514141, 400269) };
+                    auto rawPtr = *reinterpret_cast<const std::uintptr_t*>(tdhReloc.address());
+                    logger::info("  TDH: null (raw ptr at reloc: 0x{:X})", rawPtr);
                 }
 
                 // Memory allocator stats (if active)
@@ -817,6 +831,9 @@ namespace Patches::EditorIdCache
             logger::info("  AddFormToDataHandler: {} total calls ({} null)",
                 Patches::FormCaching::detail::g_addFormCalls.load(),
                 Patches::FormCaching::detail::g_addFormNullCalls.load());
+            logger::info("  OpenTES: {} calls ({} successes)",
+                Patches::FormCaching::detail::g_openTESCalls.load(),
+                Patches::FormCaching::detail::g_openTESSuccesses.load());
             logger::info("  ClearData: {} calls",
                 Patches::FormCaching::detail::g_clearDataCalls.load());
             logger::info("  InitializeFormDataStructures: {} calls",
@@ -826,39 +843,42 @@ namespace Patches::EditorIdCache
             auto* tdh = RE::TESDataHandler::GetSingleton();
             if (tdh) {
                 std::size_t fileCount = 0;
-                std::size_t compiledCount = 0;
-                std::size_t uncompiledCount = 0;
+                std::size_t compiledRegular = 0;   // compileIndex != 0xFF
+                std::size_t compiledESL = 0;        // compileIndex == 0xFE and smallFileCompileIndex assigned
+                std::size_t uncompiledCount = 0;    // compileIndex == 0xFF
 
                 for (auto& file : tdh->files) {
                     if (!file) continue;
                     ++fileCount;
 
-                    // Read compileIndex at offset 0x478 in TESFile
-                    auto fileAddr = reinterpret_cast<std::uintptr_t>(file);
-                    if (!IsBadReadPtr(reinterpret_cast<const void*>(fileAddr + 0x478), 4)) {
-                        auto compileIndex = *reinterpret_cast<const std::uint8_t*>(fileAddr + 0x478);
-                        auto smallIndex = *reinterpret_cast<const std::uint16_t*>(fileAddr + 0x47A);
+                    // Use CommonLib typed accessor for compile indices
+                    auto compileIndex = file->compileIndex;
+                    auto smallIndex = file->smallFileCompileIndex;
 
-                        if (compileIndex != 0xFF || smallIndex != 0xFFFF) {
-                            ++compiledCount;
-                            if (compiledCount <= 10) {
-                                logger::info("    COMPILED: '{}' compIdx=0x{:02X} smallIdx=0x{:04X}",
-                                    file->fileName, compileIndex, smallIndex);
-                            }
+                    if (compileIndex != 0xFF) {
+                        // File was assigned a compile index
+                        if (compileIndex == 0xFE) {
+                            ++compiledESL;
                         } else {
-                            ++uncompiledCount;
-                            if (uncompiledCount <= 5) {
-                                logger::info("    UNCOMPILED: '{}' compIdx=0xFF smallIdx=0xFFFF",
-                                    file->fileName);
-                            }
+                            ++compiledRegular;
+                        }
+                        if ((compiledRegular + compiledESL) <= 10) {
+                            logger::info("    COMPILED: '{}' compIdx=0x{:02X} smallIdx=0x{:04X}",
+                                file->fileName, compileIndex, smallIndex);
+                        }
+                    } else {
+                        ++uncompiledCount;
+                        if (uncompiledCount <= 5) {
+                            logger::info("    UNCOMPILED: '{}' compIdx=0xFF smallIdx=0x{:04X}",
+                                file->fileName, smallIndex);
                         }
                     }
                 }
 
-                logger::info("  Files: {} total, {} compiled, {} uncompiled (0xFF)",
-                    fileCount, compiledCount, uncompiledCount);
+                logger::info("  Files: {} total, {} compiled-regular, {} compiled-ESL, {} uncompiled (0xFF)",
+                    fileCount, compiledRegular, compiledESL, uncompiledCount);
 
-                if (compiledCount == 0 && fileCount > 0) {
+                if ((compiledRegular + compiledESL) == 0 && fileCount > 0) {
                     logger::warn("  >>> ZERO files have compile indices! The loading loop NEVER ASSIGNED them."sv);
                     logger::warn("  >>> This means the engine never processed plugin records."sv);
                 }

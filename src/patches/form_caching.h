@@ -41,6 +41,8 @@ namespace Patches::FormCaching
         inline std::atomic<std::uint64_t> g_initFormDataCalls{ 0 };
         inline std::atomic<std::uint64_t> g_addFormCalls{ 0 };
         inline std::atomic<std::uint64_t> g_addFormNullCalls{ 0 };
+        inline std::atomic<std::uint64_t> g_openTESCalls{ 0 };
+        inline std::atomic<std::uint64_t> g_openTESSuccesses{ 0 };
 
         struct ShardedCache
         {
@@ -229,6 +231,29 @@ namespace Patches::FormCaching
             return g_hk_AddFormToDataHandler.call<bool>(a_self, a_form);
         }
 
+        // ================================================================
+        // v1.22.1: TESFile::OpenTES hook — counts file opens
+        // If files are never opened for reading, the loading loop didn't run.
+        // ================================================================
+        inline SafetyHookInline g_hk_OpenTES;
+
+        inline bool TESFile_OpenTES(RE::TESFile* a_self, std::uint32_t a_mode, bool a_lock)
+        {
+            auto count = g_openTESCalls.fetch_add(1, std::memory_order_relaxed);
+            bool result = g_hk_OpenTES.call<bool>(a_self, a_mode, a_lock);
+            if (result) {
+                auto successes = g_openTESSuccesses.fetch_add(1, std::memory_order_relaxed);
+                if (successes < 10 || (successes > 0 && successes % 500 == 0)) {
+                    logger::info("  OpenTES #{}: '{}' mode={} lock={} -> SUCCESS",
+                        count + 1, a_self->fileName, a_mode, a_lock);
+                }
+            } else {
+                logger::warn("  OpenTES #{}: '{}' mode={} lock={} -> FAILED",
+                    count + 1, a_self->fileName, a_mode, a_lock);
+            }
+            return result;
+        }
+
         inline void ReplaceFormMapFunctions()
         {
             const REL::Relocation getForm{ RELOCATION_ID(14461, 14617) };
@@ -276,6 +301,11 @@ namespace Patches::FormCaching
             const REL::Relocation AddForm{ RELOCATION_ID(13597, 13693) };
             g_hk_AddFormToDataHandler = safetyhook::create_inline(AddForm.address(), TESDataHandler_AddFormToDataHandler);
             logger::info("form caching: AddFormToDataHandler hook installed (counting form registrations)"sv);
+
+            // v1.22.1: Hook TESFile::OpenTES to count file opens
+            const REL::Relocation OpenTES{ RELOCATION_ID(13855, 13931) };
+            g_hk_OpenTES = safetyhook::create_inline(OpenTES.address(), TESFile_OpenTES);
+            logger::info("form caching: OpenTES hook installed (counting file opens)"sv);
         }
     }
 
