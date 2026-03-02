@@ -7,6 +7,8 @@
 #include <string>
 #include <unordered_map>
 
+#include "form_caching.h"
+
 // Wine-compatible editor ID cache — fixes TESForm::LookupByEditorID under Wine
 //
 // Problem: BSTHashMap<BSFixedString, TESForm*> for editor ID lookups uses
@@ -23,8 +25,10 @@
 // BSTHashMap with fresh BSFixedString entries all created on the main thread.
 // This ensures BSStringPool consistency for keys and future lookups.
 //
-// Also maintains a parallel Wine-safe cache (std::unordered_map with std::string
-// keys) as a diagnostic tool and potential fallback for future use.
+// Form enumeration uses our own sharded form cache (from form_caching.h)
+// which intercepts every FormScatterTable_SetAt call during form loading.
+// This cache is guaranteed complete, unlike GetAllForms() BSTHashMap (broken
+// under Wine) or TESDataHandler::formArrays[] (struct layout mismatch on AE).
 //
 // Requires po3_Tweaks with "Load EditorIDs = true" so that forms actually
 // retain their editor IDs. Without it, most forms return "" from
@@ -78,17 +82,16 @@ namespace Patches::EditorIdCache
         {
             logger::info("editor ID cache: building from loaded forms..."sv);
 
-            // Phase 1: Enumerate ALL loaded forms via TESDataHandler::formArrays[].
+            // Phase 1: Enumerate ALL loaded forms from our sharded form cache.
             //
-            // We CANNOT use TESForm::GetAllForms() here — it returns a BSTHashMap
-            // (BSTScatterTable) that is broken under Wine. The scatter table uses
-            // BSCRC32 hash on FormID for insertion, and under Wine the table may
-            // not be fully populated (we observed only 166 forms instead of 100k+).
+            // We use FormCaching::detail::g_formCache[256] which intercepts every
+            // FormScatterTable_SetAt call during form loading. This sharded cache
+            // (std::unordered_map with std::shared_mutex per shard) is guaranteed
+            // to contain ALL registered forms regardless of Wine hash issues.
             //
-            // TESDataHandler::formArrays[] is an array of BSTArray<TESForm*>, one
-            // per FormType (138 types). BSTArray is a simple contiguous array with
-            // standard begin()/end() iterators — no hashing involved, so it works
-            // correctly under Wine. These arrays are fully populated by kDataLoaded.
+            // Previous attempts that FAILED under Wine:
+            //  - GetAllForms() BSTHashMap: only 166 forms (broken scatter table)
+            //  - TESDataHandler::formArrays[]: 0 forms (struct layout mismatch on AE)
             //
             // GetFormEditorID() is a virtual call that reads from each form's own
             // member storage (e.g. BGSKeyword::formEditorID), NOT from the broken
@@ -97,27 +100,20 @@ namespace Patches::EditorIdCache
             std::size_t formsScanned = 0;
             std::size_t editorIdsFound = 0;
 
-            const auto dataHandler = RE::TESDataHandler::GetSingleton();
-            if (dataHandler) {
-                for (std::uint32_t typeIdx = 0;
-                     typeIdx < static_cast<std::uint32_t>(RE::FormType::Max);
-                     ++typeIdx)
-                {
-                    auto& formArray = dataHandler->formArrays[typeIdx];
-                    for (const auto& form : formArray) {
-                        if (!form)
-                            continue;
-                        ++formsScanned;
+            for (std::uint32_t shardIdx = 0; shardIdx < 256; ++shardIdx) {
+                auto& shard = FormCaching::detail::g_formCache[shardIdx];
+                std::shared_lock lock(shard.mutex);
+                for (const auto& [baseId, form] : shard.map) {
+                    if (!form)
+                        continue;
+                    ++formsScanned;
 
-                        const char* editorId = form->GetFormEditorID();
-                        if (editorId && editorId[0] != '\0') {
-                            newCache.try_emplace(std::string(editorId), form);
-                            ++editorIdsFound;
-                        }
+                    const char* editorId = form->GetFormEditorID();
+                    if (editorId && editorId[0] != '\0') {
+                        newCache.try_emplace(std::string(editorId), form);
+                        ++editorIdsFound;
                     }
                 }
-            } else {
-                logger::error("editor ID cache: TESDataHandler singleton is null!"sv);
             }
 
             logger::info("editor ID cache: scanned {} forms, found {} with editor IDs"sv,
