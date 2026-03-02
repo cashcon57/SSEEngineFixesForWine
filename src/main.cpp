@@ -34,10 +34,12 @@ void MessageHandler(SKSE::MessagingInterface::Message* a_msg)
     switch (a_msg->type) {
     case SKSE::MessagingInterface::kDataLoaded:
         {
-            // Repopulate editor ID map FIRST — before other kDataLoaded handlers
-            // in other plugins try to look up forms by editor ID
-            if (Settings::Patches::bEditorIdCache.GetValue())
-                Patches::EditorIdCache::OnDataLoaded();
+            // Editor ID cache: DON'T populate at kDataLoaded.
+            // On AE, the editor ID map is empty at this point — po3_Tweaks
+            // populates it during its own kDataLoaded handler (which fires after
+            // ours due to alphabetical DLL ordering: 0_ < p). We populate our
+            // cache at kInputLoaded instead (fires after ALL kDataLoaded handlers).
+            logger::info("editor ID cache: deferring to kInputLoaded (editor ID map empty at kDataLoaded on AE)"sv);
 
             if (Settings::General::bCleanSKSECoSaves.GetValue())
                 Util::CoSaves::Clean();
@@ -61,11 +63,27 @@ void MessageHandler(SKSE::MessagingInterface::Message* a_msg)
 
             break;
         }
-    case SKSE::MessagingInterface::kPostLoadGame:
+    case SKSE::MessagingInterface::kInputLoaded:
         {
+            // NOW all kDataLoaded handlers have run, including po3_Tweaks which
+            // populates the editor ID map. Fix it by re-inserting with fresh
+            // BSFixedStrings created on the main thread.
+            if (Settings::Patches::bEditorIdCache.GetValue())
+                Patches::EditorIdCache::OnDataLoaded();
+            break;
+        }
+    case SKSE::MessagingInterface::kPostLoadGame:
+    case SKSE::MessagingInterface::kNewGame:
+        {
+            // Fallback: also try to populate at game load/new game in case
+            // kInputLoaded was too early
+            if (Settings::Patches::bEditorIdCache.GetValue())
+                Patches::EditorIdCache::OnDataLoaded();
+
             if (Settings::Warnings::bRefHandleLimit.GetValue()) {
                 Warnings::WarnActiveRefrHandleCount(Settings::Warnings::uRefrLoadedGameLimit.GetValue());
             }
+            break;
         }
     default:
         break;
