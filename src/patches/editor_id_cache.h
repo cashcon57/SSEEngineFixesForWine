@@ -273,18 +273,13 @@ namespace Patches::EditorIdCache
                 }
             }
 
-            // 6. Loaded file count (raw TDH scan — compiledFileCollection)
+            // 6. Loaded file count + formArrays scan
             {
                 auto* tdh = RE::TESDataHandler::GetSingleton();
                 if (tdh) {
-                    // compiledFileCollection at TDH+0x0D48 (AE) contains:
-                    //   +0x00: BSTArray<TESFile*> files
-                    //   +0x18: BSTArray<TESFile*> smallFiles
-                    // Each BSTArray is 0x18 bytes: data(8) + cap(4) + pad(4) + size(4)
                     auto tdhAddr = reinterpret_cast<std::uintptr_t>(tdh);
-                    // Try a few likely offsets for the file arrays
-                    // Standard Skyrim SE/AE: loadedMods at +0x0D38, loadedModCount at +0x0D50
-                    // Just count non-zero entries in formArrays to estimate
+
+                    // Count non-empty formArrays (at TDH+0x010, 0x18 bytes each)
                     std::size_t nonEmptyArrays = 0;
                     for (std::uint8_t t = 0; t < 0x8A; ++t) {
                         auto offset = 0x010 + static_cast<std::size_t>(t) * 0x18;
@@ -294,6 +289,44 @@ namespace Patches::EditorIdCache
                         if (sz > 0) ++nonEmptyArrays;
                     }
                     logger::info("  TDH formArrays: {}/138 types have entries", nonEmptyArrays);
+
+                    // compiledFileCollection at TDH+0xD70
+                    // files (BSTArray<TESFile*>): _data=D70, _cap=D78, _size=D80
+                    // smallFiles (BSTArray<TESFile*>): _data=D88, _cap=D90, _size=D98
+                    if (!IsBadReadPtr(reinterpret_cast<const void*>(tdhAddr + 0xD70), 0x30)) {
+                        auto regCount = *reinterpret_cast<const std::uint32_t*>(tdhAddr + 0xD80);
+                        auto eslCount = *reinterpret_cast<const std::uint32_t*>(tdhAddr + 0xD98);
+                        logger::info("  compiled files: {} regular, {} ESL-flagged, {} total",
+                            regCount, eslCount, regCount + eslCount);
+
+                        // Log first few file names if files exist
+                        if (regCount > 0) {
+                            auto filesData = *reinterpret_cast<const std::uintptr_t*>(tdhAddr + 0xD70);
+                            if (filesData && !IsBadReadPtr(reinterpret_cast<const void*>(filesData),
+                                regCount * sizeof(void*))) {
+                                auto limit = std::min(regCount, std::uint32_t(10));
+                                for (std::uint32_t i = 0; i < limit; ++i) {
+                                    auto filePtr = *reinterpret_cast<const std::uintptr_t*>(
+                                        filesData + i * sizeof(void*));
+                                    if (filePtr && !IsBadReadPtr(reinterpret_cast<const void*>(filePtr), 0x100)) {
+                                        // TESFile has fileName at various offsets. Try the common one.
+                                        // In CommonLib, TESFile::fileName is a char[260] near the start.
+                                        // Offset varies: typically 0x08 after vtable, or check raw bytes.
+                                        // Just log the pointer for now.
+                                        logger::info("    file[{}]: {:p}", i, (void*)filePtr);
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        logger::warn("  compiledFileCollection: unreadable at TDH+0xD70"sv);
+                    }
+
+                    // loadingFiles flag at TDH+0xDA8
+                    if (!IsBadReadPtr(reinterpret_cast<const void*>(tdhAddr + 0xDA8), 1)) {
+                        auto loading = *reinterpret_cast<const bool*>(tdhAddr + 0xDA8);
+                        logger::info("  loadingFiles: {}", loading);
+                    }
                 }
             }
         }
@@ -430,6 +463,19 @@ namespace Patches::EditorIdCache
             // ==============================================================
             auto htForms = ScanHashTableEntries();
             logger::info("  Phase 1: {} forms from form-by-ID hash table", htForms.size());
+
+            // Log details of the forms we found (first 30)
+            if (htForms.size() > 0 && htForms.size() <= 300) {
+                std::size_t logged = 0;
+                for (auto& [id, form] : htForms) {
+                    if (++logged > 30) break;
+                    logger::info("    formID=0x{:08X} type=0x{:02X} addr={:p}",
+                        id, static_cast<std::uint8_t>(form->GetFormType()), (void*)form);
+                }
+                if (htForms.size() > 30) {
+                    logger::info("    ... and {} more forms", htForms.size() - 30);
+                }
+            }
 
             for (auto& [id, form] : htForms) {
                 g_formById.try_emplace(id, form);
