@@ -966,19 +966,44 @@ namespace Patches::EditorIdCache
                     if (tick == 1 || (tick % 10 == 0)) {
                         std::vector<FILE*> testFiles;
                         int opened = 0;
+                        errno_t lastErr = 0;
                         for (int i = 0; i < 2000; i++) {
                             FILE* f = nullptr;
+                            errno = 0;
                             errno_t err = _wfopen_s(&f, L"NUL", L"rb");
                             if (err == 0 && f) {
                                 testFiles.push_back(f);
                                 ++opened;
                             } else {
+                                lastErr = err ? err : errno;
                                 break;
                             }
                         }
+                        auto winErr = REX::W32::GetLastError();
                         // Close them all
                         for (auto fp : testFiles) fclose(fp);
-                        logger::info("  maxStdio: {} | FD stress: opened {} files before failure", maxStdio, opened);
+                        // Also test Win32 CreateFile to compare
+                        std::vector<void*> winHandles;
+                        int winOpened = 0;
+                        for (int i = 0; i < 2000; i++) {
+                            auto h = REX::W32::CreateFileW(
+                                L"NUL",
+                                0x80000000,  // GENERIC_READ
+                                1,           // FILE_SHARE_READ
+                                nullptr,
+                                3,           // OPEN_EXISTING
+                                0x80,        // FILE_ATTRIBUTE_NORMAL
+                                nullptr);
+                            if (h != reinterpret_cast<void*>(static_cast<intptr_t>(-1))) {
+                                winHandles.push_back(h);
+                                ++winOpened;
+                            } else {
+                                break;
+                            }
+                        }
+                        for (auto h : winHandles) REX::W32::CloseHandle(h);
+                        logger::info("  maxStdio: {} | CRT: {} (errno={}, winErr={}) | Win32: {}",
+                            maxStdio, opened, lastErr, winErr, winOpened);
                     } else {
                         logger::info("  maxStdio: {}", maxStdio);
                     }
