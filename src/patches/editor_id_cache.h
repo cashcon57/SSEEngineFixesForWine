@@ -11,26 +11,14 @@
 
 // Wine-compatible editor ID cache — fixes TESForm::LookupByEditorID under Wine
 //
-// Problem: BSTHashMap<BSFixedString, TESForm*> for editor ID lookups uses
-// BSCRC32<BSFixedString> which hashes the data POINTER (not string content),
-// and BSFixedString::operator== compares data POINTERS (not string content).
-// Both rely on BSStringPool correctly interning identical strings to the same
-// pool entry. Under Wine, cross-thread interning fails — the same string
-// created on different threads gets different pool entries, breaking both
-// the hash and equality, so every LookupByEditorID returns null.
+// Problem: Under Wine, BSFixedString cross-thread interning fails, breaking
+// BSTHashMap<BSFixedString, TESForm*> lookups (pointer-based hash/equality).
 //
-// Fix: After data loading (kDataLoaded), scan FormID ranges using the GAME's
-// native GetFormByNumericId (called via inline hook trampoline). This bypasses
-// CommonLibSSE-NG's BSTHashMap template which has a struct layout mismatch
-// on AE under Wine. The game's native code uses the correct struct layout.
-//
-// For each found form, read its editor ID via GetFormEditorID() (virtual call
-// to form's own member storage), then repopulate the game's editor-ID-to-form
-// BSTHashMap with fresh BSFixedString entries all created on the main thread.
-//
-// Requires po3_Tweaks with "Load EditorIDs = true" so that forms actually
-// retain their editor IDs. Without it, most forms return "" from
-// GetFormEditorID() and the cache will be small.
+// Fix: At kDataLoaded, read the game's editor ID BSTHashMap by directly
+// iterating its raw memory (bypassing CommonLibSSE-NG's template which has
+// issues under Wine). Extract all (editorId, TESForm*) pairs, then clear
+// and re-insert with fresh BSFixedStrings created on the main thread so
+// future lookups produce consistent pointer-based hashes.
 
 namespace Patches::EditorIdCache
 {
@@ -76,96 +64,245 @@ namespace Patches::EditorIdCache
             return it != g_editorIdCache.end() ? it->second : nullptr;
         }
 
-        inline void PopulateCache()
+        // Check if a raw address looks like a valid heap/data pointer
+        inline bool isLikelyPointer(std::uintptr_t val)
         {
-            logger::info("editor ID cache: building from loaded forms..."sv);
+            // Windows x64 user space: 0x10000 to ~0x7FFFFFFFFFFF
+            return val >= 0x10000 && val < 0x00007FFFFFFFFFFF;
+        }
 
-            // Enumerate ALL loaded forms by brute-force scanning FormID ranges.
-            //
-            // Under Wine, CommonLibSSE-NG's BSTHashMap template has a struct
-            // layout mismatch on AE — both find() and iteration fail. But the
-            // GAME's native GetFormByNumericId works perfectly because it uses
-            // the actual compiled struct layout. We call it via the inline hook
-            // trampoline from form_caching.h.
-            //
-            // FormID structure: [master index : 8 bits][base ID : 24 bits]
-            //  - Master indices 0x00-0xFD: regular plugins (up to 254)
-            //  - Master index 0xFE: ESL/light plugins (sub-indexed)
-            //  - Master index 0xFF: temporary/runtime forms
-            //
-            // We scan base IDs 0x000-0xFFF for each master (4096 per master).
-            // Most plugin forms fall in this range. For large mods we extend
-            // the scan if we find forms near the end of the initial range.
-            EditorIdMap newCache;
-            std::size_t formsScanned = 0;
-            std::size_t editorIdsFound = 0;
+        // Read a C string from a BSFixedString stored at the given memory address.
+        // BSFixedString is just a pointer (8 bytes) to a BSStringPool::Entry.
+        // We reinterpret_cast to const BSFixedString* and call data() to get the string.
+        // This does NOT construct or destruct a BSFixedString — no ref counting issues.
+        inline const char* readBSFixedStringData(const void* bsfixedstr_memory)
+        {
+            auto poolEntryAddr = *reinterpret_cast<const std::uintptr_t*>(bsfixedstr_memory);
+            if (!isLikelyPointer(poolEntryAddr))
+                return nullptr;
 
-            auto scanForm = [&](RE::FormID formId) {
-                // Use the GAME's native form lookup via trampoline — this
-                // bypasses CommonLibSSE-NG's broken BSTHashMap template
-                auto* form = FormCaching::detail::GameLookupFormByID(formId);
-                if (!form)
-                    return false;
-                ++formsScanned;
+            auto* bsfs = reinterpret_cast<const RE::BSFixedString*>(bsfixedstr_memory);
+            return bsfs->data();
+        }
 
-                const char* editorId = form->GetFormEditorID();
-                if (editorId && editorId[0] != '\0') {
-                    newCache.try_emplace(std::string(editorId), form);
-                    ++editorIdsFound;
-                }
-                return true;
-            };
+        // Raw memory iteration of the editor ID BSTHashMap.
+        //
+        // BSTHashMap<BSFixedString, TESForm*> layout (CommonLibSSE-NG BSTScatterTable):
+        //   +0x00: _pad00 (uint64_t, 8 bytes)
+        //   +0x08: _pad08 (uint32_t, 4 bytes)
+        //   +0x0C: _capacity (uint32_t) — total slots, always power of 2
+        //   +0x10: _free (uint32_t) — free slot count
+        //   +0x14: _good (uint32_t) — last free index
+        //   +0x18: _sentinel (entry_type*, 8 bytes) — end-of-chain marker
+        //   +0x20: _allocator._pad00 (uint64_t, 8 bytes)
+        //   +0x28: _allocator._entries (byte*, 8 bytes) — entry array pointer
+        //
+        // Entry layout (24 bytes):
+        //   +0x00: BSFixedString key (8 bytes = pointer to BSStringPool::Entry)
+        //   +0x08: TESForm* value (8 bytes)
+        //   +0x10: entry_type* next (8 bytes)
+        //          nullptr = empty slot, any non-null = occupied (sentinel or chain)
+        inline std::size_t RawIterateEditorIdMap(EditorIdMap& outCache)
+        {
+            const auto& [editorMap, editorLock] = RE::TESForm::GetAllFormsByEditorID();
+            if (!editorMap) {
+                logger::error("editor ID cache: GetAllFormsByEditorID returned null map"sv);
+                return 0;
+            }
 
-            // Scan regular plugins (master indices 0x00-0xFD)
-            for (std::uint32_t masterIdx = 0; masterIdx <= 0xFD; ++masterIdx) {
-                const std::uint32_t prefix = masterIdx << 24;
-                std::uint32_t lastHit = 0;
+            auto* raw = reinterpret_cast<const std::uint8_t*>(editorMap);
 
-                // Initial scan: base IDs 0x000-0xFFF
-                for (std::uint32_t baseId = 0; baseId <= 0xFFF; ++baseId) {
-                    if (scanForm(prefix | baseId))
-                        lastHit = baseId;
-                }
+            // === DIAGNOSTIC: Dump raw memory ===
+            logger::info("=== Editor ID BSTHashMap raw memory (address {:p}) ===", (void*)editorMap);
+            for (int i = 0; i < 0x38; i += 8) {
+                auto val = *reinterpret_cast<const std::uint64_t*>(raw + i);
+                logger::info("  +0x{:02X}: 0x{:016X}", i, val);
+            }
 
-                // Extended scan: if we found forms near the end of initial
-                // range, keep scanning in chunks of 0x1000 until no more found
-                if (lastHit >= 0xF00) {
-                    std::uint32_t scanStart = 0x1000;
-                    while (scanStart < 0x100000) {
-                        bool foundAny = false;
-                        for (std::uint32_t baseId = scanStart;
-                             baseId < scanStart + 0x1000 && baseId < 0x1000000;
-                             ++baseId)
-                        {
-                            if (scanForm(prefix | baseId)) {
-                                foundAny = true;
-                                lastHit = baseId;
-                            }
-                        }
-                        if (!foundAny)
+            // Read at CommonLib expected offsets
+            auto capacity = *reinterpret_cast<const std::uint32_t*>(raw + 0x0C);
+            auto freeCount = *reinterpret_cast<const std::uint32_t*>(raw + 0x10);
+            auto good = *reinterpret_cast<const std::uint32_t*>(raw + 0x14);
+            auto sentinelAddr = *reinterpret_cast<std::uintptr_t const*>(raw + 0x18);
+            auto entriesAddr = *reinterpret_cast<std::uintptr_t const*>(raw + 0x28);
+
+            logger::info("  CommonLib layout: capacity={}, free={}, good={}, size={}"sv,
+                capacity, freeCount, good, capacity > freeCount ? capacity - freeCount : 0);
+            logger::info("  sentinel=0x{:016X}, entries=0x{:016X}"sv, sentinelAddr, entriesAddr);
+            logger::info("  DLL BSTScatterTableSentinel={:p}"sv,
+                (void*)RE::detail::BSTScatterTableSentinel);
+
+            bool layoutValid = capacity > 0 && capacity < 1000000 && isLikelyPointer(entriesAddr);
+
+            // If primary layout invalid, try scanning for plausible alternative layouts
+            if (!layoutValid) {
+                logger::warn("  Primary layout invalid (cap={}, entries=0x{:X}), scanning alternatives..."sv,
+                    capacity, entriesAddr);
+
+                // Find power-of-2 uint32 as capacity and pointer-like uint64 as entries
+                for (int eo = 0; eo <= 0x30 && !layoutValid; eo += 8) {
+                    auto ptr = *reinterpret_cast<std::uintptr_t const*>(raw + eo);
+                    if (!isLikelyPointer(ptr)) continue;
+
+                    for (int co = 0; co <= 0x30; co += 4) {
+                        if (co >= eo && co < eo + 8) continue; // overlaps with entries
+                        auto cap = *reinterpret_cast<const std::uint32_t*>(raw + co);
+                        if (cap > 0 && cap < 1000000 && (cap & (cap - 1)) == 0) {
+                            logger::info("  Alt layout found: entries at +0x{:02X}, capacity at +0x{:02X}={}"sv,
+                                eo, co, cap);
+                            entriesAddr = ptr;
+                            capacity = cap;
+                            layoutValid = true;
                             break;
-                        scanStart += 0x1000;
+                        }
                     }
                 }
             }
 
-            // Scan ESL/light plugins (master index 0xFE, sub-indexed)
-            // ESL FormID: 0xFE000000 | (eslIndex << 12) | baseId
-            for (std::uint32_t eslIdx = 0; eslIdx < 0x1000; ++eslIdx) {
-                const std::uint32_t eslPrefix = 0xFE000000 | (eslIdx << 12);
-                for (std::uint32_t baseId = 0; baseId <= 0xFFF; ++baseId) {
-                    scanForm(eslPrefix | baseId);
+            if (!layoutValid) {
+                logger::error("  Could not find valid BSTHashMap layout"sv);
+                return 0;
+            }
+
+            // Iterate entries
+            auto* entries = reinterpret_cast<const std::uint8_t*>(entriesAddr);
+            constexpr std::size_t ENTRY_SIZE = 24;
+
+            // Log first few entries for diagnostics
+            for (std::uint32_t i = 0; i < std::min(capacity, static_cast<std::uint32_t>(5)); ++i) {
+                auto* e = entries + (static_cast<std::size_t>(i) * ENTRY_SIZE);
+                logger::info("  Entry[{}]: key=0x{:016X} value=0x{:016X} next=0x{:016X}"sv,
+                    i,
+                    *reinterpret_cast<const std::uint64_t*>(e + 0x00),
+                    *reinterpret_cast<const std::uint64_t*>(e + 0x08),
+                    *reinterpret_cast<const std::uint64_t*>(e + 0x10));
+            }
+
+            // Full scan
+            std::size_t filledEntries = 0;
+            std::size_t editorIdsFound = 0;
+
+            for (std::uint32_t i = 0; i < capacity; ++i) {
+                auto* entryRaw = entries + (static_cast<std::size_t>(i) * ENTRY_SIZE);
+                auto nextAddr = *reinterpret_cast<std::uintptr_t const*>(entryRaw + 0x10);
+
+                if (nextAddr == 0) continue; // empty slot
+                ++filledEntries;
+
+                auto* form = *reinterpret_cast<RE::TESForm* const*>(entryRaw + 0x08);
+                if (!form) continue;
+
+                const char* editorId = readBSFixedStringData(entryRaw + 0x00);
+                if (editorId && editorId[0] != '\0') {
+                    outCache.try_emplace(std::string(editorId), form);
+                    ++editorIdsFound;
+                    if (editorIdsFound <= 10) {
+                        logger::info("  EditorID: '{}' -> FormID 0x{:08X}"sv,
+                            editorId, form->GetFormID());
+                    }
                 }
             }
 
-            logger::info("editor ID cache: scanned {} forms, found {} with editor IDs"sv,
-                formsScanned, editorIdsFound);
+            logger::info("  Raw iteration: {} filled entries, {} editor IDs (of {} capacity)"sv,
+                filledEntries, editorIdsFound, capacity);
 
-            if (editorIdsFound < 100 && formsScanned > 1000) {
-                logger::warn("editor ID cache: very few editor IDs found ({} / {} forms)"sv,
-                    editorIdsFound, formsScanned);
-                logger::warn("editor ID cache: ensure po3_Tweaks is loaded with 'Load EditorIDs = true'"sv);
+            return editorIdsFound;
+        }
+
+        inline void PopulateCache()
+        {
+            logger::info("editor ID cache: building from loaded forms..."sv);
+
+            // === Phase 1: Read editor IDs from the game's BSTHashMap via raw memory ===
+            EditorIdMap newCache;
+            std::size_t editorIdsFromRaw = RawIterateEditorIdMap(newCache);
+
+            // === Diagnostic: Trampoline test with known FormIDs ===
+            logger::info("=== Trampoline diagnostics ==="sv);
+            const std::pair<RE::FormID, const char*> knownForms[] = {
+                { 0x00000014, "PlayerRef" },
+                { 0x0000000F, "Gold001" },
+                { 0x00000007, "FormID_7" },
+                { 0x00000001, "FormID_1" },
+                { 0x00013938, "DragonPriest" },
+            };
+            for (auto& [fid, name] : knownForms) {
+                auto* form = FormCaching::detail::GameLookupFormByID(fid);
+                if (form) {
+                    const char* eid = form->GetFormEditorID();
+                    logger::info("  0x{:08X} ({}): FOUND type={} editorID='{}'",
+                        fid, name, static_cast<int>(form->GetFormType()),
+                        eid ? eid : "(null)");
+                } else {
+                    logger::info("  0x{:08X} ({}): NOT FOUND", fid, name);
+                }
             }
+
+            // === Diagnostic: Sharded cache count ===
+            std::size_t shardedTotal = 0;
+            for (auto& shard : FormCaching::detail::g_formCache) {
+                std::shared_lock lock(shard.mutex);
+                shardedTotal += shard.map.size();
+            }
+            logger::info("  Sharded form cache has {} total forms"sv, shardedTotal);
+
+            // === Phase 1b: Fallback to brute-force FormID scan if raw iteration found nothing ===
+            if (editorIdsFromRaw == 0) {
+                logger::warn("editor ID cache: raw iteration found 0 editor IDs, trying brute-force scan..."sv);
+
+                std::size_t formsScanned = 0;
+                auto scanForm = [&](RE::FormID formId) {
+                    auto* form = FormCaching::detail::GameLookupFormByID(formId);
+                    if (!form) return false;
+                    ++formsScanned;
+
+                    const char* editorId = form->GetFormEditorID();
+                    if (editorId && editorId[0] != '\0') {
+                        newCache.try_emplace(std::string(editorId), form);
+                    }
+                    return true;
+                };
+
+                for (std::uint32_t masterIdx = 0; masterIdx <= 0xFD; ++masterIdx) {
+                    const std::uint32_t prefix = masterIdx << 24;
+                    std::uint32_t lastHit = 0;
+
+                    for (std::uint32_t baseId = 0; baseId <= 0xFFF; ++baseId) {
+                        if (scanForm(prefix | baseId))
+                            lastHit = baseId;
+                    }
+
+                    if (lastHit >= 0xF00) {
+                        std::uint32_t scanStart = 0x1000;
+                        while (scanStart < 0x100000) {
+                            bool foundAny = false;
+                            for (std::uint32_t baseId = scanStart;
+                                 baseId < scanStart + 0x1000 && baseId < 0x1000000;
+                                 ++baseId)
+                            {
+                                if (scanForm(prefix | baseId)) {
+                                    foundAny = true;
+                                    lastHit = baseId;
+                                }
+                            }
+                            if (!foundAny) break;
+                            scanStart += 0x1000;
+                        }
+                    }
+                }
+
+                for (std::uint32_t eslIdx = 0; eslIdx < 0x1000; ++eslIdx) {
+                    const std::uint32_t eslPrefix = 0xFE000000 | (eslIdx << 12);
+                    for (std::uint32_t baseId = 0; baseId <= 0xFFF; ++baseId) {
+                        scanForm(eslPrefix | baseId);
+                    }
+                }
+
+                logger::info("editor ID cache: brute-force found {} forms, {} with editor IDs"sv,
+                    formsScanned, newCache.size());
+            }
+
+            logger::info("editor ID cache: total {} editor IDs in cache"sv, newCache.size());
 
             // Store in our Wine-safe cache
             {
@@ -173,54 +310,38 @@ namespace Patches::EditorIdCache
                 g_editorIdCache = std::move(newCache);
             }
 
-            // Phase 2: Repopulate the game's BSTHashMap with fresh BSFixedStrings.
+            // === Phase 2: Repopulate the game's BSTHashMap with fresh BSFixedStrings ===
             //
             // All BSFixedStrings created here go through BSStringPool on the MAIN thread.
             // Future LookupByEditorID calls (also on the main thread) will create
             // BSFixedStrings that intern to the SAME pool entries, making the pointer-based
             // hash (BSCRC32) and equality (operator==) work correctly.
-            //
-            // The clear() + insert sequence is safe because:
-            //  - clear() on an empty-checked map just destroys entries, no hash/comparison
-            //  - insert into a freshly-cleared map: find() returns end() immediately
-            //    (empty() check), so no broken comparison is ever invoked during insertion
-            //  - As entries accumulate, subsequent find() calls during insert use
-            //    BSFixedStrings all created on this thread, so interning is consistent
-
             const auto& [editorMap, editorLock] = RE::TESForm::GetAllFormsByEditorID();
             if (editorMap) {
-                // Take write lock for exclusive access during repopulation
                 const RE::BSWriteLockGuard wl{ editorLock };
 
-                // Count existing entries (diagnostic)
-                std::size_t existingCount = 0;
-                for ([[maybe_unused]] const auto& entry : *editorMap) {
-                    ++existingCount;
-                }
-                logger::info("editor ID cache: game's editor ID map had {} entries before repopulation"sv, existingCount);
-
-                // Clear (releases old BSFixedString references)
+                // Clear existing entries (releases old BSFixedString references)
                 editorMap->clear();
 
-                // Reserve capacity upfront to avoid rehashing mid-insert
                 {
                     std::shared_lock lock(g_cacheMutex);
-                    editorMap->reserve(static_cast<std::uint32_t>(g_editorIdCache.size()));
+                    if (!g_editorIdCache.empty()) {
+                        editorMap->reserve(static_cast<std::uint32_t>(g_editorIdCache.size()));
 
-                    // Re-insert with fresh BSFixedStrings
-                    std::size_t repopulated = 0;
-                    for (const auto& [editorId, form] : g_editorIdCache) {
-                        RE::BSFixedString key(editorId.c_str());
-                        editorMap->emplace(std::move(key), form);
-                        ++repopulated;
+                        std::size_t repopulated = 0;
+                        for (const auto& [editorId, form] : g_editorIdCache) {
+                            RE::BSFixedString key(editorId.c_str());
+                            editorMap->emplace(std::move(key), form);
+                            ++repopulated;
+                        }
+                        logger::info("editor ID cache: repopulated game map with {} entries"sv, repopulated);
+                    } else {
+                        logger::warn("editor ID cache: no editor IDs to repopulate"sv);
                     }
-
-                    logger::info("editor ID cache: repopulated game map with {} entries"sv, repopulated);
                 }
                 g_cachePopulated.store(true);
             } else {
-                logger::warn("editor ID cache: game's editor ID map pointer is null!"sv);
-                logger::warn("editor ID cache: Wine-safe cache is available but inlined LookupByEditorID in other plugins will still fail"sv);
+                logger::warn("editor ID cache: game's editor ID map pointer is null"sv);
             }
         }
     }
@@ -229,7 +350,7 @@ namespace Patches::EditorIdCache
     inline void OnDataLoaded()
     {
         if (detail::g_cachePopulated.load()) {
-            logger::info("editor ID cache: already populated, skipping kDataLoaded repopulation"sv);
+            logger::info("editor ID cache: already populated, skipping"sv);
             return;
         }
         detail::PopulateCache();
