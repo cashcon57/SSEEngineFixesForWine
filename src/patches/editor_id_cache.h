@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <atomic>
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
@@ -63,6 +64,7 @@ namespace Patches::EditorIdCache
 
         inline std::shared_mutex g_cacheMutex;
         inline EditorIdMap g_editorIdCache;
+        inline std::atomic<bool> g_cachePopulated{ false };
 
         // Wine-safe editor ID lookup (bypasses BSTHashMap entirely)
         inline RE::TESForm* LookupByEditorID(const std::string_view& a_editorID)
@@ -164,6 +166,7 @@ namespace Patches::EditorIdCache
 
                     logger::info("editor ID cache: repopulated game map with {} entries"sv, repopulated);
                 }
+                g_cachePopulated.store(true);
             } else {
                 logger::warn("editor ID cache: game's editor ID map pointer is null!"sv);
                 logger::warn("editor ID cache: Wine-safe cache is available but inlined LookupByEditorID in other plugins will still fail"sv);
@@ -174,11 +177,15 @@ namespace Patches::EditorIdCache
     // Called from kDataLoaded message handler
     inline void OnDataLoaded()
     {
+        if (detail::g_cachePopulated.load()) {
+            logger::info("editor ID cache: already populated, skipping kDataLoaded repopulation"sv);
+            return;
+        }
         detail::PopulateCache();
     }
 
     inline void Install()
     {
-        logger::info("editor ID cache patch enabled — will populate during kDataLoaded"sv);
+        logger::info("editor ID cache patch enabled (DLL prefixed for early load order)"sv);
     }
 }

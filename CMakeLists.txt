@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 set(NAME "SSEEngineFixesForWine" CACHE STRING "")
-set(VERSION 1.2.0 CACHE STRING "")
+set(VERSION 1.3.0 CACHE STRING "")
 
 # ---- Options ----
 option(COPY_BUILD "Copy the build output to the Skyrim directory." TRUE)
@@ -152,6 +152,17 @@ add_library(
     ${CMAKE_CURRENT_BINARY_DIR}/version.rc
     .clang-format
     .editorconfig
+)
+
+# Output DLL with "0_" prefix so it loads BEFORE all letter-named SKSE plugins.
+# SKSE enumerates *.dll in the Plugins directory; on macOS/APFS (CrossOver/Wine),
+# readdir() returns entries sorted by name. By sorting first alphabetically,
+# our kDataLoaded handler registers first and fires first, ensuring the Wine
+# editor ID cache fix runs before other plugins try LookupByEditorID.
+set_target_properties(
+    ${PROJECT_NAME}
+    PROPERTIES
+    OUTPUT_NAME "0_${NAME}"
 )
 
 target_compile_features(

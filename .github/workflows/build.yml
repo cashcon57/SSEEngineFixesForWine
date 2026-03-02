@@ -62,9 +62,9 @@ jobs:
       - name: Package
         run: |
           mkdir -p artifact/SKSE/Plugins
-          cp build/${{ env.BUILD_TYPE }}/SSEEngineFixesForWine.dll artifact/SKSE/Plugins/
-          if (Test-Path "build/${{ env.BUILD_TYPE }}/SSEEngineFixesForWine.pdb") {
-            cp build/${{ env.BUILD_TYPE }}/SSEEngineFixesForWine.pdb artifact/SKSE/Plugins/
+          cp build/${{ env.BUILD_TYPE }}/0_SSEEngineFixesForWine.dll artifact/SKSE/Plugins/
+          if (Test-Path "build/${{ env.BUILD_TYPE }}/0_SSEEngineFixesForWine.pdb") {
+            cp build/${{ env.BUILD_TYPE }}/0_SSEEngineFixesForWine.pdb artifact/SKSE/Plugins/
           }
           cp SSEEngineFixesForWine.toml artifact/SKSE/Plugins/
         shell: pwsh
