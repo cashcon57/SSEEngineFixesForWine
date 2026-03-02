@@ -78,22 +78,33 @@ namespace Patches::EditorIdCache
         {
             logger::info("editor ID cache: building from loaded forms..."sv);
 
-            // Phase 1: Iterate ALL loaded forms and read editor IDs from form storage.
-            // GetFormEditorID() is a virtual call that reads from the form's own member
-            // (e.g. BGSKeyword::formEditorID), NOT from the BSTHashMap. This works
-            // regardless of whether the map is broken.
+            // Phase 1: Enumerate ALL loaded forms via TESDataHandler::formArrays[].
             //
-            // We iterate the global form-by-ID map — its BSTHashMap iteration is safe
-            // because it walks the entry array linearly without using hash or comparison.
+            // We CANNOT use TESForm::GetAllForms() here — it returns a BSTHashMap
+            // (BSTScatterTable) that is broken under Wine. The scatter table uses
+            // BSCRC32 hash on FormID for insertion, and under Wine the table may
+            // not be fully populated (we observed only 166 forms instead of 100k+).
+            //
+            // TESDataHandler::formArrays[] is an array of BSTArray<TESForm*>, one
+            // per FormType (138 types). BSTArray is a simple contiguous array with
+            // standard begin()/end() iterators — no hashing involved, so it works
+            // correctly under Wine. These arrays are fully populated by kDataLoaded.
+            //
+            // GetFormEditorID() is a virtual call that reads from each form's own
+            // member storage (e.g. BGSKeyword::formEditorID), NOT from the broken
+            // editor ID BSTHashMap. This works regardless of Wine hash issues.
             EditorIdMap newCache;
             std::size_t formsScanned = 0;
             std::size_t editorIdsFound = 0;
 
-            const auto& [allForms, allFormsLock] = RE::TESForm::GetAllForms();
-            {
-                const RE::BSReadLockGuard l{ allFormsLock };
-                if (allForms) {
-                    for (const auto& [formId, form] : *allForms) {
+            const auto dataHandler = RE::TESDataHandler::GetSingleton();
+            if (dataHandler) {
+                for (std::uint32_t typeIdx = 0;
+                     typeIdx < static_cast<std::uint32_t>(RE::FormType::Max);
+                     ++typeIdx)
+                {
+                    auto& formArray = dataHandler->formArrays[typeIdx];
+                    for (const auto& form : formArray) {
                         if (!form)
                             continue;
                         ++formsScanned;
@@ -105,12 +116,14 @@ namespace Patches::EditorIdCache
                         }
                     }
                 }
+            } else {
+                logger::error("editor ID cache: TESDataHandler singleton is null!"sv);
             }
 
             logger::info("editor ID cache: scanned {} forms, found {} with editor IDs"sv,
                 formsScanned, editorIdsFound);
 
-            if (editorIdsFound < 100 && formsScanned > 10000) {
+            if (editorIdsFound < 100 && formsScanned > 1000) {
                 logger::warn("editor ID cache: very few editor IDs found ({} / {} forms)"sv,
                     editorIdsFound, formsScanned);
                 logger::warn("editor ID cache: ensure po3_Tweaks is loaded with 'Load EditorIDs = true'"sv);
