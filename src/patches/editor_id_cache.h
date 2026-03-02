@@ -217,28 +217,23 @@ namespace Patches::EditorIdCache
             EditorIdMap newCache;
             std::size_t editorIdsFromRaw = RawIterateEditorIdMap(newCache);
 
-            // === Diagnostic: Trampoline test with known FormIDs ===
-            logger::info("=== Trampoline diagnostics ==="sv);
+            // === Diagnostic: Form lookup at kPostLoadGame/kNewGame ===
+            logger::info("=== Diagnostics (kPostLoadGame/kNewGame) ==="sv);
             const std::pair<RE::FormID, const char*> knownForms[] = {
                 { 0x00000014, "PlayerRef" },
                 { 0x0000000F, "Gold001" },
-                { 0x00000007, "FormID_7" },
-                { 0x00000001, "FormID_1" },
-                { 0x00013938, "DragonPriest" },
+                { 0x00000007, "Lockpick" },
             };
             for (auto& [fid, name] : knownForms) {
                 auto* form = FormCaching::detail::GameLookupFormByID(fid);
-                if (form) {
-                    const char* eid = form->GetFormEditorID();
-                    logger::info("  0x{:08X} ({}): FOUND type={} editorID='{}'",
-                        fid, name, static_cast<int>(form->GetFormType()),
-                        eid ? eid : "(null)");
-                } else {
-                    logger::info("  0x{:08X} ({}): NOT FOUND", fid, name);
-                }
+                const char* eid = form ? form->GetFormEditorID() : nullptr;
+                logger::info("  0x{:08X} ({}): {} editorID='{}'"sv,
+                    fid, name,
+                    form ? "FOUND" : "NOT FOUND",
+                    eid ? eid : "(null)");
             }
 
-            // === Diagnostic: Sharded cache count ===
+            // Sharded cache count
             std::size_t shardedTotal = 0;
             for (auto& shard : FormCaching::detail::g_formCache) {
                 std::shared_lock lock(shard.mutex);
@@ -246,60 +241,39 @@ namespace Patches::EditorIdCache
             }
             logger::info("  Sharded form cache has {} total forms"sv, shardedTotal);
 
-            // === Phase 1b: Fallback to brute-force FormID scan if raw iteration found nothing ===
+            // === Phase 1b: Fallback to TESDataHandler form enumeration ===
             if (editorIdsFromRaw == 0) {
-                logger::warn("editor ID cache: raw iteration found 0 editor IDs, trying brute-force scan..."sv);
+                logger::info("editor ID cache: raw iteration found 0 editor IDs, enumerating via TESDataHandler..."sv);
 
-                std::size_t formsScanned = 0;
-                auto scanForm = [&](RE::FormID formId) {
-                    auto* form = FormCaching::detail::GameLookupFormByID(formId);
-                    if (!form) return false;
-                    ++formsScanned;
+                auto* dh = RE::TESDataHandler::GetSingleton();
+                if (dh) {
+                    std::size_t formsScanned = 0;
+                    std::size_t editorIdsFound = 0;
 
-                    const char* editorId = form->GetFormEditorID();
-                    if (editorId && editorId[0] != '\0') {
-                        newCache.try_emplace(std::string(editorId), form);
-                    }
-                    return true;
-                };
+                    for (std::uint32_t ft = 0; ft < static_cast<std::uint32_t>(RE::FormType::Max); ++ft) {
+                        auto& arr = dh->GetFormArray(static_cast<RE::FormType>(ft));
+                        for (auto* form : arr) {
+                            if (!form) continue;
+                            ++formsScanned;
 
-                for (std::uint32_t masterIdx = 0; masterIdx <= 0xFD; ++masterIdx) {
-                    const std::uint32_t prefix = masterIdx << 24;
-                    std::uint32_t lastHit = 0;
-
-                    for (std::uint32_t baseId = 0; baseId <= 0xFFF; ++baseId) {
-                        if (scanForm(prefix | baseId))
-                            lastHit = baseId;
-                    }
-
-                    if (lastHit >= 0xF00) {
-                        std::uint32_t scanStart = 0x1000;
-                        while (scanStart < 0x100000) {
-                            bool foundAny = false;
-                            for (std::uint32_t baseId = scanStart;
-                                 baseId < scanStart + 0x1000 && baseId < 0x1000000;
-                                 ++baseId)
-                            {
-                                if (scanForm(prefix | baseId)) {
-                                    foundAny = true;
-                                    lastHit = baseId;
+                            const char* editorId = form->GetFormEditorID();
+                            if (editorId && editorId[0] != '\0') {
+                                newCache.try_emplace(std::string(editorId), form);
+                                ++editorIdsFound;
+                                if (editorIdsFound <= 10) {
+                                    logger::info("  EditorID: '{}' -> FormID 0x{:08X} type={}"sv,
+                                        editorId, form->GetFormID(),
+                                        static_cast<int>(form->GetFormType()));
                                 }
                             }
-                            if (!foundAny) break;
-                            scanStart += 0x1000;
                         }
                     }
-                }
 
-                for (std::uint32_t eslIdx = 0; eslIdx < 0x1000; ++eslIdx) {
-                    const std::uint32_t eslPrefix = 0xFE000000 | (eslIdx << 12);
-                    for (std::uint32_t baseId = 0; baseId <= 0xFFF; ++baseId) {
-                        scanForm(eslPrefix | baseId);
-                    }
+                    logger::info("editor ID cache: TESDataHandler: {} forms scanned, {} with editor IDs"sv,
+                        formsScanned, editorIdsFound);
+                } else {
+                    logger::warn("editor ID cache: TESDataHandler::GetSingleton() returned null"sv);
                 }
-
-                logger::info("editor ID cache: brute-force found {} forms, {} with editor IDs"sv,
-                    formsScanned, newCache.size());
             }
 
             logger::info("editor ID cache: total {} editor IDs in cache"sv, newCache.size());
@@ -308,6 +282,15 @@ namespace Patches::EditorIdCache
             {
                 std::unique_lock lock(g_cacheMutex);
                 g_editorIdCache = std::move(newCache);
+            }
+
+            // If no editor IDs found, allow retry at next event (kNewGame, kPostLoadGame)
+            {
+                std::shared_lock lock(g_cacheMutex);
+                if (g_editorIdCache.empty()) {
+                    logger::warn("editor ID cache: no editor IDs found, will retry at next event"sv);
+                    return;
+                }
             }
 
             // === Phase 2: Repopulate the game's BSTHashMap with fresh BSFixedStrings ===
@@ -325,23 +308,19 @@ namespace Patches::EditorIdCache
 
                 {
                     std::shared_lock lock(g_cacheMutex);
-                    if (!g_editorIdCache.empty()) {
-                        editorMap->reserve(static_cast<std::uint32_t>(g_editorIdCache.size()));
+                    editorMap->reserve(static_cast<std::uint32_t>(g_editorIdCache.size()));
 
-                        std::size_t repopulated = 0;
-                        for (const auto& [editorId, form] : g_editorIdCache) {
-                            RE::BSFixedString key(editorId.c_str());
-                            editorMap->emplace(std::move(key), form);
-                            ++repopulated;
-                        }
-                        logger::info("editor ID cache: repopulated game map with {} entries"sv, repopulated);
-                    } else {
-                        logger::warn("editor ID cache: no editor IDs to repopulate"sv);
+                    std::size_t repopulated = 0;
+                    for (const auto& [editorId, form] : g_editorIdCache) {
+                        RE::BSFixedString key(editorId.c_str());
+                        editorMap->emplace(std::move(key), form);
+                        ++repopulated;
                     }
+                    logger::info("editor ID cache: repopulated game map with {} entries"sv, repopulated);
                 }
                 g_cachePopulated.store(true);
             } else {
-                logger::warn("editor ID cache: game's editor ID map pointer is null"sv);
+                logger::warn("editor ID cache: game's editor ID map pointer is null, will retry"sv);
             }
         }
     }

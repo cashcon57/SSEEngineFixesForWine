@@ -38,8 +38,8 @@ void MessageHandler(SKSE::MessagingInterface::Message* a_msg)
             // On AE, the editor ID map is empty at this point — po3_Tweaks
             // populates it during its own kDataLoaded handler (which fires after
             // ours due to alphabetical DLL ordering: 0_ < p). We populate our
-            // cache at kInputLoaded instead (fires after ALL kDataLoaded handlers).
-            logger::info("editor ID cache: deferring to kInputLoaded (editor ID map empty at kDataLoaded on AE)"sv);
+            // cache at kPostLoadGame/kNewGame instead (fires after ALL data is loaded).
+            logger::info("editor ID cache: deferring to kPostLoadGame (editor ID map empty at kDataLoaded on AE)"sv);
 
             if (Settings::General::bCleanSKSECoSaves.GetValue())
                 Util::CoSaves::Clean();
@@ -65,18 +65,15 @@ void MessageHandler(SKSE::MessagingInterface::Message* a_msg)
         }
     case SKSE::MessagingInterface::kInputLoaded:
         {
-            // NOW all kDataLoaded handlers have run, including po3_Tweaks which
-            // populates the editor ID map. Fix it by re-inserting with fresh
-            // BSFixedStrings created on the main thread.
-            if (Settings::Patches::bEditorIdCache.GetValue())
-                Patches::EditorIdCache::OnDataLoaded();
+            // kInputLoaded fires BEFORE kDataLoaded (confirmed by timestamps).
+            // Cannot use it to defer work past kDataLoaded handlers.
             break;
         }
     case SKSE::MessagingInterface::kPostLoadGame:
     case SKSE::MessagingInterface::kNewGame:
         {
-            // Fallback: also try to populate at game load/new game in case
-            // kInputLoaded was too early
+            // Primary: populate editor ID cache AFTER all kDataLoaded handlers
+            // (including po3_Tweaks which loads editor IDs onto forms).
             if (Settings::Patches::bEditorIdCache.GetValue())
                 Patches::EditorIdCache::OnDataLoaded();
 
