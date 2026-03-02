@@ -34,12 +34,14 @@ void MessageHandler(SKSE::MessagingInterface::Message* a_msg)
     switch (a_msg->type) {
     case SKSE::MessagingInterface::kDataLoaded:
         {
-            // Editor ID cache: DON'T populate at kDataLoaded.
-            // On AE, the editor ID map is empty at this point — po3_Tweaks
-            // populates it during its own kDataLoaded handler (which fires after
-            // ours due to alphabetical DLL ordering: 0_ < p). We populate our
-            // cache at kPostLoadGame/kNewGame instead (fires after ALL data is loaded).
-            logger::info("editor ID cache: deferring to kPostLoadGame (editor ID map empty at kDataLoaded on AE)"sv);
+            // Editor ID cache: populate NOW at kDataLoaded, BEFORE other plugins.
+            // Our handler fires first (alphabetical: 0_ < C < p), so we MUST
+            // populate before CoreImpactFramework (C) tries LookupByEditorID.
+            // po3_Tweaks installed its "Load EditorIDs" hook at kPostLoad (before
+            // ESM loading), so forms should have editor IDs by now.
+            // We enumerate via TESDataHandler (BSTArray, no hashing — Wine-safe).
+            if (Settings::Patches::bEditorIdCache.GetValue())
+                Patches::EditorIdCache::OnDataLoaded();
 
             if (Settings::General::bCleanSKSECoSaves.GetValue())
                 Util::CoSaves::Clean();
@@ -72,8 +74,7 @@ void MessageHandler(SKSE::MessagingInterface::Message* a_msg)
     case SKSE::MessagingInterface::kPostLoadGame:
     case SKSE::MessagingInterface::kNewGame:
         {
-            // Primary: populate editor ID cache AFTER all kDataLoaded handlers
-            // (including po3_Tweaks which loads editor IDs onto forms).
+            // Fallback: retry editor ID cache if kDataLoaded found nothing.
             if (Settings::Patches::bEditorIdCache.GetValue())
                 Patches::EditorIdCache::OnDataLoaded();
 

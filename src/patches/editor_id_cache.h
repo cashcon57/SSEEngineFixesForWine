@@ -213,67 +213,47 @@ namespace Patches::EditorIdCache
         {
             logger::info("editor ID cache: building from loaded forms..."sv);
 
-            // === Phase 1: Read editor IDs from the game's BSTHashMap via raw memory ===
             EditorIdMap newCache;
-            std::size_t editorIdsFromRaw = RawIterateEditorIdMap(newCache);
 
-            // === Diagnostic: Form lookup at kPostLoadGame/kNewGame ===
-            logger::info("=== Diagnostics (kPostLoadGame/kNewGame) ==="sv);
-            const std::pair<RE::FormID, const char*> knownForms[] = {
-                { 0x00000014, "PlayerRef" },
-                { 0x0000000F, "Gold001" },
-                { 0x00000007, "Lockpick" },
-            };
-            for (auto& [fid, name] : knownForms) {
-                auto* form = FormCaching::detail::GameLookupFormByID(fid);
-                const char* eid = form ? form->GetFormEditorID() : nullptr;
-                logger::info("  0x{:08X} ({}): {} editorID='{}'"sv,
-                    fid, name,
-                    form ? "FOUND" : "NOT FOUND",
-                    eid ? eid : "(null)");
-            }
+            // === Phase 1: Enumerate ALL forms via TESDataHandler (primary method) ===
+            // TESDataHandler::GetFormArray() returns BSTArray<TESForm*> — contiguous
+            // arrays with no hashing. Safe under Wine. po3_Tweaks "Load EditorIDs"
+            // hook was installed at kPostLoad (before ESM loading), so forms should
+            // have editor IDs on them by now.
+            auto* dh = RE::TESDataHandler::GetSingleton();
+            if (dh) {
+                std::size_t formsScanned = 0;
+                std::size_t editorIdsFound = 0;
 
-            // Sharded cache count
-            std::size_t shardedTotal = 0;
-            for (auto& shard : FormCaching::detail::g_formCache) {
-                std::shared_lock lock(shard.mutex);
-                shardedTotal += shard.map.size();
-            }
-            logger::info("  Sharded form cache has {} total forms"sv, shardedTotal);
+                for (std::uint32_t ft = 0; ft < static_cast<std::uint32_t>(RE::FormType::Max); ++ft) {
+                    auto& arr = dh->GetFormArray(static_cast<RE::FormType>(ft));
+                    for (auto* form : arr) {
+                        if (!form) continue;
+                        ++formsScanned;
 
-            // === Phase 1b: Fallback to TESDataHandler form enumeration ===
-            if (editorIdsFromRaw == 0) {
-                logger::info("editor ID cache: raw iteration found 0 editor IDs, enumerating via TESDataHandler..."sv);
-
-                auto* dh = RE::TESDataHandler::GetSingleton();
-                if (dh) {
-                    std::size_t formsScanned = 0;
-                    std::size_t editorIdsFound = 0;
-
-                    for (std::uint32_t ft = 0; ft < static_cast<std::uint32_t>(RE::FormType::Max); ++ft) {
-                        auto& arr = dh->GetFormArray(static_cast<RE::FormType>(ft));
-                        for (auto* form : arr) {
-                            if (!form) continue;
-                            ++formsScanned;
-
-                            const char* editorId = form->GetFormEditorID();
-                            if (editorId && editorId[0] != '\0') {
-                                newCache.try_emplace(std::string(editorId), form);
-                                ++editorIdsFound;
-                                if (editorIdsFound <= 10) {
-                                    logger::info("  EditorID: '{}' -> FormID 0x{:08X} type={}"sv,
-                                        editorId, form->GetFormID(),
-                                        static_cast<int>(form->GetFormType()));
-                                }
+                        const char* editorId = form->GetFormEditorID();
+                        if (editorId && editorId[0] != '\0') {
+                            newCache.try_emplace(std::string(editorId), form);
+                            ++editorIdsFound;
+                            if (editorIdsFound <= 10) {
+                                logger::info("  EditorID: '{}' -> FormID 0x{:08X} type={}"sv,
+                                    editorId, form->GetFormID(),
+                                    static_cast<int>(form->GetFormType()));
                             }
                         }
                     }
-
-                    logger::info("editor ID cache: TESDataHandler: {} forms scanned, {} with editor IDs"sv,
-                        formsScanned, editorIdsFound);
-                } else {
-                    logger::warn("editor ID cache: TESDataHandler::GetSingleton() returned null"sv);
                 }
+
+                logger::info("editor ID cache: TESDataHandler: {} forms scanned, {} with editor IDs"sv,
+                    formsScanned, editorIdsFound);
+            } else {
+                logger::warn("editor ID cache: TESDataHandler::GetSingleton() returned null"sv);
+            }
+
+            // === Phase 1b: Fallback to raw BSTHashMap iteration ===
+            if (newCache.empty()) {
+                logger::info("editor ID cache: TESDataHandler found nothing, trying raw BSTHashMap..."sv);
+                RawIterateEditorIdMap(newCache);
             }
 
             logger::info("editor ID cache: total {} editor IDs in cache"sv, newCache.size());
