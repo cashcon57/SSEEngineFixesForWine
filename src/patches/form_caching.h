@@ -38,6 +38,7 @@ namespace Patches::FormCaching
         };
 
         inline ShardedCache g_formCache[256];
+        inline SafetyHookInline g_hk_GetFormByNumericId{};
 
         inline RE::TESForm* TESForm_GetFormByNumericId(RE::FormID a_formId)
         {
@@ -55,8 +56,10 @@ namespace Patches::FormCaching
                 }
             }
 
-            // lookup form in bethesda's map
-            RE::TESForm* formPointer = RE::TESForm::LookupByID(a_formId);
+            // Call the GAME's native GetFormByNumericId via trampoline.
+            // This uses the game's actual BSTHashMap code with the correct struct
+            // layout, bypassing CommonLibSSE-NG's broken BSTHashMap template.
+            RE::TESForm* formPointer = g_hk_GetFormByNumericId.call<RE::TESForm*>(a_formId);
 
             if (formPointer != nullptr) {
                 std::unique_lock lock(shard.mutex);
@@ -64,6 +67,13 @@ namespace Patches::FormCaching
             }
 
             return formPointer;
+        }
+
+        // Call the game's native GetFormByNumericId directly (via trampoline).
+        // Used by editor_id_cache.h for brute-force form enumeration.
+        inline RE::TESForm* GameLookupFormByID(RE::FormID a_formId)
+        {
+            return g_hk_GetFormByNumericId.call<RE::TESForm*>(a_formId);
         }
 
 #ifdef SKYRIM_AE
@@ -180,8 +190,8 @@ namespace Patches::FormCaching
 
         inline void ReplaceFormMapFunctions()
         {
-            REL::Relocation getForm{ RELOCATION_ID(14461, 14617) };
-            getForm.replace_func(0x9E, TESForm_GetFormByNumericId);
+            const REL::Relocation getForm{ RELOCATION_ID(14461, 14617) };
+            g_hk_GetFormByNumericId = safetyhook::create_inline(getForm.address(), TESForm_GetFormByNumericId);
 
             const REL::Relocation RemoveAt{ RELOCATION_ID(14514, 14710) };
             g_hk_RemoveAt = safetyhook::create_inline(RemoveAt.address(), FormMap_RemoveAt);

@@ -7,6 +7,8 @@
 #include <string>
 #include <unordered_map>
 
+#include "form_caching.h"
+
 // Wine-compatible editor ID cache — fixes TESForm::LookupByEditorID under Wine
 //
 // Problem: BSTHashMap<BSFixedString, TESForm*> for editor ID lookups uses
@@ -17,18 +19,14 @@
 // created on different threads gets different pool entries, breaking both
 // the hash and equality, so every LookupByEditorID returns null.
 //
-// Fix: After data loading (kDataLoaded), scan FormID ranges using the
-// form-by-ID BSTHashMap's find() method (works under Wine because uint32_t
-// keys use integer hashing, not pointer-based). For each found form, read
-// its editor ID via GetFormEditorID() (virtual call to form's own storage),
-// then repopulate the game's editor-ID-to-form BSTHashMap with fresh
-// BSFixedString entries all created on the main thread.
+// Fix: After data loading (kDataLoaded), scan FormID ranges using the GAME's
+// native GetFormByNumericId (called via inline hook trampoline). This bypasses
+// CommonLibSSE-NG's BSTHashMap template which has a struct layout mismatch
+// on AE under Wine. The game's native code uses the correct struct layout.
 //
-// Standard form enumeration methods all fail under Wine:
-//  - GetAllForms() BSTHashMap iteration: only finds ~166 forms
-//  - TESDataHandler::formArrays[]: struct layout mismatch on AE (0 forms)
-//  - form_caching.h sharded cache: SetAt callsite hooks miss most forms
-// The brute-force FormID scan bypasses all of these issues.
+// For each found form, read its editor ID via GetFormEditorID() (virtual call
+// to form's own member storage), then repopulate the game's editor-ID-to-form
+// BSTHashMap with fresh BSFixedString entries all created on the main thread.
 //
 // Requires po3_Tweaks with "Load EditorIDs = true" so that forms actually
 // retain their editor IDs. Without it, most forms return "" from
@@ -84,15 +82,11 @@ namespace Patches::EditorIdCache
 
             // Enumerate ALL loaded forms by brute-force scanning FormID ranges.
             //
-            // Under Wine, all standard form enumeration methods fail:
-            //  - GetAllForms() BSTHashMap iteration: only finds ~166 forms
-            //  - TESDataHandler::formArrays[]: struct layout mismatch on AE (0 forms)
-            //  - form_caching.h sharded cache: SetAt callsite hooks miss most forms
-            //
-            // However, RE::TESForm::LookupByID(formId) works perfectly because
-            // the form-by-ID BSTHashMap uses uint32_t keys with BSCRC32<uint32_t>
-            // (integer hashing, NOT pointer-based like BSFixedString). So we can
-            // scan FormID ranges and look up each one individually.
+            // Under Wine, CommonLibSSE-NG's BSTHashMap template has a struct
+            // layout mismatch on AE — both find() and iteration fail. But the
+            // GAME's native GetFormByNumericId works perfectly because it uses
+            // the actual compiled struct layout. We call it via the inline hook
+            // trampoline from form_caching.h.
             //
             // FormID structure: [master index : 8 bits][base ID : 24 bits]
             //  - Master indices 0x00-0xFD: regular plugins (up to 254)
@@ -106,75 +100,61 @@ namespace Patches::EditorIdCache
             std::size_t formsScanned = 0;
             std::size_t editorIdsFound = 0;
 
-            // Acquire the form-by-ID BSTHashMap ONCE and hold the lock for
-            // the entire scan. This avoids per-lookup lock overhead.
-            // BSTHashMap::find() with uint32_t keys works under Wine because
-            // BSCRC32<uint32_t> hashes the integer value directly (not a pointer).
-            const auto& [allForms, allFormsLock] = RE::TESForm::GetAllForms();
-            {
-                const RE::BSReadLockGuard l{ allFormsLock };
-                if (!allForms) {
-                    logger::error("editor ID cache: GetAllForms() returned null!"sv);
-                    return;
+            auto scanForm = [&](RE::FormID formId) {
+                // Use the GAME's native form lookup via trampoline — this
+                // bypasses CommonLibSSE-NG's broken BSTHashMap template
+                auto* form = FormCaching::detail::GameLookupFormByID(formId);
+                if (!form)
+                    return false;
+                ++formsScanned;
+
+                const char* editorId = form->GetFormEditorID();
+                if (editorId && editorId[0] != '\0') {
+                    newCache.try_emplace(std::string(editorId), form);
+                    ++editorIdsFound;
+                }
+                return true;
+            };
+
+            // Scan regular plugins (master indices 0x00-0xFD)
+            for (std::uint32_t masterIdx = 0; masterIdx <= 0xFD; ++masterIdx) {
+                const std::uint32_t prefix = masterIdx << 24;
+                std::uint32_t lastHit = 0;
+
+                // Initial scan: base IDs 0x000-0xFFF
+                for (std::uint32_t baseId = 0; baseId <= 0xFFF; ++baseId) {
+                    if (scanForm(prefix | baseId))
+                        lastHit = baseId;
                 }
 
-                auto scanForm = [&](RE::FormID formId) {
-                    const auto it = allForms->find(formId);
-                    if (it == allForms->end())
-                        return false;
-                    auto* form = it->second;
-                    if (!form)
-                        return false;
-                    ++formsScanned;
-
-                    const char* editorId = form->GetFormEditorID();
-                    if (editorId && editorId[0] != '\0') {
-                        newCache.try_emplace(std::string(editorId), form);
-                        ++editorIdsFound;
-                    }
-                    return true;
-                };
-
-                // Scan regular plugins (master indices 0x00-0xFD)
-                for (std::uint32_t masterIdx = 0; masterIdx <= 0xFD; ++masterIdx) {
-                    const std::uint32_t prefix = masterIdx << 24;
-                    std::uint32_t lastHit = 0;
-
-                    // Initial scan: base IDs 0x000-0xFFF
-                    for (std::uint32_t baseId = 0; baseId <= 0xFFF; ++baseId) {
-                        if (scanForm(prefix | baseId))
-                            lastHit = baseId;
-                    }
-
-                    // Extended scan: if we found forms near the end of initial
-                    // range, keep scanning in chunks of 0x1000 until no more found
-                    if (lastHit >= 0xF00) {
-                        std::uint32_t scanStart = 0x1000;
-                        while (scanStart < 0x100000) {
-                            bool foundAny = false;
-                            for (std::uint32_t baseId = scanStart;
-                                 baseId < scanStart + 0x1000 && baseId < 0x1000000;
-                                 ++baseId)
-                            {
-                                if (scanForm(prefix | baseId)) {
-                                    foundAny = true;
-                                    lastHit = baseId;
-                                }
+                // Extended scan: if we found forms near the end of initial
+                // range, keep scanning in chunks of 0x1000 until no more found
+                if (lastHit >= 0xF00) {
+                    std::uint32_t scanStart = 0x1000;
+                    while (scanStart < 0x100000) {
+                        bool foundAny = false;
+                        for (std::uint32_t baseId = scanStart;
+                             baseId < scanStart + 0x1000 && baseId < 0x1000000;
+                             ++baseId)
+                        {
+                            if (scanForm(prefix | baseId)) {
+                                foundAny = true;
+                                lastHit = baseId;
                             }
-                            if (!foundAny)
-                                break;
-                            scanStart += 0x1000;
                         }
+                        if (!foundAny)
+                            break;
+                        scanStart += 0x1000;
                     }
                 }
+            }
 
-                // Scan ESL/light plugins (master index 0xFE, sub-indexed)
-                // ESL FormID: 0xFE000000 | (eslIndex << 12) | baseId
-                for (std::uint32_t eslIdx = 0; eslIdx < 0x1000; ++eslIdx) {
-                    const std::uint32_t eslPrefix = 0xFE000000 | (eslIdx << 12);
-                    for (std::uint32_t baseId = 0; baseId <= 0xFFF; ++baseId) {
-                        scanForm(eslPrefix | baseId);
-                    }
+            // Scan ESL/light plugins (master index 0xFE, sub-indexed)
+            // ESL FormID: 0xFE000000 | (eslIndex << 12) | baseId
+            for (std::uint32_t eslIdx = 0; eslIdx < 0x1000; ++eslIdx) {
+                const std::uint32_t eslPrefix = 0xFE000000 | (eslIdx << 12);
+                for (std::uint32_t baseId = 0; baseId <= 0xFFF; ++baseId) {
+                    scanForm(eslPrefix | baseId);
                 }
             }
 
