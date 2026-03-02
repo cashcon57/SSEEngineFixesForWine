@@ -18,9 +18,10 @@ This preload phase is **incompatible with Wine/CrossOver/Proton** — it causes 
 |--------|-----|
 | **No d3dx9_42.dll preloader** | Wine crashes when hooks are installed during the preload phase |
 | **No TBB dependency** | `tbb::concurrent_hash_map` replaced with `std::shared_mutex` + `std::unordered_map` (256 shards) |
-| **No memory manager overrides** | TBB malloc replacement is Wine-incompatible; removed entirely |
+| **Wine-compatible memory allocator** | TBB malloc replacement crashes under Wine; replaced with HeapAlloc/HeapFree (v1.21.0+) |
+| **ScrapHeap expansion** | Per-thread ScrapHeap expanded from 64MB to 512MB for large mod lists |
 
-All **38 bug fixes** and **14 patches** from SSE Engine Fixes are preserved.
+All **38 bug fixes** and **14 patches** from SSE Engine Fixes are preserved, plus Wine-specific additions.
 
 ## Included Fixes
 
@@ -37,6 +38,13 @@ All **38 bug fixes** and **14 patches** from SSE Engine Fixes are preserved.
 - Save Screenshots, Saved Havok Data Load Init, ShadowSceneNode Null Pointer Crash
 - Texture Load Crash, Torch Landscape, Tree Reflections
 - Vertical Look Sensitivity, Weapon Block Scaling
+
+## Wine-Specific Additions
+
+- **Wine null actor base crash fix** — prevents crashes from null parent cells and actor bases unique to Wine
+- **Wine-compatible memory allocator** — replaces TBB with HeapAlloc/HeapFree via SafetyHook inline hooks on MemoryManager::Allocate/Deallocate/Reallocate. Uses a dedicated growable heap (HeapCreate) with 32-byte allocation headers for tracking.
+- **ScrapHeap expansion** — hooks GetThreadScrapHeap to expand per-thread reserve from 64MB to 512MB before first use
+- **Editor ID cache** — diagnostic + safe repopulation of editor IDs for Wine compatibility (investigating form loading with large mod lists)
 
 ## Included Patches
 
@@ -81,6 +89,18 @@ For AE build:
 cmake -B build -S . -DBUILD_SKYRIMAE=ON -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" -DVCPKG_TARGET_TRIPLET=x64-windows-static
 cmake --build build --config Release
 ```
+
+## Known Issues / Active Investigation
+
+**Form loading with large mod lists under Wine (v1.21.x):**
+
+With the Gate to Sovngarde modlist (1720 enabled plugins), ESM forms are not being registered in the engine's form maps at `kDataLoaded`. Only ~166 engine-internal forms exist; all ESM forms (Gold001, defaultUnarmedWeap, etc.) return NULL from `TESForm::LookupByEditorID` and `GetFormByNumericId`.
+
+Findings so far:
+- **Memory is NOT the cause** — v1.21.0 added a HeapAlloc-based allocator that successfully handled 1.3GB / 1.8M allocations with 0 failures. Forms still don't load.
+- **Skyrim.ini [Memory] settings have no effect** — AE ignores DefaultHeapInitialAllocMB/ScrapHeapSizeMB (hardcoded in binary)
+- **Investigating: `FormScatterTable::SetAt` callsite hooks** — the form_caching.h patch uses hardcoded offsets within TESForm::ctor for AE. If these offsets are wrong for AE 1.6.1170, `write_call<5>` would corrupt the constructor, preventing all form creation after SKSE loads.
+- Smaller modlists (Immersive & Pure, ~100 mods) appear to work under Wine
 
 ## Credits
 
