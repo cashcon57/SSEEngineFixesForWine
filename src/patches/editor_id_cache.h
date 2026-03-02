@@ -923,17 +923,33 @@ namespace Patches::EditorIdCache
                         auto regCount = *reinterpret_cast<const std::uint32_t*>(tdhAddr + 0xD80);
                         auto eslCount = *reinterpret_cast<const std::uint32_t*>(tdhAddr + 0xD98);
 
-                        // Count files in BSSimpleList (only occasionally to avoid overhead)
+                        // Count files and active flags (only occasionally to avoid overhead)
                         std::size_t fileCount = 0;
+                        std::size_t activeCount = 0;
+                        std::size_t masterCount = 0;
+                        std::size_t smallFileCount = 0;
                         if (tick % 5 == 0) {
                             for (auto& file : tdh->files) {
-                                if (file) ++fileCount;
+                                if (file) {
+                                    ++fileCount;
+                                    if (file->recordFlags.all(RE::TESFile::RecordFlag::kActive))
+                                        ++activeCount;
+                                    if (file->recordFlags.all(RE::TESFile::RecordFlag::kMaster))
+                                        ++masterCount;
+                                    if (file->recordFlags.all(RE::TESFile::RecordFlag::kSmallFile))
+                                        ++smallFileCount;
+                                }
                             }
                         }
 
-                        logger::info("  compiled: {} reg + {} ESL | loadingFiles: {} | files: {}",
-                            regCount, eslCount, isLoading,
-                            tick % 5 == 0 ? std::to_string(fileCount) : std::string("(skip)"));
+                        if (tick % 5 == 0) {
+                            logger::info("  compiled: {} reg + {} ESL | loadingFiles: {} | files: {} (active={}, master={}, small={})",
+                                regCount, eslCount, isLoading,
+                                fileCount, activeCount, masterCount, smallFileCount);
+                        } else {
+                            logger::info("  compiled: {} reg + {} ESL | loadingFiles: {}",
+                                regCount, eslCount, isLoading);
+                        }
                     }
                 } else {
                     // TDH doesn't exist yet — check raw pointer to detect transitions
@@ -1040,12 +1056,27 @@ namespace Patches::EditorIdCache
                     }
                 }
 
+                // Count active/master/smallFile flags
+                std::size_t activeCount = 0, masterFlagCount = 0, smallFileFlagCount = 0;
+                for (auto& file : tdh->files) {
+                    if (!file) continue;
+                    if (file->recordFlags.all(RE::TESFile::RecordFlag::kActive))
+                        ++activeCount;
+                    if (file->recordFlags.all(RE::TESFile::RecordFlag::kMaster))
+                        ++masterFlagCount;
+                    if (file->recordFlags.all(RE::TESFile::RecordFlag::kSmallFile))
+                        ++smallFileFlagCount;
+                }
+
                 logger::info("  Files: {} total, {} compiled-regular, {} compiled-ESL, {} uncompiled (0xFF)",
                     fileCount, compiledRegular, compiledESL, uncompiledCount);
+                logger::info("  Flags: {} kActive, {} kMaster, {} kSmallFile",
+                    activeCount, masterFlagCount, smallFileFlagCount);
 
                 if ((compiledRegular + compiledESL) == 0 && fileCount > 0) {
                     logger::warn("  >>> ZERO files have compile indices! The loading loop NEVER ASSIGNED them."sv);
                     logger::warn("  >>> This means the engine never processed plugin records."sv);
+                    logger::warn("  >>> Active files: {} (expected from plugins.txt)", activeCount);
                 }
             }
 
