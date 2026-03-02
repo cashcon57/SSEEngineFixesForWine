@@ -51,57 +51,59 @@ namespace Patches::FormCaching
         inline std::atomic<std::uint64_t> g_readDataBytes{ 0 };
         inline std::atomic<bool> g_seekNextFormReturnedFalse{ false };
 
-        // v1.22.8: CompileFiles pipeline hooks — trace which loading phases execute
-        inline std::atomic<std::uint64_t> g_sub13707Calls{ 0 };
-        inline std::atomic<std::uint64_t> g_sub13716Calls{ 0 };
-        inline std::atomic<std::uint64_t> g_sub13721Calls{ 0 };
-
-        inline SafetyHookInline g_hk_sub13707;
-        inline SafetyHookInline g_hk_sub13716;
-        inline SafetyHookInline g_hk_sub13721;
-
-        // Generic passthrough hooks that just log entry
-        inline void Sub13707_Hook(RE::TESDataHandler* a_self)
+        // v1.22.10: Enhanced ClearData diagnostic — dumps files list state
+        // when ClearData fires, to see what the engine knew about before compile
+        inline void DumpFilesListState(RE::TESDataHandler* a_self, const char* context)
         {
-            auto count = g_sub13707Calls.fetch_add(1, std::memory_order_relaxed);
-            logger::info(">>> TDH::sub_13707 (AE) CALLED #{} (files list size: {})"sv,
-                count + 1, a_self ? a_self->files.size() : 0);
-            g_hk_sub13707.call(a_self);
-            // Log state after return
-            if (a_self) {
-                auto& cc = a_self->compiledFileCollection;
-                logger::info("<<< TDH::sub_13707 returned: compiled={} reg + {} ESL, loadingFiles={}"sv,
-                    cc.files.size(), cc.smallFiles.size(),
-                    *reinterpret_cast<bool*>(reinterpret_cast<uintptr_t>(a_self) + 0xDA8));
-            }
-        }
+            if (!a_self) return;
 
-        inline void Sub13716_Hook(RE::TESDataHandler* a_self)
-        {
-            auto count = g_sub13716Calls.fetch_add(1, std::memory_order_relaxed);
-            logger::info(">>> TDH::sub_13716 (AE) CALLED #{} (files list size: {})"sv,
-                count + 1, a_self ? a_self->files.size() : 0);
-            g_hk_sub13716.call(a_self);
-            if (a_self) {
-                auto& cc = a_self->compiledFileCollection;
-                logger::info("<<< TDH::sub_13716 returned: compiled={} reg + {} ESL, loadingFiles={}"sv,
-                    cc.files.size(), cc.smallFiles.size(),
-                    *reinterpret_cast<bool*>(reinterpret_cast<uintptr_t>(a_self) + 0xDA8));
-            }
-        }
+            std::size_t fileCount = 0;
+            std::size_t masterCount = 0;
+            std::size_t smallFileCount = 0;
+            std::size_t activeCount = 0;
+            std::size_t compiledCount = 0;
 
-        inline void Sub13721_Hook(RE::TESDataHandler* a_self)
-        {
-            auto count = g_sub13721Calls.fetch_add(1, std::memory_order_relaxed);
-            logger::info(">>> TDH::sub_13721 (AE) CALLED #{} (files list size: {})"sv,
-                count + 1, a_self ? a_self->files.size() : 0);
-            g_hk_sub13721.call(a_self);
-            if (a_self) {
-                auto& cc = a_self->compiledFileCollection;
-                logger::info("<<< TDH::sub_13721 returned: compiled={} reg + {} ESL, loadingFiles={}"sv,
-                    cc.files.size(), cc.smallFiles.size(),
-                    *reinterpret_cast<bool*>(reinterpret_cast<uintptr_t>(a_self) + 0xDA8));
+            for (auto& file : a_self->files) {
+                if (!file) continue;
+                ++fileCount;
+                if (file->recordFlags.all(RE::TESFile::RecordFlag::kMaster))
+                    ++masterCount;
+                if (file->recordFlags.all(RE::TESFile::RecordFlag::kSmallFile))
+                    ++smallFileCount;
+                if (file->recordFlags.all(RE::TESFile::RecordFlag::kActive))
+                    ++activeCount;
+                if (file->compileIndex != 0xFF)
+                    ++compiledCount;
+
+                // Log first 20 files and last 5
+                if (fileCount <= 20) {
+                    logger::info("  [{}] {} '{}' flags=0x{:08X} compIdx=0x{:02X} smallIdx=0x{:04X}",
+                        context, fileCount, file->fileName,
+                        file->recordFlags.underlying(),
+                        file->compileIndex, file->smallFileCompileIndex);
+                }
             }
+
+            // Log last 5 if there are more than 25
+            if (fileCount > 25) {
+                std::size_t idx = 0;
+                for (auto& file : a_self->files) {
+                    if (!file) continue;
+                    ++idx;
+                    if (idx > fileCount - 5) {
+                        logger::info("  [{}] {} '{}' flags=0x{:08X} compIdx=0x{:02X} smallIdx=0x{:04X}",
+                            context, idx, file->fileName,
+                            file->recordFlags.underlying(),
+                            file->compileIndex, file->smallFileCompileIndex);
+                    }
+                }
+            }
+
+            auto& cc = a_self->compiledFileCollection;
+            logger::info("  [{}] SUMMARY: {} files, {} master, {} small, {} active, {} compiled, "
+                         "compiledCollection={} reg + {} ESL, loadingFiles={}",
+                context, fileCount, masterCount, smallFileCount, activeCount, compiledCount,
+                cc.files.size(), cc.smallFiles.size(), a_self->loadingFiles);
         }
 
         struct ShardedCache
@@ -238,7 +240,10 @@ namespace Patches::FormCaching
         inline void TESDataHandler_ClearData(RE::TESDataHandler* a_self)
         {
             auto count = g_clearDataCalls.fetch_add(1, std::memory_order_relaxed) + 1;
-            logger::info(">>> ClearData called (call #{}) — wiping form caches"sv, count);
+            logger::info(">>> ClearData called (call #{}) — dumping state BEFORE clear"sv, count);
+
+            // v1.22.10: Dump files list state before ClearData wipes it
+            DumpFilesListState(a_self, "PRE-ClearData");
 
             for (auto& shard : g_formCache) {
                 std::unique_lock lock(shard.mutex);
@@ -248,6 +253,9 @@ namespace Patches::FormCaching
             TreeLodReferenceCaching::detail::ClearCache();
 
             g_hk_ClearData.call(a_self);
+
+            // Dump state after ClearData too
+            DumpFilesListState(a_self, "POST-ClearData");
         }
 
         inline SafetyHookInline g_hk_InitializeFormDataStructures;
@@ -255,7 +263,13 @@ namespace Patches::FormCaching
         inline void TESForm_InitializeFormDataStructures()
         {
             auto count = g_initFormDataCalls.fetch_add(1, std::memory_order_relaxed) + 1;
-            logger::info(">>> InitializeFormDataStructures called (call #{}) — resetting form map"sv, count);
+            logger::info(">>> InitializeFormDataStructures called (call #{})"sv, count);
+
+            // v1.22.10: Check TDH state at init time
+            auto* tdh = RE::TESDataHandler::GetSingleton();
+            if (tdh) {
+                DumpFilesListState(tdh, "PRE-InitFormData");
+            }
 
             for (auto& shard : g_formCache) {
                 std::unique_lock lock(shard.mutex);
@@ -472,23 +486,9 @@ namespace Patches::FormCaching
             g_hk_ReadData = safetyhook::create_inline(ReadData.address(), TESFile_ReadData);
             logger::info("form caching: ReadData hook at 0x{:X}"sv, ReadData.address());
 
-            // v1.22.8: Hook CompileFiles pipeline functions to trace which phases execute
-            {
-                const REL::Relocation sub13707{ RELOCATION_ID(13611, 13707) };
-                g_hk_sub13707 = safetyhook::create_inline(sub13707.address(), Sub13707_Hook);
-                logger::info("form caching: sub_13707 hook at 0x{:X} (offset 0x{:X})"sv,
-                    sub13707.address(), sub13707.address() - REL::Module::get().base());
-
-                const REL::Relocation sub13716{ RELOCATION_ID(13620, 13716) };
-                g_hk_sub13716 = safetyhook::create_inline(sub13716.address(), Sub13716_Hook);
-                logger::info("form caching: sub_13716 hook at 0x{:X} (offset 0x{:X})"sv,
-                    sub13716.address(), sub13716.address() - REL::Module::get().base());
-
-                const REL::Relocation sub13721{ RELOCATION_ID(13623, 13721) };
-                g_hk_sub13721 = safetyhook::create_inline(sub13721.address(), Sub13721_Hook);
-                logger::info("form caching: sub_13721 hook at 0x{:X} (offset 0x{:X})"sv,
-                    sub13721.address(), sub13721.address() - REL::Module::get().base());
-            }
+            // v1.22.9: CompileFiles hooks REMOVED — caused crash (wrong RELOCATION_IDs)
+            // SE→AE ID mapping is not a fixed offset; guessed AE IDs were wrong.
+            // Instead, enhanced ClearData + InitFormData hooks dump full TDH state.
 
             // Log all hook addresses for verification
             logger::info("form caching: hook summary — GetForm=0x{:X} AddForm=0x{:X} OpenTES=0x{:X} AddCompileIdx=0x{:X} SeekNextForm=0x{:X} CloseTES=0x{:X}"sv,
