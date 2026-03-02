@@ -163,6 +163,7 @@ namespace Patches::EditorIdCache
 
         // ================================================================
         // Diagnostic: dump state of all game form registries
+        // v1.21.3: Added relocation verification + brute-force form check
         // ================================================================
         inline void DiagnosticDump()
         {
@@ -171,41 +172,181 @@ namespace Patches::EditorIdCache
                 img.base, img.end,
                 static_cast<double>(img.end - img.base) / (1024.0 * 1024.0));
 
-            // 1. Form-by-ID hash map
+            // ============================================================
+            // 0. RELOCATION VERIFICATION — check if CommonLib IDs resolve
+            //    to sane addresses on this AE version
+            // ============================================================
+            {
+                // TDH singleton pointer
+                REL::Relocation<void**> tdhReloc{ RELOCATION_ID(514141, 400269) };
+                auto tdhRelocAddr = tdhReloc.address();
+                logger::info("  RELOC TDH singleton: ID={} -> addr=0x{:X} (offset=0x{:X})",
+#ifdef SKYRIM_AE
+                    400269,
+#else
+                    514141,
+#endif
+                    tdhRelocAddr, tdhRelocAddr - img.base);
+
+                // Check if relocation address is within image
+                bool tdhInImage = (tdhRelocAddr >= img.base && tdhRelocAddr < img.end);
+                logger::info("    reloc addr in image: {} (expected: YES for .data global)", tdhInImage);
+
+                // Read the pointer stored there
+                if (!IsBadReadPtr(reinterpret_cast<const void*>(tdhRelocAddr), 8)) {
+                    auto tdhPtr = *reinterpret_cast<const std::uintptr_t*>(tdhRelocAddr);
+                    bool ptrInImage = (tdhPtr >= img.base && tdhPtr < img.end);
+                    logger::info("    dereferenced value: 0x{:X} (in image: {} — expected: NO for heap object)",
+                        tdhPtr, ptrInImage);
+                }
+
+                // allForms map pointer
+                REL::Relocation<void**> allFormsReloc{ RELOCATION_ID(514351, 400507) };
+                auto allFormsRelocAddr = allFormsReloc.address();
+                logger::info("  RELOC allForms: ID={} -> addr=0x{:X} (offset=0x{:X})",
+#ifdef SKYRIM_AE
+                    400507,
+#else
+                    514351,
+#endif
+                    allFormsRelocAddr, allFormsRelocAddr - img.base);
+
+                if (!IsBadReadPtr(reinterpret_cast<const void*>(allFormsRelocAddr), 8)) {
+                    auto mapPtr = *reinterpret_cast<const std::uintptr_t*>(allFormsRelocAddr);
+                    bool mapInImage = (mapPtr >= img.base && mapPtr < img.end);
+                    logger::info("    dereferenced value: 0x{:X} (in image: {})",
+                        mapPtr, mapInImage);
+                }
+
+                // GetFormByNumericId function address (for comparison)
+                REL::Relocation<void*> getFormReloc{ RELOCATION_ID(14461, 14617) };
+                logger::info("  RELOC GetFormByNumericId: ID={} -> addr=0x{:X} (offset=0x{:X})",
+#ifdef SKYRIM_AE
+                    14617,
+#else
+                    14461,
+#endif
+                    getFormReloc.address(), getFormReloc.address() - img.base);
+            }
+
+            // 1. Form-by-ID hash map (via CommonLib)
             {
                 const auto& [formMap, formLock] = RE::TESForm::GetAllForms();
                 if (formMap) {
                     auto stats = ReadHashMapStats(formMap);
-                    logger::info("  form-by-ID map: ~{} entries (capacity={}, free={})",
-                        stats.used, stats.capacity, stats.freeSlots);
+                    logger::info("  form-by-ID map (CommonLib): ~{} entries (capacity={}, free={}) at {:p}",
+                        stats.used, stats.capacity, stats.freeSlots, (void*)formMap);
                 } else {
                     logger::warn("  form-by-ID map: NULL pointer!"sv);
                 }
             }
 
-            // 2. Editor-ID hash map (FIRST TIME checking this!)
+            // 2. Editor-ID hash map
             {
                 const auto& [editorMap, editorLock] = RE::TESForm::GetAllFormsByEditorID();
                 if (editorMap) {
                     auto stats = ReadHashMapStats(editorMap);
                     logger::info("  editor-ID map: ~{} entries (capacity={}, free={})",
                         stats.used, stats.capacity, stats.freeSlots);
-
-                    // If the editor-ID map has entries, try looking up key editor IDs
-                    if (stats.used > 0) {
-                        logger::info("  editor-ID map has entries! Trying native lookups..."sv);
-                    }
                 } else {
                     logger::warn("  editor-ID map: NULL pointer!"sv);
                 }
             }
 
-            // 3. Native LookupByEditorID — uses game's editor-ID map directly
+            // ============================================================
+            // 3. BRUTE-FORCE FORM CHECK — use game's own GetFormByNumericId
+            //    (via trampoline) to check if forms ACTUALLY exist.
+            //    This bypasses CommonLib's potentially wrong relocation IDs.
+            // ============================================================
+            {
+                logger::info("  --- brute-force form check via game function ---"sv);
+
+                // Check specific known Skyrim.esm forms
+                struct TestId { RE::FormID id; const char* name; };
+                TestId specifics[] = {
+                    { 0x14,    "PlayerRef" },
+                    { 0x07,    "Player" },
+                    { 0x3B,    "Gold001" },
+                    { 0x1,     "Keyword:Null" },
+                    { 0x2,     "LocationRefType:Null" },
+                    { 0x12E46, "defaultUnarmedWeap" },
+                    { 0x13F8D, "WeapTypeUnarmed" },
+                    { 0x1D4EC, "Torch01" },
+                };
+                for (auto& t : specifics) {
+                    auto* form = Patches::FormCaching::detail::GameLookupFormByID(t.id);
+                    if (form) {
+                        // Read form type from raw memory (offset 0x1A in TESForm)
+                        auto formType = *reinterpret_cast<const std::uint8_t*>(
+                            reinterpret_cast<const std::uint8_t*>(form) + 0x1A);
+                        logger::info("  GameLookup({}, 0x{:X}): {:p} type=0x{:02X}",
+                            t.name, t.id, (void*)form, formType);
+                    } else {
+                        logger::info("  GameLookup({}, 0x{:X}): NULL", t.name, t.id);
+                    }
+                }
+
+                // Sweep ranges to count how many forms exist via game function
+                // Range 0x001-0x0FF: hardcoded engine forms
+                std::size_t found_0001_00FF = 0;
+                for (RE::FormID id = 0x01; id <= 0xFF; ++id) {
+                    if (Patches::FormCaching::detail::GameLookupFormByID(id))
+                        ++found_0001_00FF;
+                }
+                logger::info("  GameLookup sweep 0x001-0x0FF: {}/255 found", found_0001_00FF);
+
+                // Range 0x100-0xFFF: early Skyrim.esm forms
+                std::size_t found_0100_0FFF = 0;
+                for (RE::FormID id = 0x100; id <= 0xFFF; ++id) {
+                    if (Patches::FormCaching::detail::GameLookupFormByID(id))
+                        ++found_0100_0FFF;
+                }
+                logger::info("  GameLookup sweep 0x100-0xFFF: {}/3840 found", found_0100_0FFF);
+
+                // Range 0x1000-0x1FFF: more Skyrim.esm forms
+                std::size_t found_1000_1FFF = 0;
+                for (RE::FormID id = 0x1000; id <= 0x1FFF; ++id) {
+                    if (Patches::FormCaching::detail::GameLookupFormByID(id))
+                        ++found_1000_1FFF;
+                }
+                logger::info("  GameLookup sweep 0x1000-0x1FFF: {}/4096 found", found_1000_1FFF);
+
+                // Check if plugins are loaded (compile index 01 = Update.esm)
+                std::size_t found_01 = 0;
+                for (RE::FormID id = 0x01000000; id <= 0x01000FFF; ++id) {
+                    if (Patches::FormCaching::detail::GameLookupFormByID(id))
+                        ++found_01;
+                }
+                logger::info("  GameLookup sweep 0x01000000-0x01000FFF (Update.esm): {}/4096 found", found_01);
+
+                // Compile index 02 = Dawnguard.esm
+                std::size_t found_02 = 0;
+                for (RE::FormID id = 0x02000000; id <= 0x02000FFF; ++id) {
+                    if (Patches::FormCaching::detail::GameLookupFormByID(id))
+                        ++found_02;
+                }
+                logger::info("  GameLookup sweep 0x02000000-0x02000FFF (Dawnguard.esm): {}/4096 found", found_02);
+
+                // Compile index FE (light plugins / ESL)
+                std::size_t found_FE = 0;
+                for (RE::FormID id = 0xFE000000; id <= 0xFE000FFF; ++id) {
+                    if (Patches::FormCaching::detail::GameLookupFormByID(id))
+                        ++found_FE;
+                }
+                logger::info("  GameLookup sweep 0xFE000000-0xFE000FFF (ESL range): {}/4096 found", found_FE);
+
+                // Total across all sweeps
+                logger::info("  GameLookup total found: {}",
+                    found_0001_00FF + found_0100_0FFF + found_1000_1FFF +
+                    found_01 + found_02 + found_FE);
+            }
+
+            // 4. Native LookupByEditorID — uses CommonLib's editor-ID map
             {
                 const char* testIds[] = {
                     "PlayerRef", "Player", "Gold001",
                     "defaultUnarmedWeap", "WeapTypeUnarmed", "Torch01",
-                    "GameHour", "TimeScale", "Gammaybe",
+                    "GameHour", "TimeScale",
                 };
                 for (auto eid : testIds) {
                     auto* form = RE::TESForm::LookupByEditorID(std::string_view(eid));
@@ -219,114 +360,76 @@ namespace Patches::EditorIdCache
                 }
             }
 
-            // 4. GameLookupFormByID for key forms
-            {
-                struct TestId { RE::FormID id; const char* name; };
-                TestId tests[] = {
-                    { 0x14,    "PlayerRef" },
-                    { 0x07,    "Player" },
-                    { 0x3B,    "Gold001" },
-                    { 0x12E46, "defaultUnarmedWeap" },
-                    { 0x13F8D, "WeapTypeUnarmed" },
-                    { 0x1D4EC, "Torch01" },
-                };
-                for (auto& t : tests) {
-                    auto* form = Patches::FormCaching::detail::GameLookupFormByID(t.id);
-                    if (form) {
-                        logger::info("  GameLookup({}, 0x{:X}): {:p}",
-                            t.name, t.id, (void*)form);
-                    } else {
-                        logger::info("  GameLookup({}, 0x{:X}): NULL", t.name, t.id);
-                    }
-                }
-            }
-
-            // 5. formArrays sizes (raw offset approach)
+            // 5. TESDataHandler diagnostics
             {
                 auto* tdh = RE::TESDataHandler::GetSingleton();
                 if (tdh) {
-                    logger::info("  TDH address: {:p}", (void*)tdh);
                     auto tdhAddr = reinterpret_cast<std::uintptr_t>(tdh);
+                    bool tdhInImage = (tdhAddr >= img.base && tdhAddr < img.end);
+                    logger::info("  TDH address: {:p} (in image: {} — expected: NO)", (void*)tdh, tdhInImage);
+
+                    if (tdhInImage) {
+                        logger::warn("  TDH appears to be in the game image! This likely means");
+                        logger::warn("  RELOCATION_ID(514141, 400269) resolves to the WRONG address.");
+                        logger::warn("  The TDH singleton pointer might be stale/wrong for AE 1.6.1170.");
+                    }
+
+                    // Try both raw offset AND CommonLib typed accessor for compiledFileCollection
+                    logger::info("  --- compiledFileCollection (raw offset vs typed) ---"sv);
+
+                    // Raw offset approach
+                    if (!IsBadReadPtr(reinterpret_cast<const void*>(tdhAddr + 0xD70), 0x30)) {
+                        auto regCount = *reinterpret_cast<const std::uint32_t*>(tdhAddr + 0xD80);
+                        auto eslCount = *reinterpret_cast<const std::uint32_t*>(tdhAddr + 0xD98);
+                        logger::info("    raw offset: {} regular, {} ESL-flagged", regCount, eslCount);
+                    }
+
+                    // CommonLib typed accessor
+                    auto& files = tdh->compiledFileCollection.files;
+                    auto& smallFiles = tdh->compiledFileCollection.smallFiles;
+                    logger::info("    typed accessor: {} regular, {} ESL-flagged",
+                        files.size(), smallFiles.size());
+
+                    // Also check the `files` BSSimpleList (at offset 0xD60)
+                    // This is the list of ALL loaded TESFile objects
+                    logger::info("  --- TDH files list (BSSimpleList at +0xD60) ---"sv);
+                    std::size_t fileListCount = 0;
+                    for (auto& file : tdh->files) {
+                        if (file && fileListCount < 10) {
+                            logger::info("    file: '{}'", file->fileName);
+                        }
+                        ++fileListCount;
+                    }
+                    logger::info("    total files in list: {}", fileListCount);
+
+                    // formArrays scan (sample a few types)
                     struct FA { std::uint8_t type; const char* name; };
                     FA types[] = {
                         { 0x04, "Keyword" }, { 0x29, "Weapon" }, { 0x1A, "Armor" },
                         { 0x2B, "NPC" }, { 0x3C, "Cell" }, { 0x3D, "Ref" },
-                        { 0x05, "Action" }, { 0x15, "Static" }, { 0x31, "Quest" },
                     };
                     std::size_t totalForms = 0;
                     for (auto& fa : types) {
-                        auto offset = 0x010 + static_cast<std::size_t>(fa.type) * 0x18;
-                        auto* arrBase = reinterpret_cast<const std::uint8_t*>(tdhAddr + offset);
-                        if (IsBadReadPtr(arrBase, 0x18)) continue;
-                        auto dataPtr = *reinterpret_cast<const std::uintptr_t*>(arrBase);
-                        auto cap = *reinterpret_cast<const std::uint32_t*>(arrBase + 0x08);
-                        auto sz = *reinterpret_cast<const std::uint32_t*>(arrBase + 0x10);
-                        totalForms += sz;
-                        if (sz > 0 || cap > 0) {
-                            logger::info("  formArrays[{}]: size={} cap={} data=0x{:X}",
-                                fa.name, sz, cap, dataPtr);
+                        auto& arr = tdh->GetFormArray(static_cast<RE::FormType>(fa.type));
+                        totalForms += arr.size();
+                        if (arr.size() > 0 || arr.capacity() > 0) {
+                            logger::info("  formArrays[{}]: size={} cap={}", fa.name, arr.size(), arr.capacity());
                         }
                     }
                     if (totalForms == 0) {
                         logger::warn("  formArrays: ALL EMPTY (0 forms in checked types)"sv);
                     }
-                }
-            }
 
-            // 6. Loaded file count + formArrays scan
-            {
-                auto* tdh = RE::TESDataHandler::GetSingleton();
-                if (tdh) {
-                    auto tdhAddr = reinterpret_cast<std::uintptr_t>(tdh);
-
-                    // Count non-empty formArrays (at TDH+0x010, 0x18 bytes each)
+                    // Count non-empty arrays
                     std::size_t nonEmptyArrays = 0;
                     for (std::uint8_t t = 0; t < 0x8A; ++t) {
-                        auto offset = 0x010 + static_cast<std::size_t>(t) * 0x18;
-                        auto* arrBase = reinterpret_cast<const std::uint8_t*>(tdhAddr + offset);
-                        if (IsBadReadPtr(arrBase, 0x18)) continue;
-                        auto sz = *reinterpret_cast<const std::uint32_t*>(arrBase + 0x10);
-                        if (sz > 0) ++nonEmptyArrays;
+                        auto& arr = tdh->GetFormArray(static_cast<RE::FormType>(t));
+                        if (arr.size() > 0) ++nonEmptyArrays;
                     }
                     logger::info("  TDH formArrays: {}/138 types have entries", nonEmptyArrays);
 
-                    // compiledFileCollection at TDH+0xD70
-                    // files (BSTArray<TESFile*>): _data=D70, _cap=D78, _size=D80
-                    // smallFiles (BSTArray<TESFile*>): _data=D88, _cap=D90, _size=D98
-                    if (!IsBadReadPtr(reinterpret_cast<const void*>(tdhAddr + 0xD70), 0x30)) {
-                        auto regCount = *reinterpret_cast<const std::uint32_t*>(tdhAddr + 0xD80);
-                        auto eslCount = *reinterpret_cast<const std::uint32_t*>(tdhAddr + 0xD98);
-                        logger::info("  compiled files: {} regular, {} ESL-flagged, {} total",
-                            regCount, eslCount, regCount + eslCount);
-
-                        // Log first few file names if files exist
-                        if (regCount > 0) {
-                            auto filesData = *reinterpret_cast<const std::uintptr_t*>(tdhAddr + 0xD70);
-                            if (filesData && !IsBadReadPtr(reinterpret_cast<const void*>(filesData),
-                                regCount * sizeof(void*))) {
-                                auto limit = std::min(regCount, std::uint32_t(10));
-                                for (std::uint32_t i = 0; i < limit; ++i) {
-                                    auto filePtr = *reinterpret_cast<const std::uintptr_t*>(
-                                        filesData + i * sizeof(void*));
-                                    if (filePtr && !IsBadReadPtr(reinterpret_cast<const void*>(filePtr), 0x100)) {
-                                        // TESFile has fileName at various offsets. Try the common one.
-                                        // In CommonLib, TESFile::fileName is a char[260] near the start.
-                                        // Offset varies: typically 0x08 after vtable, or check raw bytes.
-                                        // Just log the pointer for now.
-                                        logger::info("    file[{}]: {:p}", i, (void*)filePtr);
-                                    }
-                                }
-                            }
-                        }
-                    } else {
-                        logger::warn("  compiledFileCollection: unreadable at TDH+0xD70"sv);
-                    }
-
-                    // loadingFiles flag at TDH+0xDA8
-                    if (!IsBadReadPtr(reinterpret_cast<const void*>(tdhAddr + 0xDA8), 1)) {
-                        auto loading = *reinterpret_cast<const bool*>(tdhAddr + 0xDA8);
-                        logger::info("  loadingFiles: {}", loading);
-                    }
+                    // loadingFiles
+                    logger::info("  loadingFiles: {}", tdh->loadingFiles);
                 }
             }
         }
