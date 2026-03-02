@@ -196,6 +196,13 @@ namespace Patches::FormCaching
             const REL::Relocation RemoveAt{ RELOCATION_ID(14514, 14710) };
             g_hk_RemoveAt = safetyhook::create_inline(RemoveAt.address(), FormMap_RemoveAt);
 
+            // DISABLED: SetAt callsite hooks may corrupt TESForm::ctor with wrong
+            // offsets for AE 1.6.1170, preventing all form creation after SKSE loads.
+            // The 166 pre-existing forms (created before SKSE) are the only ones that
+            // survive, while all ESM form creation silently fails.
+            // TODO: Verify correct offsets for AE 1.6.1170 before re-enabling.
+            logger::info("form caching: SetAt callsite hooks DISABLED (investigating form creation failure)"sv);
+#if 0
             // there is one call that is not the form table so we will callsite hook
 #ifdef SKYRIM_AE
             constexpr std::array todoSetAt = {
@@ -216,6 +223,7 @@ namespace Patches::FormCaching
                 REL::Relocation target{ REL::ID(id), offset };
                 orig_FormScatterTable_SetAt = target.write_call<5>(FormScatterTable_SetAt);
             }
+#endif
 
             const REL::Relocation ClearData{ RELOCATION_ID(13646, 13754) };
             g_hk_ClearData = safetyhook::create_inline(ClearData.address(), TESDataHandler_ClearData);
