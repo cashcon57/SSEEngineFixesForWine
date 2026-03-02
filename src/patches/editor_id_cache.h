@@ -222,11 +222,21 @@ namespace Patches::EditorIdCache
             // have editor IDs on them by now.
             auto* dh = RE::TESDataHandler::GetSingleton();
             if (dh) {
+                logger::info("  TESDataHandler ptr={:p}, FormType::Max={}"sv,
+                    (void*)dh, static_cast<std::uint32_t>(RE::FormType::Max));
+
                 std::size_t formsScanned = 0;
                 std::size_t editorIdsFound = 0;
+                std::size_t nonEmptyArrays = 0;
 
                 for (std::uint32_t ft = 0; ft < static_cast<std::uint32_t>(RE::FormType::Max); ++ft) {
                     auto& arr = dh->GetFormArray(static_cast<RE::FormType>(ft));
+                    if (arr.size() > 0) {
+                        ++nonEmptyArrays;
+                        if (nonEmptyArrays <= 5) {
+                            logger::info("  FormType {} has {} forms"sv, ft, arr.size());
+                        }
+                    }
                     for (auto* form : arr) {
                         if (!form) continue;
                         ++formsScanned;
@@ -244,15 +254,63 @@ namespace Patches::EditorIdCache
                     }
                 }
 
-                logger::info("editor ID cache: TESDataHandler: {} forms scanned, {} with editor IDs"sv,
-                    formsScanned, editorIdsFound);
+                logger::info("editor ID cache: TESDataHandler: {} forms scanned, {} with editor IDs, {} non-empty arrays"sv,
+                    formsScanned, editorIdsFound, nonEmptyArrays);
             } else {
                 logger::warn("editor ID cache: TESDataHandler::GetSingleton() returned null"sv);
             }
 
-            // === Phase 1b: Fallback to raw BSTHashMap iteration ===
+            // === Phase 1b: Raw iterate form-by-ID BSTHashMap (RE::TESForm::GetAllForms) ===
             if (newCache.empty()) {
-                logger::info("editor ID cache: TESDataHandler found nothing, trying raw BSTHashMap..."sv);
+                logger::info("editor ID cache: trying form-by-ID BSTHashMap..."sv);
+
+                const auto& [formMap, formLock] = RE::TESForm::GetAllForms();
+                if (formMap) {
+                    auto* raw = reinterpret_cast<const std::uint8_t*>(formMap);
+                    auto capacity = *reinterpret_cast<const std::uint32_t*>(raw + 0x0C);
+                    auto freeCount = *reinterpret_cast<const std::uint32_t*>(raw + 0x10);
+                    auto entriesAddr = *reinterpret_cast<std::uintptr_t const*>(raw + 0x28);
+
+                    logger::info("  form-by-ID map: capacity={}, used={}, entries=0x{:X}"sv,
+                        capacity, capacity > freeCount ? capacity - freeCount : 0, entriesAddr);
+
+                    if (capacity > 0 && capacity < 10000000 && isLikelyPointer(entriesAddr)) {
+                        auto* entries = reinterpret_cast<const std::uint8_t*>(entriesAddr);
+                        constexpr std::size_t ENTRY_SIZE = 24;  // FormID(4)+pad(4)+TESForm*(8)+next(8)
+                        std::size_t formsFound = 0;
+                        std::size_t editorIdsFound = 0;
+
+                        for (std::uint32_t i = 0; i < capacity; ++i) {
+                            auto* e = entries + (static_cast<std::size_t>(i) * ENTRY_SIZE);
+                            auto nextAddr = *reinterpret_cast<std::uintptr_t const*>(e + 0x10);
+                            if (nextAddr == 0) continue;
+
+                            auto* form = *reinterpret_cast<RE::TESForm* const*>(e + 0x08);
+                            if (!form) continue;
+                            ++formsFound;
+
+                            const char* editorId = form->GetFormEditorID();
+                            if (editorId && editorId[0] != '\0') {
+                                newCache.try_emplace(std::string(editorId), form);
+                                ++editorIdsFound;
+                                if (editorIdsFound <= 10) {
+                                    logger::info("  EditorID: '{}' -> FormID 0x{:08X}"sv,
+                                        editorId, form->GetFormID());
+                                }
+                            }
+                        }
+
+                        logger::info("  form-by-ID: {} forms found, {} with editor IDs"sv,
+                            formsFound, editorIdsFound);
+                    }
+                } else {
+                    logger::warn("  form-by-ID map pointer is null"sv);
+                }
+            }
+
+            // === Phase 1c: Fallback to raw editor-ID-to-form BSTHashMap ===
+            if (newCache.empty()) {
+                logger::info("editor ID cache: trying editor-ID-to-form BSTHashMap..."sv);
                 RawIterateEditorIdMap(newCache);
             }
 
