@@ -51,6 +51,59 @@ namespace Patches::FormCaching
         inline std::atomic<std::uint64_t> g_readDataBytes{ 0 };
         inline std::atomic<bool> g_seekNextFormReturnedFalse{ false };
 
+        // v1.22.8: CompileFiles pipeline hooks — trace which loading phases execute
+        inline std::atomic<std::uint64_t> g_sub13707Calls{ 0 };
+        inline std::atomic<std::uint64_t> g_sub13716Calls{ 0 };
+        inline std::atomic<std::uint64_t> g_sub13721Calls{ 0 };
+
+        inline SafetyHookInline g_hk_sub13707;
+        inline SafetyHookInline g_hk_sub13716;
+        inline SafetyHookInline g_hk_sub13721;
+
+        // Generic passthrough hooks that just log entry
+        inline void Sub13707_Hook(RE::TESDataHandler* a_self)
+        {
+            auto count = g_sub13707Calls.fetch_add(1, std::memory_order_relaxed);
+            logger::info(">>> TDH::sub_13707 (AE) CALLED #{} (files list size: {})"sv,
+                count + 1, a_self ? a_self->files.size() : 0);
+            g_hk_sub13707.call(a_self);
+            // Log state after return
+            if (a_self) {
+                auto& cc = a_self->compiledFileCollection;
+                logger::info("<<< TDH::sub_13707 returned: compiled={} reg + {} ESL, loadingFiles={}"sv,
+                    cc.files.size(), cc.smallFiles.size(),
+                    *reinterpret_cast<bool*>(reinterpret_cast<uintptr_t>(a_self) + 0xDA8));
+            }
+        }
+
+        inline void Sub13716_Hook(RE::TESDataHandler* a_self)
+        {
+            auto count = g_sub13716Calls.fetch_add(1, std::memory_order_relaxed);
+            logger::info(">>> TDH::sub_13716 (AE) CALLED #{} (files list size: {})"sv,
+                count + 1, a_self ? a_self->files.size() : 0);
+            g_hk_sub13716.call(a_self);
+            if (a_self) {
+                auto& cc = a_self->compiledFileCollection;
+                logger::info("<<< TDH::sub_13716 returned: compiled={} reg + {} ESL, loadingFiles={}"sv,
+                    cc.files.size(), cc.smallFiles.size(),
+                    *reinterpret_cast<bool*>(reinterpret_cast<uintptr_t>(a_self) + 0xDA8));
+            }
+        }
+
+        inline void Sub13721_Hook(RE::TESDataHandler* a_self)
+        {
+            auto count = g_sub13721Calls.fetch_add(1, std::memory_order_relaxed);
+            logger::info(">>> TDH::sub_13721 (AE) CALLED #{} (files list size: {})"sv,
+                count + 1, a_self ? a_self->files.size() : 0);
+            g_hk_sub13721.call(a_self);
+            if (a_self) {
+                auto& cc = a_self->compiledFileCollection;
+                logger::info("<<< TDH::sub_13721 returned: compiled={} reg + {} ESL, loadingFiles={}"sv,
+                    cc.files.size(), cc.smallFiles.size(),
+                    *reinterpret_cast<bool*>(reinterpret_cast<uintptr_t>(a_self) + 0xDA8));
+            }
+        }
+
         struct ShardedCache
         {
             mutable std::shared_mutex mutex;
@@ -418,6 +471,24 @@ namespace Patches::FormCaching
             const REL::Relocation ReadData{ RELOCATION_ID(13904, 13991) };
             g_hk_ReadData = safetyhook::create_inline(ReadData.address(), TESFile_ReadData);
             logger::info("form caching: ReadData hook at 0x{:X}"sv, ReadData.address());
+
+            // v1.22.8: Hook CompileFiles pipeline functions to trace which phases execute
+            {
+                const REL::Relocation sub13707{ RELOCATION_ID(13611, 13707) };
+                g_hk_sub13707 = safetyhook::create_inline(sub13707.address(), Sub13707_Hook);
+                logger::info("form caching: sub_13707 hook at 0x{:X} (offset 0x{:X})"sv,
+                    sub13707.address(), sub13707.address() - REL::Module::get().base());
+
+                const REL::Relocation sub13716{ RELOCATION_ID(13620, 13716) };
+                g_hk_sub13716 = safetyhook::create_inline(sub13716.address(), Sub13716_Hook);
+                logger::info("form caching: sub_13716 hook at 0x{:X} (offset 0x{:X})"sv,
+                    sub13716.address(), sub13716.address() - REL::Module::get().base());
+
+                const REL::Relocation sub13721{ RELOCATION_ID(13623, 13721) };
+                g_hk_sub13721 = safetyhook::create_inline(sub13721.address(), Sub13721_Hook);
+                logger::info("form caching: sub_13721 hook at 0x{:X} (offset 0x{:X})"sv,
+                    sub13721.address(), sub13721.address() - REL::Module::get().base());
+            }
 
             // Log all hook addresses for verification
             logger::info("form caching: hook summary — GetForm=0x{:X} AddForm=0x{:X} OpenTES=0x{:X} AddCompileIdx=0x{:X} SeekNextForm=0x{:X} CloseTES=0x{:X}"sv,

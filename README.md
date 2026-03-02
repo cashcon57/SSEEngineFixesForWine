@@ -96,38 +96,41 @@ cmake --build build --config Release
 
 With the Gate to Sovngarde modlist (1720 enabled plugins, 3368 total files, 485 BSAs), the game's record-loading pipeline is completely skipped — `AddCompileIndex` is never called, `loadingFiles` is never set to `true`, and `AddFormToDataHandler` registers 0 forms. The game goes from catalog scan (SeekNextForm) straight to `kDataLoaded` with only ~166 engine-internal forms.
 
-**Root Cause: CRT File Handle Limit (512) under Wine**
+**Root Cause: Under Investigation (v1.22.9)**
 
-Through extensive binary search and diagnostic instrumentation (v1.22.0–v1.22.7), the root cause has been identified:
+Through extensive binary search and diagnostic instrumentation (v1.22.0–v1.22.9), the root cause has been narrowed but not yet identified:
 
 | Finding | Detail |
 |---------|--------|
 | **Threshold** | Exactly **599 compiled files** work; **600+ fails** |
 | **Count-based** | Swapping which plugins are enabled doesn't matter — only total compiled count |
-| **CRT bottleneck** | `_setmaxstdio(8192)` reports success, but the CRT can only open **508 additional files** (512 total - 4 reserved) |
-| **Not Unix FDs** | The game process has 4000+ Unix FDs available (via lsof); wineserver has 6000+ |
-| **Not `_setmaxstdio` reset** | Hooked `_setmaxstdio` — game never calls it again after our patch; stays at 8192 |
+| **NOT file handles** | 3-way FD stress test (static CRT, dynamic ucrtbase, Win32 CreateFile) all show **2000+ available** after `_setmaxstdio(8192)` |
+| **NOT Unix FDs** | The game process has 4000+ Unix FDs available (via lsof); wineserver has 6000+ |
+| **NOT `_setmaxstdio` reset** | Hooked `_setmaxstdio` — game never calls it again after our patch; stays at 8192 |
 
-**How it works on Windows vs Wine:**
-- Windows CRT: `_setmaxstdio(8192)` raises both the stream limit AND the underlying fd table capacity. SSE Engine Fixes (original) raises this to 2048–8192, allowing 1000+ mod setups.
-- Wine CRT: `_setmaxstdio(8192)` sets `MSVCRT_max_streams` but the **actual CRT fd table** appears hard-limited to 512 entries in Wine's ucrtbase implementation. This is a Wine compatibility gap.
+**CRT file handle theory debunked (v1.22.8):**
+- v1.22.6–v1.22.7 appeared to show a CRT limit of 508/512 files, but this was a **measurement error**
+- Our SKSE DLL uses **static CRT** (`/MT` link), which has its own `MSVCRT_max_streams` separate from the game's dynamic ucrtbase.dll
+- The stress test was calling `_wfopen_s` in our own static CRT (maxstdio=512), not the game's dynamic CRT (maxstdio=8192)
+- After fixing the test to: (1) raise our own static CRT's maxstdio, and (2) test the game's ucrtbase via GetProcAddress — all three layers show 2000+
+- **Conclusion: file handles are NOT the bottleneck**
 
-**The math:**
-- Each compiled plugin needs at least one CRT file handle for reading records
-- BSA archives also consume CRT handles during loading
-- 485 BSAs + 599 compiled plugins = 1084 file handles needed
-- Wine CRT actual limit: 512
-- Result: when the engine tries to compile 600+ files, file opens silently fail, and the loading pipeline is skipped entirely
+**Current investigation (v1.22.9):**
+- Hooking CompileFiles pipeline functions (AE IDs 13707, 13716, 13721) to trace which loading phases execute
+- These unnamed TESDataHandler functions control compile index assignment and the `loadingFiles` flag
+- Goal: determine whether CompileFiles is never called, exits early, or the compile index loop iterates 0 times
 
 **Diagnostic versions:**
 - v1.22.0–v1.22.2: Instrumented all 10 loading pipeline functions (AddFormToDataHandler, OpenTES, AddCompileIndex, etc.)
 - v1.22.3: Added loading monitor thread with 200ms polling of TESDataHandler state
 - v1.22.4: Hooked `_setmaxstdio` — confirmed game never resets the limit
 - v1.22.5: Added kActive/kMaster/kSmallFile flag counting
-- v1.22.6: Added CRT FD stress test — discovered the 508/512 actual limit
-- v1.22.7: Added Win32 CreateFile stress test to compare CRT vs Win32 handle limits
+- v1.22.6–v1.22.7: FD stress tests (CRT + Win32) — initially appeared to show 512 CRT limit
+- v1.22.8: Fixed FD stress test (static vs dynamic CRT) — **debunked file handle theory**
+- v1.22.9: CompileFiles pipeline hooks to trace compile index assignment
 
-**Previous eliminated causes:**
+**Eliminated causes:**
+- **CRT file handles** (v1.22.8 — static CRT measurement error; actual limit is 2000+)
 - Memory allocator (v1.21.0 HeapAlloc replacement works fine, 0 failures)
 - Skyrim.ini settings (AE ignores them)
 - FormScatterTable::SetAt hooks (disabled, not the cause)

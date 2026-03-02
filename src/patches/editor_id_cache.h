@@ -1089,6 +1089,10 @@ namespace Patches::EditorIdCache
             logger::info("  ReadData: {} calls ({:.1f}MB total)",
                 Patches::FormCaching::detail::g_readDataCalls.load(),
                 static_cast<double>(Patches::FormCaching::detail::g_readDataBytes.load()) / (1024.0 * 1024.0));
+            logger::info("  CompileFiles pipeline: sub_13707={} sub_13716={} sub_13721={}",
+                Patches::FormCaching::detail::g_sub13707Calls.load(),
+                Patches::FormCaching::detail::g_sub13716Calls.load(),
+                Patches::FormCaching::detail::g_sub13721Calls.load());
             logger::info("  loadingFiles ever true: {}",
                 g_loadingFilesEverTrue.load());
 
