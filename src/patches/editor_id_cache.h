@@ -152,7 +152,7 @@ namespace Patches::EditorIdCache
                 lightFileCount = static_cast<std::uint32_t>(smallFiles.size());
                 logger::info("  Loaded files: {} regular, {} light", regularFileCount, lightFileCount);
 
-                for (std::size_t i = 0; i < std::min(files.size(), static_cast<std::size_t>(3)); ++i) {
+                for (std::uint32_t i = 0; i < files.size() && i < 3; ++i) {
                     if (files[i]) {
                         logger::info("    File[{}]: '{}'", i, files[i]->GetFilename());
                     }
