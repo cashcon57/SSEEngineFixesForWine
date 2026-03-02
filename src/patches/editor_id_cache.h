@@ -967,10 +967,9 @@ namespace Patches::EditorIdCache
                         std::vector<FILE*> testFiles;
                         int opened = 0;
                         for (int i = 0; i < 2000; i++) {
-                            wchar_t path[MAX_PATH];
-                            swprintf_s(path, MAX_PATH, L"NUL");
-                            FILE* f = _wfopen(path, L"rb");
-                            if (f) {
+                            FILE* f = nullptr;
+                            errno_t err = _wfopen_s(&f, L"NUL", L"rb");
+                            if (err == 0 && f) {
                                 testFiles.push_back(f);
                                 ++opened;
                             } else {
@@ -978,7 +977,7 @@ namespace Patches::EditorIdCache
                             }
                         }
                         // Close them all
-                        for (auto f : testFiles) fclose(f);
+                        for (auto fp : testFiles) fclose(fp);
                         logger::info("  maxStdio: {} | FD stress: opened {} files before failure", maxStdio, opened);
                     } else {
                         logger::info("  maxStdio: {}", maxStdio);
