@@ -986,22 +986,22 @@ namespace Patches::EditorIdCache
                         std::vector<void*> winHandles;
                         int winOpened = 0;
                         for (int i = 0; i < 2000; i++) {
-                            auto h = REX::W32::CreateFileW(
+                            auto h = ::CreateFileW(
                                 L"NUL",
-                                0x80000000,  // GENERIC_READ
-                                1,           // FILE_SHARE_READ
+                                GENERIC_READ,
+                                FILE_SHARE_READ,
                                 nullptr,
-                                3,           // OPEN_EXISTING
-                                0x80,        // FILE_ATTRIBUTE_NORMAL
+                                OPEN_EXISTING,
+                                FILE_ATTRIBUTE_NORMAL,
                                 nullptr);
-                            if (h != reinterpret_cast<void*>(static_cast<intptr_t>(-1))) {
+                            if (h != INVALID_HANDLE_VALUE) {
                                 winHandles.push_back(h);
                                 ++winOpened;
                             } else {
                                 break;
                             }
                         }
-                        for (auto h : winHandles) REX::W32::CloseHandle(h);
+                        for (auto h : winHandles) ::CloseHandle(h);
                         logger::info("  maxStdio: {} | CRT: {} (errno={}, winErr={}) | Win32: {}",
                             maxStdio, opened, lastErr, winErr, winOpened);
                     } else {
