@@ -193,7 +193,7 @@ namespace Patches::EditorIdCache
                                 }
                                 if (printable && possibleFile[0] != '\0') {
                                     char namePreview[32] = {};
-                                    std::strncpy(namePreview, possibleFile, 31);
+                                    std::memcpy(namePreview, possibleFile, 31);
                                     logger::info("    +0x{:03X}: file array? size={} cap={} first='{}'",
                                         off, size, cap, namePreview);
                                 }
