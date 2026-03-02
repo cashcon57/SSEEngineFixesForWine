@@ -958,10 +958,31 @@ namespace Patches::EditorIdCache
                     logger::info("  TDH: null (raw ptr at reloc: 0x{:X})", rawPtr);
                 }
 
-                // CRT stdio limit check
+                // CRT stdio limit + FD stress test
                 if (Patches::MaxStdIO::g_getmaxstdio) {
                     auto maxStdio = Patches::MaxStdIO::g_getmaxstdio();
-                    logger::info("  maxStdio: {}", maxStdio);
+
+                    // FD stress test: try to open many temp files to find the actual limit
+                    if (tick == 1 || (tick % 10 == 0)) {
+                        std::vector<FILE*> testFiles;
+                        int opened = 0;
+                        for (int i = 0; i < 2000; i++) {
+                            wchar_t path[MAX_PATH];
+                            swprintf_s(path, MAX_PATH, L"NUL");
+                            FILE* f = _wfopen(path, L"rb");
+                            if (f) {
+                                testFiles.push_back(f);
+                                ++opened;
+                            } else {
+                                break;
+                            }
+                        }
+                        // Close them all
+                        for (auto f : testFiles) fclose(f);
+                        logger::info("  maxStdio: {} | FD stress: opened {} files before failure", maxStdio, opened);
+                    } else {
+                        logger::info("  maxStdio: {}", maxStdio);
+                    }
                 }
 
                 // Memory allocator stats (if active)
