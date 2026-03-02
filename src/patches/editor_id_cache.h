@@ -211,7 +211,8 @@ namespace Patches::EditorIdCache
                     auto* form = RE::TESForm::LookupByEditorID(std::string_view(eid));
                     if (form) {
                         logger::info("  NativeLookup('{}'): {:p} formId=0x{:X} type=0x{:02X}",
-                            eid, (void*)form, form->GetFormID(), form->GetFormType());
+                            eid, (void*)form, form->GetFormID(),
+                            static_cast<std::uint8_t>(form->GetFormType()));
                     } else {
                         logger::info("  NativeLookup('{}'): NULL", eid);
                     }
@@ -272,15 +273,27 @@ namespace Patches::EditorIdCache
                 }
             }
 
-            // 6. Loaded mod count
+            // 6. Loaded file count (raw TDH scan — compiledFileCollection)
             {
                 auto* tdh = RE::TESDataHandler::GetSingleton();
                 if (tdh) {
-                    // Try CommonLib API
-                    auto regular = tdh->GetLoadedModCount();
-                    auto light = tdh->GetLoadedLightModCount();
-                    logger::info("  loaded files: {} regular + {} light = {} total",
-                        regular, light, regular + light);
+                    // compiledFileCollection at TDH+0x0D48 (AE) contains:
+                    //   +0x00: BSTArray<TESFile*> files
+                    //   +0x18: BSTArray<TESFile*> smallFiles
+                    // Each BSTArray is 0x18 bytes: data(8) + cap(4) + pad(4) + size(4)
+                    auto tdhAddr = reinterpret_cast<std::uintptr_t>(tdh);
+                    // Try a few likely offsets for the file arrays
+                    // Standard Skyrim SE/AE: loadedMods at +0x0D38, loadedModCount at +0x0D50
+                    // Just count non-zero entries in formArrays to estimate
+                    std::size_t nonEmptyArrays = 0;
+                    for (std::uint8_t t = 0; t < 0x8A; ++t) {
+                        auto offset = 0x010 + static_cast<std::size_t>(t) * 0x18;
+                        auto* arrBase = reinterpret_cast<const std::uint8_t*>(tdhAddr + offset);
+                        if (IsBadReadPtr(arrBase, 0x18)) continue;
+                        auto sz = *reinterpret_cast<const std::uint32_t*>(arrBase + 0x10);
+                        if (sz > 0) ++nonEmptyArrays;
+                    }
+                    logger::info("  TDH formArrays: {}/138 types have entries", nonEmptyArrays);
                 }
             }
         }
