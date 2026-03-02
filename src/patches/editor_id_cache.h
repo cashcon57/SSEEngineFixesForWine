@@ -6,10 +6,13 @@
 #include <chrono>
 #include <shared_mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
 #include "form_caching.h"
+#include "memory_manager.h"
+#include "../settings.h"
 
 // Wine-compatible editor ID cache — fixes TESForm::LookupByEditorID under Wine
 //
@@ -720,6 +723,149 @@ namespace Patches::EditorIdCache
         }
 
         detail::PopulateCache();
+    }
+
+    // ================================================================
+    // v1.22.0: Loading Timeline Monitor
+    // Periodically logs the state of form loading during the ~51 second
+    // load period. This answers: "Are forms ever created during loading,
+    // or are they never created at all?"
+    // ================================================================
+    namespace LoadingMonitor
+    {
+        inline std::atomic<bool> g_running{ false };
+        inline std::thread g_thread;
+
+        inline void MonitorThread()
+        {
+            logger::info("=== LOADING MONITOR STARTED ==="sv);
+            int tick = 0;
+
+            while (g_running.load(std::memory_order_relaxed)) {
+                // Sleep 5 seconds (in 100ms increments so we can stop quickly)
+                for (int i = 0; i < 50 && g_running.load(std::memory_order_relaxed); ++i) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
+
+                if (!g_running.load(std::memory_order_relaxed)) break;
+
+                ++tick;
+                logger::info("--- MONITOR tick {} ({}s) ---", tick, tick * 5);
+
+                // Form pipeline counters
+                logger::info("  AddFormToDataHandler: {} calls ({} null)",
+                    Patches::FormCaching::detail::g_addFormCalls.load(std::memory_order_relaxed),
+                    Patches::FormCaching::detail::g_addFormNullCalls.load(std::memory_order_relaxed));
+                logger::info("  ClearData: {} calls, InitFormData: {} calls",
+                    Patches::FormCaching::detail::g_clearDataCalls.load(std::memory_order_relaxed),
+                    Patches::FormCaching::detail::g_initFormDataCalls.load(std::memory_order_relaxed));
+
+                // allForms hash map size (read-only, safe for concurrent access)
+                {
+                    const auto& [formMap, formLock] = RE::TESForm::GetAllForms();
+                    if (formMap) {
+                        auto stats = detail::ReadHashMapStats(formMap);
+                        logger::info("  allForms: ~{} entries (cap={}, free={})",
+                            stats.used, stats.capacity, stats.freeSlots);
+                    }
+                }
+
+                // compiledFileCollection sizes (raw offset reads)
+                auto* tdh = RE::TESDataHandler::GetSingleton();
+                if (tdh) {
+                    auto tdhAddr = reinterpret_cast<std::uintptr_t>(tdh);
+                    if (!IsBadReadPtr(reinterpret_cast<const void*>(tdhAddr + 0xD70), 0x30)) {
+                        auto regCount = *reinterpret_cast<const std::uint32_t*>(tdhAddr + 0xD80);
+                        auto eslCount = *reinterpret_cast<const std::uint32_t*>(tdhAddr + 0xD98);
+                        logger::info("  compiledFileCollection: {} regular, {} ESL", regCount, eslCount);
+                    }
+                    logger::info("  loadingFiles: {}", tdh->loadingFiles);
+                }
+
+                // Memory allocator stats (if active)
+                if (Settings::Memory::bReplaceAllocator.GetValue()) {
+                    auto allocated = Patches::WineMemoryManager::detail::g_totalAllocated.load(std::memory_order_relaxed);
+                    auto allocs = Patches::WineMemoryManager::detail::g_allocationCount.load(std::memory_order_relaxed);
+                    auto fails = Patches::WineMemoryManager::detail::g_failCount.load(std::memory_order_relaxed);
+                    logger::info("  memory: {:.1f}MB allocated, {}K allocs, {} fails",
+                        static_cast<double>(allocated) / (1024.0 * 1024.0),
+                        allocs / 1000, fails);
+                }
+            }
+
+            logger::info("=== LOADING MONITOR STOPPED ==="sv);
+        }
+
+        inline void Start()
+        {
+            if (g_running.exchange(true)) return; // already running
+            g_thread = std::thread(MonitorThread);
+        }
+
+        inline void Stop()
+        {
+            g_running.store(false, std::memory_order_relaxed);
+            if (g_thread.joinable()) {
+                g_thread.join();
+            }
+        }
+
+        // Log final loading pipeline state at kDataLoaded
+        inline void LogFinalState()
+        {
+            logger::info("========== LOADING PIPELINE FINAL STATE =========="sv);
+            logger::info("  AddFormToDataHandler: {} total calls ({} null)",
+                Patches::FormCaching::detail::g_addFormCalls.load(),
+                Patches::FormCaching::detail::g_addFormNullCalls.load());
+            logger::info("  ClearData: {} calls",
+                Patches::FormCaching::detail::g_clearDataCalls.load());
+            logger::info("  InitializeFormDataStructures: {} calls",
+                Patches::FormCaching::detail::g_initFormDataCalls.load());
+
+            // Check compile indices of files in TDH
+            auto* tdh = RE::TESDataHandler::GetSingleton();
+            if (tdh) {
+                std::size_t fileCount = 0;
+                std::size_t compiledCount = 0;
+                std::size_t uncompiledCount = 0;
+
+                for (auto& file : tdh->files) {
+                    if (!file) continue;
+                    ++fileCount;
+
+                    // Read compileIndex at offset 0x478 in TESFile
+                    auto fileAddr = reinterpret_cast<std::uintptr_t>(file);
+                    if (!IsBadReadPtr(reinterpret_cast<const void*>(fileAddr + 0x478), 4)) {
+                        auto compileIndex = *reinterpret_cast<const std::uint8_t*>(fileAddr + 0x478);
+                        auto smallIndex = *reinterpret_cast<const std::uint16_t*>(fileAddr + 0x47A);
+
+                        if (compileIndex != 0xFF || smallIndex != 0xFFFF) {
+                            ++compiledCount;
+                            if (compiledCount <= 10) {
+                                logger::info("    COMPILED: '{}' compIdx=0x{:02X} smallIdx=0x{:04X}",
+                                    file->fileName, compileIndex, smallIndex);
+                            }
+                        } else {
+                            ++uncompiledCount;
+                            if (uncompiledCount <= 5) {
+                                logger::info("    UNCOMPILED: '{}' compIdx=0xFF smallIdx=0xFFFF",
+                                    file->fileName);
+                            }
+                        }
+                    }
+                }
+
+                logger::info("  Files: {} total, {} compiled, {} uncompiled (0xFF)",
+                    fileCount, compiledCount, uncompiledCount);
+
+                if (compiledCount == 0 && fileCount > 0) {
+                    logger::warn("  >>> ZERO files have compile indices! The loading loop NEVER ASSIGNED them."sv);
+                    logger::warn("  >>> This means the engine never processed plugin records."sv);
+                }
+            }
+
+            logger::info("=================================================="sv);
+        }
     }
 
     inline void Install()

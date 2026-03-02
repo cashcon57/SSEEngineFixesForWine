@@ -35,6 +35,10 @@ void MessageHandler(SKSE::MessagingInterface::Message* a_msg)
     switch (a_msg->type) {
     case SKSE::MessagingInterface::kDataLoaded:
         {
+            // v1.22.0: Stop loading monitor and log final pipeline state
+            Patches::EditorIdCache::LoadingMonitor::Stop();
+            Patches::EditorIdCache::LoadingMonitor::LogFinalState();
+
             // Editor ID cache: populate NOW at kDataLoaded, BEFORE other plugins.
             // Our handler fires first (alphabetical: 0_ < C < p), so we MUST
             // populate before CoreImpactFramework (C) tries LookupByEditorID.
@@ -184,6 +188,11 @@ extern "C" __declspec(dllexport) bool SKSEAPI SKSEPlugin_Load(const SKSE::LoadIn
     // crash when hooks are installed during the d3dx9_42.dll preload phase.
     Patches::Install();
     Fixes::Install();
+
+    // v1.22.0: Start loading monitor — logs pipeline state every 5 seconds
+    // until kDataLoaded fires. This gives us a timeline of what happens during
+    // the ~51 second loading period.
+    Patches::EditorIdCache::LoadingMonitor::Start();
 
     const auto messaging = SKSE::GetMessagingInterface();
     if (!messaging->RegisterListener("SKSE", MessageHandler)) {

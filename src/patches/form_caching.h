@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <shared_mutex>
 #include <unordered_map>
 
@@ -31,6 +32,16 @@ namespace Patches::FormCaching
 {
     namespace detail
     {
+        // ================================================================
+        // v1.22.0: Loading pipeline instrumentation counters
+        // These track calls to critical loading functions to determine
+        // whether forms are ever created during the 51-second load.
+        // ================================================================
+        inline std::atomic<std::uint64_t> g_clearDataCalls{ 0 };
+        inline std::atomic<std::uint64_t> g_initFormDataCalls{ 0 };
+        inline std::atomic<std::uint64_t> g_addFormCalls{ 0 };
+        inline std::atomic<std::uint64_t> g_addFormNullCalls{ 0 };
+
         struct ShardedCache
         {
             mutable std::shared_mutex mutex;
@@ -164,6 +175,9 @@ namespace Patches::FormCaching
         // maybe fix later if it causes issues
         inline void TESDataHandler_ClearData(RE::TESDataHandler* a_self)
         {
+            auto count = g_clearDataCalls.fetch_add(1, std::memory_order_relaxed) + 1;
+            logger::info(">>> ClearData called (call #{}) — wiping form caches"sv, count);
+
             for (auto& shard : g_formCache) {
                 std::unique_lock lock(shard.mutex);
                 shard.map.clear();
@@ -178,6 +192,9 @@ namespace Patches::FormCaching
 
         inline void TESForm_InitializeFormDataStructures()
         {
+            auto count = g_initFormDataCalls.fetch_add(1, std::memory_order_relaxed) + 1;
+            logger::info(">>> InitializeFormDataStructures called (call #{}) — resetting form map"sv, count);
+
             for (auto& shard : g_formCache) {
                 std::unique_lock lock(shard.mutex);
                 shard.map.clear();
@@ -186,6 +203,30 @@ namespace Patches::FormCaching
             TreeLodReferenceCaching::detail::ClearCache();
 
             g_hk_InitializeFormDataStructures.call();
+        }
+
+        // ================================================================
+        // v1.22.0: AddFormToDataHandler hook — counts form registrations
+        // This is the CRITICAL function: if this is never called, the
+        // engine never creates forms from plugin files.
+        // ================================================================
+        inline SafetyHookInline g_hk_AddFormToDataHandler;
+
+        inline bool TESDataHandler_AddFormToDataHandler(RE::TESDataHandler* a_self, RE::TESForm* a_form)
+        {
+            if (!a_form) {
+                g_addFormNullCalls.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                auto count = g_addFormCalls.fetch_add(1, std::memory_order_relaxed);
+                // Log the first 20 forms added, then every 10000th
+                if (count < 20 || (count > 0 && count % 10000 == 0)) {
+                    auto formId = a_form->GetFormID();
+                    auto formType = static_cast<std::uint8_t>(a_form->GetFormType());
+                    logger::info("  AddForm #{}: formID=0x{:08X} type=0x{:02X}",
+                        count + 1, formId, formType);
+                }
+            }
+            return g_hk_AddFormToDataHandler.call<bool>(a_self, a_form);
         }
 
         inline void ReplaceFormMapFunctions()
@@ -230,6 +271,11 @@ namespace Patches::FormCaching
 
             const REL::Relocation InitializeFormDataStructures{ RELOCATION_ID(14511, 14669) };
             g_hk_InitializeFormDataStructures = safetyhook::create_inline(InitializeFormDataStructures.address(), TESForm_InitializeFormDataStructures);
+
+            // v1.22.0: Hook AddFormToDataHandler to count form registrations
+            const REL::Relocation AddForm{ RELOCATION_ID(13597, 13693) };
+            g_hk_AddFormToDataHandler = safetyhook::create_inline(AddForm.address(), TESDataHandler_AddFormToDataHandler);
+            logger::info("form caching: AddFormToDataHandler hook installed (counting form registrations)"sv);
         }
     }
 
