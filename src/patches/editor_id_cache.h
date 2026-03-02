@@ -757,10 +757,12 @@ namespace Patches::EditorIdCache
                 logger::info("--- MONITOR tick {} ({:.1f}s) ---", tick, elapsed / 1000.0);
 
                 // Form pipeline counters
-                logger::info("  AddForm: {} | OpenTES: {} ok/{} total | ClearData: {} | InitFormData: {}",
+                logger::info("  AddForm:{} OpenTES:{}/{} CompileIdx:{} SeekForm:{} Clear:{} Init:{}",
                     Patches::FormCaching::detail::g_addFormCalls.load(std::memory_order_relaxed),
                     Patches::FormCaching::detail::g_openTESSuccesses.load(std::memory_order_relaxed),
                     Patches::FormCaching::detail::g_openTESCalls.load(std::memory_order_relaxed),
+                    Patches::FormCaching::detail::g_addCompileIndexCalls.load(std::memory_order_relaxed),
+                    Patches::FormCaching::detail::g_seekNextFormCalls.load(std::memory_order_relaxed),
                     Patches::FormCaching::detail::g_clearDataCalls.load(std::memory_order_relaxed),
                     Patches::FormCaching::detail::g_initFormDataCalls.load(std::memory_order_relaxed));
 
@@ -834,6 +836,10 @@ namespace Patches::EditorIdCache
             logger::info("  OpenTES: {} calls ({} successes)",
                 Patches::FormCaching::detail::g_openTESCalls.load(),
                 Patches::FormCaching::detail::g_openTESSuccesses.load());
+            logger::info("  AddCompileIndex: {} calls",
+                Patches::FormCaching::detail::g_addCompileIndexCalls.load());
+            logger::info("  SeekNextForm: {} calls",
+                Patches::FormCaching::detail::g_seekNextFormCalls.load());
             logger::info("  ClearData: {} calls",
                 Patches::FormCaching::detail::g_clearDataCalls.load());
             logger::info("  InitializeFormDataStructures: {} calls",

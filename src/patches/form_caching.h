@@ -43,6 +43,8 @@ namespace Patches::FormCaching
         inline std::atomic<std::uint64_t> g_addFormNullCalls{ 0 };
         inline std::atomic<std::uint64_t> g_openTESCalls{ 0 };
         inline std::atomic<std::uint64_t> g_openTESSuccesses{ 0 };
+        inline std::atomic<std::uint64_t> g_addCompileIndexCalls{ 0 };
+        inline std::atomic<std::uint64_t> g_seekNextFormCalls{ 0 };
 
         struct ShardedCache
         {
@@ -254,6 +256,40 @@ namespace Patches::FormCaching
             return result;
         }
 
+        // ================================================================
+        // v1.22.2: Hook TESForm::AddCompileIndex — counts compile index assignments
+        // If this is never called, compile indices are never assigned.
+        // ================================================================
+        inline SafetyHookInline g_hk_AddCompileIndex;
+
+        inline void TESForm_AddCompileIndex(RE::FormID* a_id, RE::TESFile* a_file)
+        {
+            auto count = g_addCompileIndexCalls.fetch_add(1, std::memory_order_relaxed);
+            if (count < 10 || (count > 0 && count % 50000 == 0)) {
+                logger::info("  AddCompileIndex #{}: file='{}' formID=0x{:08X}",
+                    count + 1, a_file ? a_file->fileName : "null",
+                    a_id ? *a_id : 0);
+            }
+            g_hk_AddCompileIndex.call(a_id, a_file);
+        }
+
+        // ================================================================
+        // v1.22.2: Hook TESFile::SeekNextForm — counts record iteration
+        // This is called repeatedly during record reading. If it's never
+        // called, the game never attempts to read any records.
+        // ================================================================
+        inline SafetyHookInline g_hk_SeekNextForm;
+
+        inline bool TESFile_SeekNextForm(RE::TESFile* a_self, bool a_skipIgnored)
+        {
+            auto count = g_seekNextFormCalls.fetch_add(1, std::memory_order_relaxed);
+            if (count < 5 || (count > 0 && count % 100000 == 0)) {
+                logger::info("  SeekNextForm #{}: file='{}'",
+                    count + 1, a_self ? a_self->fileName : "null");
+            }
+            return g_hk_SeekNextForm.call<bool>(a_self, a_skipIgnored);
+        }
+
         inline void ReplaceFormMapFunctions()
         {
             const REL::Relocation getForm{ RELOCATION_ID(14461, 14617) };
@@ -305,7 +341,25 @@ namespace Patches::FormCaching
             // v1.22.1: Hook TESFile::OpenTES to count file opens
             const REL::Relocation OpenTES{ RELOCATION_ID(13855, 13931) };
             g_hk_OpenTES = safetyhook::create_inline(OpenTES.address(), TESFile_OpenTES);
-            logger::info("form caching: OpenTES hook installed (counting file opens)"sv);
+            logger::info("form caching: OpenTES hook at 0x{:X} (offset 0x{:X})"sv,
+                OpenTES.address(), OpenTES.address() - REL::Module::get().base());
+
+            // v1.22.2: Hook AddCompileIndex to count compile index assignments
+            const REL::Relocation AddCompileIndex{ RELOCATION_ID(14509, 14667) };
+            g_hk_AddCompileIndex = safetyhook::create_inline(AddCompileIndex.address(), TESForm_AddCompileIndex);
+            logger::info("form caching: AddCompileIndex hook at 0x{:X} (offset 0x{:X})"sv,
+                AddCompileIndex.address(), AddCompileIndex.address() - REL::Module::get().base());
+
+            // v1.22.2: Hook SeekNextForm to count record iteration
+            const REL::Relocation SeekNextForm{ RELOCATION_ID(13894, 13979) };
+            g_hk_SeekNextForm = safetyhook::create_inline(SeekNextForm.address(), TESFile_SeekNextForm);
+            logger::info("form caching: SeekNextForm hook at 0x{:X} (offset 0x{:X})"sv,
+                SeekNextForm.address(), SeekNextForm.address() - REL::Module::get().base());
+
+            // Log all hook addresses for verification
+            logger::info("form caching: hook summary — GetForm=0x{:X} AddForm=0x{:X} OpenTES=0x{:X} AddCompileIdx=0x{:X} SeekNextForm=0x{:X}"sv,
+                getForm.address(), AddForm.address(), OpenTES.address(),
+                AddCompileIndex.address(), SeekNextForm.address());
         }
     }
 
