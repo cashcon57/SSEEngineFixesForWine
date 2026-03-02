@@ -7,8 +7,6 @@
 #include <string>
 #include <unordered_map>
 
-#include "form_caching.h"
-
 // Wine-compatible editor ID cache — fixes TESForm::LookupByEditorID under Wine
 //
 // Problem: BSTHashMap<BSFixedString, TESForm*> for editor ID lookups uses
@@ -19,16 +17,18 @@
 // created on different threads gets different pool entries, breaking both
 // the hash and equality, so every LookupByEditorID returns null.
 //
-// Fix: After data loading (kDataLoaded), iterate all forms on the main thread,
-// read their editor IDs via GetFormEditorID() (reads from each form's own
-// member storage, not the broken map), then clear and repopulate the game's
-// BSTHashMap with fresh BSFixedString entries all created on the main thread.
-// This ensures BSStringPool consistency for keys and future lookups.
+// Fix: After data loading (kDataLoaded), scan FormID ranges using the
+// form-by-ID BSTHashMap's find() method (works under Wine because uint32_t
+// keys use integer hashing, not pointer-based). For each found form, read
+// its editor ID via GetFormEditorID() (virtual call to form's own storage),
+// then repopulate the game's editor-ID-to-form BSTHashMap with fresh
+// BSFixedString entries all created on the main thread.
 //
-// Form enumeration uses our own sharded form cache (from form_caching.h)
-// which intercepts every FormScatterTable_SetAt call during form loading.
-// This cache is guaranteed complete, unlike GetAllForms() BSTHashMap (broken
-// under Wine) or TESDataHandler::formArrays[] (struct layout mismatch on AE).
+// Standard form enumeration methods all fail under Wine:
+//  - GetAllForms() BSTHashMap iteration: only finds ~166 forms
+//  - TESDataHandler::formArrays[]: struct layout mismatch on AE (0 forms)
+//  - form_caching.h sharded cache: SetAt callsite hooks miss most forms
+// The brute-force FormID scan bypasses all of these issues.
 //
 // Requires po3_Tweaks with "Load EditorIDs = true" so that forms actually
 // retain their editor IDs. Without it, most forms return "" from
@@ -82,36 +82,98 @@ namespace Patches::EditorIdCache
         {
             logger::info("editor ID cache: building from loaded forms..."sv);
 
-            // Phase 1: Enumerate ALL loaded forms from our sharded form cache.
+            // Enumerate ALL loaded forms by brute-force scanning FormID ranges.
             //
-            // We use FormCaching::detail::g_formCache[256] which intercepts every
-            // FormScatterTable_SetAt call during form loading. This sharded cache
-            // (std::unordered_map with std::shared_mutex per shard) is guaranteed
-            // to contain ALL registered forms regardless of Wine hash issues.
+            // Under Wine, all standard form enumeration methods fail:
+            //  - GetAllForms() BSTHashMap iteration: only finds ~166 forms
+            //  - TESDataHandler::formArrays[]: struct layout mismatch on AE (0 forms)
+            //  - form_caching.h sharded cache: SetAt callsite hooks miss most forms
             //
-            // Previous attempts that FAILED under Wine:
-            //  - GetAllForms() BSTHashMap: only 166 forms (broken scatter table)
-            //  - TESDataHandler::formArrays[]: 0 forms (struct layout mismatch on AE)
+            // However, RE::TESForm::LookupByID(formId) works perfectly because
+            // the form-by-ID BSTHashMap uses uint32_t keys with BSCRC32<uint32_t>
+            // (integer hashing, NOT pointer-based like BSFixedString). So we can
+            // scan FormID ranges and look up each one individually.
             //
-            // GetFormEditorID() is a virtual call that reads from each form's own
-            // member storage (e.g. BGSKeyword::formEditorID), NOT from the broken
-            // editor ID BSTHashMap. This works regardless of Wine hash issues.
+            // FormID structure: [master index : 8 bits][base ID : 24 bits]
+            //  - Master indices 0x00-0xFD: regular plugins (up to 254)
+            //  - Master index 0xFE: ESL/light plugins (sub-indexed)
+            //  - Master index 0xFF: temporary/runtime forms
+            //
+            // We scan base IDs 0x000-0xFFF for each master (4096 per master).
+            // Most plugin forms fall in this range. For large mods we extend
+            // the scan if we find forms near the end of the initial range.
             EditorIdMap newCache;
             std::size_t formsScanned = 0;
             std::size_t editorIdsFound = 0;
 
-            for (std::uint32_t shardIdx = 0; shardIdx < 256; ++shardIdx) {
-                auto& shard = FormCaching::detail::g_formCache[shardIdx];
-                std::shared_lock lock(shard.mutex);
-                for (const auto& [baseId, form] : shard.map) {
+            // Acquire the form-by-ID BSTHashMap ONCE and hold the lock for
+            // the entire scan. This avoids per-lookup lock overhead.
+            // BSTHashMap::find() with uint32_t keys works under Wine because
+            // BSCRC32<uint32_t> hashes the integer value directly (not a pointer).
+            const auto& [allForms, allFormsLock] = RE::TESForm::GetAllForms();
+            {
+                const RE::BSReadLockGuard l{ allFormsLock };
+                if (!allForms) {
+                    logger::error("editor ID cache: GetAllForms() returned null!"sv);
+                    return;
+                }
+
+                auto scanForm = [&](RE::FormID formId) {
+                    const auto it = allForms->find(formId);
+                    if (it == allForms->end())
+                        return false;
+                    auto* form = it->second;
                     if (!form)
-                        continue;
+                        return false;
                     ++formsScanned;
 
                     const char* editorId = form->GetFormEditorID();
                     if (editorId && editorId[0] != '\0') {
                         newCache.try_emplace(std::string(editorId), form);
                         ++editorIdsFound;
+                    }
+                    return true;
+                };
+
+                // Scan regular plugins (master indices 0x00-0xFD)
+                for (std::uint32_t masterIdx = 0; masterIdx <= 0xFD; ++masterIdx) {
+                    const std::uint32_t prefix = masterIdx << 24;
+                    std::uint32_t lastHit = 0;
+
+                    // Initial scan: base IDs 0x000-0xFFF
+                    for (std::uint32_t baseId = 0; baseId <= 0xFFF; ++baseId) {
+                        if (scanForm(prefix | baseId))
+                            lastHit = baseId;
+                    }
+
+                    // Extended scan: if we found forms near the end of initial
+                    // range, keep scanning in chunks of 0x1000 until no more found
+                    if (lastHit >= 0xF00) {
+                        std::uint32_t scanStart = 0x1000;
+                        while (scanStart < 0x100000) {
+                            bool foundAny = false;
+                            for (std::uint32_t baseId = scanStart;
+                                 baseId < scanStart + 0x1000 && baseId < 0x1000000;
+                                 ++baseId)
+                            {
+                                if (scanForm(prefix | baseId)) {
+                                    foundAny = true;
+                                    lastHit = baseId;
+                                }
+                            }
+                            if (!foundAny)
+                                break;
+                            scanStart += 0x1000;
+                        }
+                    }
+                }
+
+                // Scan ESL/light plugins (master index 0xFE, sub-indexed)
+                // ESL FormID: 0xFE000000 | (eslIndex << 12) | baseId
+                for (std::uint32_t eslIdx = 0; eslIdx < 0x1000; ++eslIdx) {
+                    const std::uint32_t eslPrefix = 0xFE000000 | (eslIdx << 12);
+                    for (std::uint32_t baseId = 0; baseId <= 0xFFF; ++baseId) {
+                        scanForm(eslPrefix | baseId);
                     }
                 }
             }
