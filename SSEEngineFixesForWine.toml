@@ -98,6 +98,9 @@ bDisableChargenPrecache = false
 bDisableSnowFlag = false
 # Enable achievements even with mods installed
 bEnableAchievementsWithMods = true
+# Fix editor ID lookups under Wine (repopulates BSTHashMap with main-thread BSFixedStrings)
+# Requires po3_Tweaks with "Load EditorIDs = true" to be effective
+bEditorIdCache = true
 # Cache form lookups for faster loading (Wine-safe sharded implementation)
 bFormCaching = true
 # Expand INI setting collection capacity

@@ -67,6 +67,7 @@ namespace Settings
         static REX::TOML::Bool bScrollingDoesntSwitchPOV("Patches", "bScrollingDoesntSwitchPOV", false);
         static REX::TOML::F32  fSleepWaitTimeModifier("Patches", "fSleepWaitTimeModifier", 1.0f);
         static REX::TOML::Bool bTreeLodReferenceCaching("Patches", "bTreeLodReferenceCaching", true);
+        static REX::TOML::Bool bEditorIdCache("Patches", "bEditorIdCache", true);
         static REX::TOML::Bool bWaterflowAnimation("Patches", "bWaterflowAnimation", true);
         static REX::TOML::F32  fWaterflowSpeed("Patches", "fWaterflowSpeed", 20.0f);
     }

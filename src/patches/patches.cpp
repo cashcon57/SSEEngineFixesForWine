@@ -2,6 +2,7 @@
 
 #include "disable_chargen_precache.h"
 #include "disable_snow_flag.h"
+#include "editor_id_cache.h"
 #include "enable_achievements.h"
 #include "form_caching.h"
 #include "ini_setting_collection.h"
@@ -27,6 +28,9 @@ namespace Patches
 
         if (Settings::Patches::bEnableAchievementsWithMods.GetValue())
             EnableAchievementsWithMods::Install();
+
+        if (Settings::Patches::bEditorIdCache.GetValue())
+            EditorIdCache::Install();
 
         if (Settings::Patches::bFormCaching.GetValue())
             FormCaching::Install();

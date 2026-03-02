@@ -21,6 +21,7 @@
 #include "fixes/fixes.h"
 #include "fixes/save_screenshots.h"
 #include "fixes/tree_reflections.h"
+#include "patches/editor_id_cache.h"
 #include "patches/patches.h"
 #include "patches/save_added_sound_categories.h"
 #include "settings.h"
@@ -33,6 +34,11 @@ void MessageHandler(SKSE::MessagingInterface::Message* a_msg)
     switch (a_msg->type) {
     case SKSE::MessagingInterface::kDataLoaded:
         {
+            // Repopulate editor ID map FIRST — before other kDataLoaded handlers
+            // in other plugins try to look up forms by editor ID
+            if (Settings::Patches::bEditorIdCache.GetValue())
+                Patches::EditorIdCache::OnDataLoaded();
+
             if (Settings::General::bCleanSKSECoSaves.GetValue())
                 Util::CoSaves::Clean();
             if (Settings::Patches::bSaveAddedSoundCategories.GetValue())
