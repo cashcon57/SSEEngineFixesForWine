@@ -16,10 +16,9 @@
 //   2. TESDataHandler member offsets in CommonLib don't match this version
 //   3. po3_Tweaks' GetFormEditorID hook doesn't work under Wine
 //   4. The editor-ID-to-form BSTHashMap is completely empty
+//   5. AddFormToDataHandler (REL::ID 13693) is never called (inlined by compiler)
 //
-// Fix: Hook TESDataHandler::AddFormToDataHandler to capture ALL forms during
-// ESM loading. Build editor ID cache from captured forms. Repopulate the
-// game's editor-ID-to-form BSTHashMap.
+// v1.15.0: Deep diagnostics to find where ESM forms are actually stored
 
 namespace Patches::EditorIdCache
 {
@@ -57,25 +56,6 @@ namespace Patches::EditorIdCache
         inline EditorIdMap g_editorIdCache;
         inline std::atomic<bool> g_cachePopulated{ false };
 
-        // ================================================================
-        // AddFormToDataHandler hook — captures ALL forms during ESM loading
-        // ================================================================
-        inline SafetyHookInline g_hk_AddForm{};
-        inline std::mutex g_capturedFormsMutex;
-        inline std::unordered_map<RE::FormID, RE::TESForm*> g_capturedForms;
-
-        inline bool HookedAddFormToDataHandler(RE::TESDataHandler* a_self, RE::TESForm* a_form)
-        {
-            auto result = g_hk_AddForm.call<bool>(a_self, a_form);
-
-            if (a_form) {
-                std::lock_guard lock(g_capturedFormsMutex);
-                g_capturedForms[a_form->GetFormID()] = a_form;
-            }
-
-            return result;
-        }
-
         // Wine-safe editor ID lookup
         inline RE::TESForm* LookupByEditorID(const std::string_view& a_editorID)
         {
@@ -84,188 +64,250 @@ namespace Patches::EditorIdCache
             return it != g_editorIdCache.end() ? it->second : nullptr;
         }
 
+        // ================================================================
+        // Hex dump helper
+        // ================================================================
+        inline void HexDump(const char* label, const void* ptr, std::size_t len)
+        {
+            auto* raw = reinterpret_cast<const std::uint8_t*>(ptr);
+            for (std::size_t off = 0; off < len; off += 16) {
+                std::string hex;
+                std::string ascii;
+                for (std::size_t i = 0; i < 16 && (off + i) < len; ++i) {
+                    char buf[4];
+                    std::snprintf(buf, sizeof(buf), "%02X ", raw[off + i]);
+                    hex += buf;
+                    ascii += (raw[off + i] >= 0x20 && raw[off + i] <= 0x7E)
+                        ? static_cast<char>(raw[off + i]) : '.';
+                }
+                logger::info("  {} +0x{:04X}: {} | {}", label, off, hex, ascii);
+            }
+        }
+
         inline void PopulateCache()
         {
-            logger::info("editor ID cache: building from loaded forms..."sv);
+            logger::info("editor ID cache v1.15.0: deep diagnostics"sv);
 
             EditorIdMap newCache;
 
             // ================================================================
-            // DIAGNOSTIC PHASE
+            // DIAGNOSTIC 1: Hex dump TESDataHandler first 0x100 bytes
             // ================================================================
+            auto* dh = RE::TESDataHandler::GetSingleton();
+            if (dh) {
+                logger::info("  TESDataHandler ptr={:p}", (void*)dh);
+                HexDump("DH", dh, 0x100);
 
-            // Captured forms from AddFormToDataHandler hook
-            std::size_t capturedCount = 0;
-            {
-                std::lock_guard lock(g_capturedFormsMutex);
-                capturedCount = g_capturedForms.size();
-            }
-            logger::info("  AddFormToDataHandler hook captured {} forms", capturedCount);
-
-            // Test game native lookup
-            {
-                auto* player = Patches::FormCaching::detail::GameLookupFormByID(0x14);
-                auto* weapon = Patches::FormCaching::detail::GameLookupFormByID(0x12E46);
-                logger::info("  GameLookup: Player={:p}, defaultUnarmedWeap={:p}",
-                    (void*)player, (void*)weapon);
+                // Also dump around expected compiledFileCollection offset (0xD70)
+                logger::info("  TESDataHandler at +0xD70 (expected compiledFileCollection):");
+                HexDump("DH+D70", reinterpret_cast<const char*>(dh) + 0xD70, 0x40);
             }
 
-            // Test captured forms for the weapon
-            {
-                std::lock_guard lock(g_capturedFormsMutex);
-                auto it = g_capturedForms.find(0x00012E46);
-                if (it != g_capturedForms.end()) {
-                    auto* form = it->second;
-                    auto eid = form->GetFormEditorID();
-                    logger::info("  Captured form 0x12E46: {:p} type={} editorID='{}'",
-                        (void*)form, static_cast<int>(form->GetFormType()),
-                        eid ? eid : "(null)");
-                } else {
-                    logger::info("  Form 0x12E46 NOT in captured forms");
-                }
-            }
-
-            // GetAllForms map size
+            // ================================================================
+            // DIAGNOSTIC 2: Log ALL 166 FormIDs from the form-by-ID map
+            // ================================================================
             {
                 const auto& [formMap, formLock] = RE::TESForm::GetAllForms();
                 if (formMap) {
-                    logger::info("  GetAllForms .size(): {}", formMap->size());
+                    const RE::BSReadLockGuard rl{ formLock };
+                    logger::info("  form-by-ID map: size={}", formMap->size());
+
+                    std::size_t logged = 0;
+                    for (auto& [id, form] : *formMap) {
+                        if (!form) continue;
+                        if (logged < 30) {
+                            logger::info("    FormID=0x{:08X} type={} ptr={:p}",
+                                id, static_cast<int>(form->GetFormType()), (void*)form);
+                        }
+                        ++logged;
+                    }
+                    logger::info("  form-by-ID map: iterated {} forms total", logged);
                 }
             }
 
-            // Dump raw TESDataHandler memory to find actual member offsets
+            // ================================================================
+            // DIAGNOSTIC 3: Dump raw BSTHashMap structure at REL::ID 400507
+            // ================================================================
             {
-                auto* dh = RE::TESDataHandler::GetSingleton();
-                if (dh) {
-                    logger::info("  TESDataHandler ptr={:p}", (void*)dh);
+                // The form-by-ID map is at this relocation
+                static REL::Relocation<void*> formMapReloc{ REL::ID(VAR_NUM(514351, 400507)) };
+                auto mapAddr = formMapReloc.address();
+                logger::info("  form-by-ID map reloc: addr=0x{:X}", mapAddr);
+                HexDump("FormMap", reinterpret_cast<void*>(mapAddr), 0x40);
+            }
 
-                    // Also log the RELOCATION address vs dereferenced value
-                    static REL::Relocation<RE::TESDataHandler**> singleton{ REL::ID(VAR_NUM(514141, 400269)) };
-                    logger::info("  TESDataHandler reloc addr={:p}, *reloc={:p}",
-                        (void*)singleton.address(), (void*)*singleton);
+            // ================================================================
+            // DIAGNOSTIC 4: Scan TESDataHandler for ANY non-zero qwords
+            // This tells us which offsets have data at all
+            // ================================================================
+            if (dh) {
+                auto* raw = reinterpret_cast<const std::uint64_t*>(dh);
+                logger::info("  Scanning TESDataHandler for non-zero qwords (up to +0x1800)..."sv);
 
-                    auto* raw = reinterpret_cast<const std::uint8_t*>(dh);
+                std::size_t nonZeroCount = 0;
+                for (std::size_t off = 0; off < 0x1800 / 8; ++off) {
+                    if (raw[off] != 0) {
+                        if (nonZeroCount < 50) {
+                            logger::info("    +0x{:04X}: 0x{:016X}", off * 8, raw[off]);
+                        }
+                        ++nonZeroCount;
+                    }
+                }
+                logger::info("  TESDataHandler: {} non-zero qwords in first 0x1800 bytes", nonZeroCount);
+            }
 
-                    // Scan for BSTArray patterns: ptr(8) + size(4) + capacity(4) = 16 bytes
-                    // Look for non-zero size values that suggest form arrays
-                    logger::info("  Scanning TESDataHandler for non-zero BSTArray (up to +0xF00)..."sv);
+            // ================================================================
+            // DIAGNOSTIC 5: Check if forms exist at known FormIDs via
+            // scanning entries directly in the BSTHashMap
+            // ================================================================
+            {
+                // Read the BSTHashMap structure manually
+                // BSTScatterTable layout (confirmed from CommonLib):
+                //   +0x00: pad(8) + pad(4) + capacity(4) + free(4) + good(4)  = 0x18
+                //   +0x18: sentinel(8)                                          = 0x20
+                //   +0x20: allocator.pad(8) + allocator.entries(8)              = 0x30
+                // Entry layout for <FormID, TESForm*>:
+                //   value.first (FormID, 4) + pad(4) + value.second (TESForm*, 8) + next(8) = 24 bytes
 
-                    std::size_t arraysFound = 0;
-                    for (std::size_t off = 0; off < 0xF00; off += 8) {
-                        // BSTArray layout: data_ptr(8) + size(4) + capacity(4)
-                        auto dataPtr = *reinterpret_cast<const std::uintptr_t*>(raw + off);
-                        auto size = *reinterpret_cast<const std::uint32_t*>(raw + off + 8);
-                        auto cap = *reinterpret_cast<const std::uint32_t*>(raw + off + 12);
+                static REL::Relocation<void*> formMapReloc{ REL::ID(VAR_NUM(514351, 400507)) };
+                auto* mapRaw = reinterpret_cast<const std::uint8_t*>(formMapReloc.address());
 
-                        // Valid BSTArray: pointer-like data ptr, size > 0, capacity >= size, capacity < 10M
-                        if (dataPtr > 0x10000 && dataPtr < 0x00007FFFFFFFFFFF &&
-                            size > 0 && cap >= size && cap < 10000000) {
-                            if (arraysFound < 20) {
-                                logger::info("    +0x{:03X}: BSTArray? ptr=0x{:X} size={} cap={}",
-                                    off, dataPtr, size, cap);
-                            }
-                            ++arraysFound;
+                auto capacity = *reinterpret_cast<const std::uint32_t*>(mapRaw + 0x0C);
+                auto free = *reinterpret_cast<const std::uint32_t*>(mapRaw + 0x10);
+                auto good = *reinterpret_cast<const std::uint32_t*>(mapRaw + 0x14);
+                auto sentinel = *reinterpret_cast<const std::uintptr_t*>(mapRaw + 0x18);
+                auto entries = *reinterpret_cast<const std::uintptr_t*>(mapRaw + 0x28);
+
+                logger::info("  BSTHashMap manual read: cap={} free={} good={} sentinel=0x{:X} entries=0x{:X}",
+                    capacity, free, good, sentinel, entries);
+
+                // Look for FormIDs 0x14 and 0x12E46 in the entries
+                if (entries > 0x10000 && capacity > 0 && capacity < 0x1000000) {
+                    auto* entryBase = reinterpret_cast<const std::uint8_t*>(entries);
+                    std::size_t entrySize = 24; // FormID(4) + pad(4) + TESForm*(8) + next(8)
+
+                    std::size_t occupied = 0;
+                    RE::FormID minId = 0xFFFFFFFF, maxId = 0;
+                    bool foundPlayer = false, foundWeapon = false;
+
+                    for (std::uint32_t i = 0; i < capacity; ++i) {
+                        auto* entry = entryBase + i * entrySize;
+                        auto formId = *reinterpret_cast<const RE::FormID*>(entry);
+                        auto formPtr = *reinterpret_cast<const std::uintptr_t*>(entry + 8);
+                        auto nextPtr = *reinterpret_cast<const std::uintptr_t*>(entry + 16);
+
+                        // An occupied entry has a non-sentinel next pointer or a valid form pointer
+                        if (formPtr != 0 && formPtr != sentinel && formPtr > 0x10000) {
+                            ++occupied;
+                            if (formId < minId) minId = formId;
+                            if (formId > maxId) maxId = formId;
+                            if (formId == 0x14) foundPlayer = true;
+                            if (formId == 0x12E46) foundWeapon = true;
                         }
                     }
-                    logger::info("  Found {} potential BSTArray entries in TESDataHandler"sv, arraysFound);
 
-                    // Also look specifically for TESFile* arrays (loaded files)
-                    // These would have size in range of loaded plugin count (1-1000)
-                    logger::info("  Looking for loaded file arrays (size 1-1000)..."sv);
-                    for (std::size_t off = 0; off < 0xF00; off += 8) {
-                        auto dataPtr = *reinterpret_cast<const std::uintptr_t*>(raw + off);
-                        auto size = *reinterpret_cast<const std::uint32_t*>(raw + off + 8);
-                        auto cap = *reinterpret_cast<const std::uint32_t*>(raw + off + 12);
+                    logger::info("  BSTHashMap entries: {}/{} occupied, IDs range 0x{:X}-0x{:X}",
+                        occupied, capacity, minId, maxId);
+                    logger::info("  Found Player(0x14)={}, defaultUnarmedWeap(0x12E46)={}",
+                        foundPlayer, foundWeapon);
+                }
+            }
 
-                        if (dataPtr > 0x10000 && dataPtr < 0x00007FFFFFFFFFFF &&
-                            size > 0 && size <= 1000 && cap >= size && cap < 10000) {
-                            // Could be a file array. Try reading the first element as a pointer.
-                            auto firstElem = *reinterpret_cast<const std::uintptr_t*>(dataPtr);
-                            if (firstElem > 0x10000 && firstElem < 0x00007FFFFFFFFFFF) {
-                                // Try reading as TESFile — check if fileName offset has printable chars
-                                auto* possibleFile = reinterpret_cast<const char*>(firstElem + 0x58);
-                                bool printable = true;
-                                for (int i = 0; i < 6 && possibleFile[i]; ++i) {
-                                    if (possibleFile[i] < 0x20 || possibleFile[i] > 0x7E) {
-                                        printable = false;
-                                        break;
-                                    }
-                                }
-                                if (printable && possibleFile[0] != '\0') {
-                                    char namePreview[32] = {};
-                                    std::memcpy(namePreview, possibleFile, 31);
-                                    logger::info("    +0x{:03X}: file array? size={} cap={} first='{}'",
-                                        off, size, cap, namePreview);
-                                }
-                            }
+            // ================================================================
+            // DIAGNOSTIC 6: Try TESDataHandler file access with raw pointer math
+            // CommonLib says compiledFileCollection is at +0xD70
+            // compiledFileCollection.files (BSTArray<TESFile*>) at +0xD70
+            // compiledFileCollection.smallFiles (BSTArray<TESFile*>) at +0xD70+0x18
+            // But since our offsets are wrong, scan for TESFile pointers differently:
+            // - Get module base and size
+            // - Look for BSTArrays where elements are pointers to objects
+            //   that have a printable string at +0x58 (TESFile::fileName)
+            // ================================================================
+            if (dh) {
+                // Broader scan: scan every 8-byte aligned offset in first 0x1800 bytes
+                // looking for pointer-to-array-of-pointers-to-TESFile patterns
+                auto* raw = reinterpret_cast<const std::uint8_t*>(dh);
+                logger::info("  Scanning TESDataHandler 0x1800 bytes for TESFile arrays..."sv);
+
+                for (std::size_t off = 0; off < 0x1800; off += 8) {
+                    auto dataPtr = *reinterpret_cast<const std::uintptr_t*>(raw + off);
+                    // Next 4 bytes could be size, next 4 capacity
+                    auto size = *reinterpret_cast<const std::uint32_t*>(raw + off + 8);
+                    auto cap = *reinterpret_cast<const std::uint32_t*>(raw + off + 12);
+
+                    if (dataPtr < 0x10000 || dataPtr > 0x00007FFFFFFFFFFF) continue;
+                    if (size == 0 || size > 10000 || cap < size || cap > 100000) continue;
+
+                    // Check first element: is it a valid pointer?
+                    if (IsBadReadPtr(reinterpret_cast<const void*>(dataPtr), 8)) continue;
+                    auto firstElem = *reinterpret_cast<const std::uintptr_t*>(dataPtr);
+                    if (firstElem < 0x10000 || firstElem > 0x00007FFFFFFFFFFF) continue;
+
+                    // Check if first element looks like a TESFile (+0x58 = fileName)
+                    if (IsBadReadPtr(reinterpret_cast<const void*>(firstElem + 0x58), 8)) continue;
+                    const char* possibleName = reinterpret_cast<const char*>(firstElem + 0x58);
+
+                    bool hasPrintable = false;
+                    bool allPrintable = true;
+                    for (int i = 0; i < 8 && possibleName[i]; ++i) {
+                        if (possibleName[i] >= 0x20 && possibleName[i] <= 0x7E) {
+                            hasPrintable = true;
+                        } else {
+                            allPrintable = false;
+                            break;
                         }
+                    }
+
+                    if (hasPrintable && allPrintable && possibleName[0] != '\0') {
+                        char namePreview[48] = {};
+                        for (int i = 0; i < 47 && possibleName[i] && possibleName[i] >= 0x20; ++i) {
+                            namePreview[i] = possibleName[i];
+                        }
+                        logger::info("    +0x{:04X}: ptr=0x{:X} size={} cap={} elem[0]+0x58='{}'",
+                            off, dataPtr, size, cap, namePreview);
                     }
                 }
             }
 
             // ================================================================
-            // POPULATION PHASE: Use captured forms
+            // DIAGNOSTIC 7: Try scanning a WIDER range of addresses near the
+            // form-by-ID map for other BSTHashMaps with large entry counts
+            // The game might use a separate map for ESM forms
+            // ================================================================
+            {
+                static REL::Relocation<void*> formMapReloc{ REL::ID(VAR_NUM(514351, 400507)) };
+                auto baseAddr = formMapReloc.address();
+
+                logger::info("  Scanning for large BSTHashMaps near form-by-ID map (base=0x{:X})...", baseAddr);
+
+                // Scan +/- 0x1000 bytes around the form-by-ID map
+                for (std::intptr_t delta = -0x1000; delta <= 0x1000; delta += 0x30) {
+                    auto addr = baseAddr + delta;
+                    auto* mapRaw = reinterpret_cast<const std::uint8_t*>(addr);
+
+                    auto capacity = *reinterpret_cast<const std::uint32_t*>(mapRaw + 0x0C);
+                    auto free = *reinterpret_cast<const std::uint32_t*>(mapRaw + 0x10);
+                    auto good = *reinterpret_cast<const std::uint32_t*>(mapRaw + 0x14);
+                    auto entriesPtr = *reinterpret_cast<const std::uintptr_t*>(mapRaw + 0x28);
+
+                    // Valid BSTHashMap: power-of-2 capacity, free+good=capacity, valid entries ptr
+                    if (capacity >= 64 && capacity <= 0x1000000 &&
+                        (capacity & (capacity - 1)) == 0 &&  // power of 2
+                        free + good == capacity &&
+                        entriesPtr > 0x10000 && entriesPtr < 0x00007FFFFFFFFFFF) {
+
+                        logger::info("    delta={:+05X} (0x{:X}): cap={} free={} good={} entries=0x{:X}",
+                            delta, addr, capacity, free, good, entriesPtr);
+                    }
+                }
+            }
+
+            // ================================================================
+            // POPULATION PHASE: Try all available sources
             // ================================================================
 
-            if (capturedCount > 0) {
-                logger::info("editor ID cache: building from {} captured forms..."sv, capturedCount);
-
-                std::lock_guard lock(g_capturedFormsMutex);
-                std::size_t withEditorId = 0;
-
-                for (auto& [formId, form] : g_capturedForms) {
-                    if (!form) continue;
-
-                    const char* eid = form->GetFormEditorID();
-                    if (eid && eid[0] != '\0') {
-                        newCache.try_emplace(std::string(eid), form);
-                        ++withEditorId;
-                        if (withEditorId <= 5) {
-                            logger::info("  EditorID: '{}' -> 0x{:08X} type={}",
-                                eid, formId, static_cast<int>(form->GetFormType()));
-                        }
-                    }
-                }
-
-                logger::info("editor ID cache: {} forms with editor IDs out of {} captured",
-                    withEditorId, capturedCount);
-
-                // If GetFormEditorID doesn't work (po3_Tweaks broken), try hardcoded
-                // editor IDs for commonly needed vanilla forms
-                if (withEditorId == 0) {
-                    logger::warn("editor ID cache: GetFormEditorID not working, using hardcoded IDs"sv);
-
-                    // Hardcoded editor ID -> FormID map for critical Skyrim.esm forms
-                    // that mods commonly look up by editor ID
-                    static const std::pair<const char*, RE::FormID> knownEditorIds[] = {
-                        { "defaultUnarmedWeap", 0x00012E46 },
-                        { "Player", 0x00000007 },
-                        { "PlayerRef", 0x00000014 },
-                        { "Gold001", 0x0000003B },
-                        { "Iron Dagger", 0x0001397E },
-                        { "ArmorIronCuirass", 0x00012E49 },
-                        { "FoodBread", 0x00064B31 },
-                        { "Torch01", 0x0001D4EC },
-                        { "LockPick", 0x0000000A },
-                        { "WeapTypeUnarmed", 0x00013F8D },
-                    };
-
-                    for (auto& [editorId, formId] : knownEditorIds) {
-                        auto it = g_capturedForms.find(formId);
-                        if (it != g_capturedForms.end() && it->second) {
-                            newCache.try_emplace(std::string(editorId), it->second);
-                            logger::info("  Hardcoded: '{}' -> 0x{:08X} ({:p})",
-                                editorId, formId, (void*)it->second);
-                        }
-                    }
-
-                    logger::info("editor ID cache: {} hardcoded editor IDs matched", newCache.size());
-                }
-            } else {
-                // No forms captured by hook — fall back to game native lookup
-                logger::warn("editor ID cache: no forms captured by AddFormToDataHandler hook"sv);
-
-                // Last resort: try CommonLib iteration
+            // Source 1: CommonLib iteration of form-by-ID map
+            {
                 const auto& [formMap, formLock] = RE::TESForm::GetAllForms();
                 if (formMap && formMap->size() > 0) {
                     const RE::BSReadLockGuard rl{ formLock };
@@ -281,6 +323,30 @@ namespace Patches::EditorIdCache
                     logger::info("editor ID cache: CommonLib iteration: {} forms, {} editor IDs",
                         count, newCache.size());
                 }
+            }
+
+            // Source 2: If we found forms but no editor IDs, try hardcoded mapping
+            if (newCache.empty()) {
+                // Try to use GameLookupFormByID for known forms
+                // Note: This only works for forms IN the BSTHashMap (engine forms)
+                static const std::pair<const char*, RE::FormID> knownEditorIds[] = {
+                    { "Player", 0x00000007 },
+                    { "PlayerRef", 0x00000014 },
+                    { "LockPick", 0x0000000A },
+                    { "Gold001", 0x0000003B },
+                    { "defaultUnarmedWeap", 0x00012E46 },
+                    { "WeapTypeUnarmed", 0x00013F8D },
+                };
+
+                for (auto& [editorId, formId] : knownEditorIds) {
+                    auto* form = Patches::FormCaching::detail::GameLookupFormByID(formId);
+                    if (form) {
+                        newCache.try_emplace(std::string(editorId), form);
+                        logger::info("  Hardcoded via GameLookup: '{}' -> 0x{:08X} ({:p})",
+                            editorId, formId, (void*)form);
+                    }
+                }
+                logger::info("editor ID cache: {} hardcoded editor IDs resolved via GameLookup", newCache.size());
             }
 
             logger::info("editor ID cache: total {} editor IDs in cache"sv, newCache.size());
@@ -342,18 +408,6 @@ namespace Patches::EditorIdCache
 
     inline void Install()
     {
-        logger::info("editor ID cache patch enabled (DLL prefixed for early load order)"sv);
-
-        // Hook AddFormToDataHandler to capture ALL forms during ESM loading.
-        // This fires for every form registered, giving us the complete form set.
-        const REL::Relocation addForm{ REL::ID(VAR_NUM(13597, 13693)) };
-        detail::g_hk_AddForm = safetyhook::create_inline(
-            addForm.address(), detail::HookedAddFormToDataHandler);
-
-        if (detail::g_hk_AddForm) {
-            logger::info("  hooked AddFormToDataHandler at {:p}", (void*)addForm.address());
-        } else {
-            logger::warn("  FAILED to hook AddFormToDataHandler");
-        }
+        logger::info("editor ID cache patch enabled (v1.15.0 deep diagnostics)"sv);
     }
 }
