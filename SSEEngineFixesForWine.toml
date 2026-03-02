@@ -126,9 +126,17 @@ bWaterflowAnimation = true
 # Waterflow animation speed
 fWaterflowSpeed = 20.0
 
-# Note: [MemoryManager] is intentionally omitted.
-# The TBB allocator replacement used by the original SSE Engine Fixes
-# is incompatible with Wine/CrossOver/Proton.
+[Memory]
+# Replace the engine's memory allocator with Wine-compatible HeapAlloc.
+# The original SSE Engine Fixes uses Intel TBB which crashes under Wine.
+# This provides an unlimited-size growable heap via the Windows API.
+# Essential for large mod lists (1000+ plugins) that exhaust the default heap.
+bReplaceAllocator = true
+# Expand the per-thread ScrapHeap reserve from 64MB to the value below.
+# Only affects threads created after SKSE plugin load.
+bExpandScrapHeap = true
+# ScrapHeap reserve size in MB (default: 512, game default: 64)
+uScrapHeapSizeMB = 512
 
 [Warnings]
 # Warn when texture loading fails

@@ -8,7 +8,7 @@
 // This fork removes the d3dx9_42.dll preloader requirement and installs
 // all hooks during normal SKSE plugin load instead. The TBB dependency
 // is replaced with standard C++ synchronization primitives, and the
-// memory manager overrides are removed entirely (Wine-incompatible).
+// memory allocator uses HeapAlloc/HeapFree (Wine-compatible) instead of TBB.
 //
 // License: MIT (same as upstream SSE Engine Fixes)
 
@@ -22,6 +22,7 @@
 #include "fixes/save_screenshots.h"
 #include "fixes/tree_reflections.h"
 #include "patches/editor_id_cache.h"
+#include "patches/memory_manager.h"
 #include "patches/patches.h"
 #include "patches/save_added_sound_categories.h"
 #include "settings.h"
@@ -40,6 +41,10 @@ void MessageHandler(SKSE::MessagingInterface::Message* a_msg)
             // po3_Tweaks installed its "Load EditorIDs" hook at kPostLoad (before
             // ESM loading), so forms should have editor IDs by now.
             // We enumerate via TESDataHandler (BSTArray, no hashing — Wine-safe).
+            // Log memory allocator stats before other kDataLoaded work
+            if (Settings::Memory::bReplaceAllocator.GetValue())
+                Patches::WineMemoryManager::LogStats();
+
             if (Settings::Patches::bEditorIdCache.GetValue())
                 Patches::EditorIdCache::OnDataLoaded();
 
@@ -168,10 +173,15 @@ extern "C" __declspec(dllexport) bool SKSEAPI SKSEPlugin_Load(const SKSE::LoadIn
         logger::trace("enabled verbose logging"sv);
     }
 
+    // Install Wine-compatible memory allocator FIRST — all subsequent allocations
+    // (including from other patches and ESM loading) use our HeapAlloc-based heap.
+    // The original Engine Fixes uses Intel TBB which crashes under Wine; we replace
+    // with HeapAlloc/HeapFree which Wine implements natively.
+    Patches::WineMemoryManager::Install();
+
     // Install all patches and fixes during SKSE load (not preload).
     // This is the key difference from Engine Fixes — Wine/CrossOver/Proton
     // crash when hooks are installed during the d3dx9_42.dll preload phase.
-    // Memory manager overrides are intentionally omitted (Wine-incompatible).
     Patches::Install();
     Fixes::Install();
 

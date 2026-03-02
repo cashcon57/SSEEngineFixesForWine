@@ -48,6 +48,7 @@ set(headers ${headers}
 	src/patches/form_caching.h
 	src/patches/ini_setting_collection.h
 	src/patches/max_stdio.h
+	src/patches/memory_manager.h
 	src/patches/patches.h
 	src/patches/regular_quicksaves.h
 	src/patches/safe_exit.h

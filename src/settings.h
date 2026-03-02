@@ -72,8 +72,12 @@ namespace Settings
         static REX::TOML::F32  fWaterflowSpeed("Patches", "fWaterflowSpeed", 20.0f);
     }
 
-    // MemoryManager section intentionally omitted — Wine-incompatible.
-    // TBB allocator replacement crashes under Wine/CrossOver/Proton.
+    namespace Memory
+    {
+        static REX::TOML::Bool bReplaceAllocator("Memory", "bReplaceAllocator", true);
+        static REX::TOML::Bool bExpandScrapHeap("Memory", "bExpandScrapHeap", true);
+        static REX::TOML::U32  uScrapHeapSizeMB("Memory", "uScrapHeapSizeMB", 512);
+    }
 
     namespace Warnings
     {
