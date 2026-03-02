@@ -92,15 +92,48 @@ cmake --build build --config Release
 
 ## Known Issues / Active Investigation
 
-**Form loading with large mod lists under Wine (v1.21.x):**
+**Form loading with large mod lists under Wine (v1.22.x):**
 
-With the Gate to Sovngarde modlist (1720 enabled plugins), ESM forms are not being registered in the engine's form maps at `kDataLoaded`. Only ~166 engine-internal forms exist; all ESM forms (Gold001, defaultUnarmedWeap, etc.) return NULL from `TESForm::LookupByEditorID` and `GetFormByNumericId`.
+With the Gate to Sovngarde modlist (1720 enabled plugins, 3368 total files, 485 BSAs), the game's record-loading pipeline is completely skipped — `AddCompileIndex` is never called, `loadingFiles` is never set to `true`, and `AddFormToDataHandler` registers 0 forms. The game goes from catalog scan (SeekNextForm) straight to `kDataLoaded` with only ~166 engine-internal forms.
 
-Findings so far:
-- **Memory is NOT the cause** — v1.21.0 added a HeapAlloc-based allocator that successfully handled 1.3GB / 1.8M allocations with 0 failures. Forms still don't load.
-- **Skyrim.ini [Memory] settings have no effect** — AE ignores DefaultHeapInitialAllocMB/ScrapHeapSizeMB (hardcoded in binary)
-- **Investigating: `FormScatterTable::SetAt` callsite hooks** — the form_caching.h patch uses hardcoded offsets within TESForm::ctor for AE. If these offsets are wrong for AE 1.6.1170, `write_call<5>` would corrupt the constructor, preventing all form creation after SKSE loads.
-- Smaller modlists (Immersive & Pure, ~100 mods) appear to work under Wine
+**Root Cause: CRT File Handle Limit (512) under Wine**
+
+Through extensive binary search and diagnostic instrumentation (v1.22.0–v1.22.7), the root cause has been identified:
+
+| Finding | Detail |
+|---------|--------|
+| **Threshold** | Exactly **599 compiled files** work; **600+ fails** |
+| **Count-based** | Swapping which plugins are enabled doesn't matter — only total compiled count |
+| **CRT bottleneck** | `_setmaxstdio(8192)` reports success, but the CRT can only open **508 additional files** (512 total - 4 reserved) |
+| **Not Unix FDs** | The game process has 4000+ Unix FDs available (via lsof); wineserver has 6000+ |
+| **Not `_setmaxstdio` reset** | Hooked `_setmaxstdio` — game never calls it again after our patch; stays at 8192 |
+
+**How it works on Windows vs Wine:**
+- Windows CRT: `_setmaxstdio(8192)` raises both the stream limit AND the underlying fd table capacity. SSE Engine Fixes (original) raises this to 2048–8192, allowing 1000+ mod setups.
+- Wine CRT: `_setmaxstdio(8192)` sets `MSVCRT_max_streams` but the **actual CRT fd table** appears hard-limited to 512 entries in Wine's ucrtbase implementation. This is a Wine compatibility gap.
+
+**The math:**
+- Each compiled plugin needs at least one CRT file handle for reading records
+- BSA archives also consume CRT handles during loading
+- 485 BSAs + 599 compiled plugins = 1084 file handles needed
+- Wine CRT actual limit: 512
+- Result: when the engine tries to compile 600+ files, file opens silently fail, and the loading pipeline is skipped entirely
+
+**Diagnostic versions:**
+- v1.22.0–v1.22.2: Instrumented all 10 loading pipeline functions (AddFormToDataHandler, OpenTES, AddCompileIndex, etc.)
+- v1.22.3: Added loading monitor thread with 200ms polling of TESDataHandler state
+- v1.22.4: Hooked `_setmaxstdio` — confirmed game never resets the limit
+- v1.22.5: Added kActive/kMaster/kSmallFile flag counting
+- v1.22.6: Added CRT FD stress test — discovered the 508/512 actual limit
+- v1.22.7: Added Win32 CreateFile stress test to compare CRT vs Win32 handle limits
+
+**Previous eliminated causes:**
+- Memory allocator (v1.21.0 HeapAlloc replacement works fine, 0 failures)
+- Skyrim.ini settings (AE ignores them)
+- FormScatterTable::SetAt hooks (disabled, not the cause)
+- Specific plugin files (count-based, not file-specific)
+- plugins.txt entry count (only compiled file count matters)
+- kActive flag (never set, even in working cases — normal behavior)
 
 ## Credits
 
