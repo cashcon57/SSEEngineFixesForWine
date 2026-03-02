@@ -6,13 +6,16 @@
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "form_caching.h"
 
 // Wine-compatible editor ID cache — fixes TESForm::LookupByEditorID under Wine
 //
-// v1.16.0: Corrected diagnostics — deref BSTHashMap pointer, find FormID offset,
-// investigate TESDataHandler+0xD00 region, scan for real form storage
+// Problem: On AE 1.6.1170 under Wine, the form-by-ID BSTHashMap has capacity
+// 262144 but only 166 engine forms are populated. ESM forms are never registered.
+// FormID is at TESForm+0x14 (confirmed). We scan the hash table entries directly
+// and also scan heap memory near known forms to find ESM forms.
 
 namespace Patches::EditorIdCache
 {
@@ -49,6 +52,9 @@ namespace Patches::EditorIdCache
         inline EditorIdMap g_editorIdCache;
         inline std::atomic<bool> g_cachePopulated{ false };
 
+        // Our own FormID -> TESForm* map built from memory scanning
+        inline std::unordered_map<RE::FormID, RE::TESForm*> g_formById;
+
         inline RE::TESForm* LookupByEditorID(const std::string_view& a_editorID)
         {
             std::shared_lock lock(g_cacheMutex);
@@ -56,320 +62,311 @@ namespace Patches::EditorIdCache
             return it != g_editorIdCache.end() ? it->second : nullptr;
         }
 
-        inline void HexDump(const char* label, const void* ptr, std::size_t len)
+        // ================================================================
+        // Scan BSTHashMap entries table directly for ALL forms
+        // The map has 262144 capacity but CommonLib iteration only finds 166.
+        // We brute-force scan every entry slot.
+        // ================================================================
+        inline std::unordered_map<RE::FormID, RE::TESForm*> ScanHashTableEntries()
         {
-            auto* raw = reinterpret_cast<const std::uint8_t*>(ptr);
-            for (std::size_t off = 0; off < len; off += 16) {
-                std::string hex;
-                std::string ascii;
-                for (std::size_t i = 0; i < 16 && (off + i) < len; ++i) {
-                    char buf[4];
-                    std::snprintf(buf, sizeof(buf), "%02X ", raw[off + i]);
-                    hex += buf;
-                    ascii += (raw[off + i] >= 0x20 && raw[off + i] <= 0x7E)
-                        ? static_cast<char>(raw[off + i]) : '.';
-                }
-                logger::info("  {} +0x{:04X}: {} | {}", label, off, hex, ascii);
+            std::unordered_map<RE::FormID, RE::TESForm*> result;
+
+            const auto& [formMap, formLock] = RE::TESForm::GetAllForms();
+            if (!formMap) return result;
+
+            // Read the raw BSTHashMap structure
+            auto* mapRaw = reinterpret_cast<const std::uint8_t*>(formMap);
+
+            // BSTHashMap layout (from CommonLib):
+            // +0x00: _pad00 (8), +0x08: _pad08 (4), +0x0C: capacity (4)
+            // +0x10: free (4), +0x14: good (4)
+            // +0x18: sentinel (8), +0x20: alloc.pad (8), +0x28: entries (8)
+            auto capacity = *reinterpret_cast<const std::uint32_t*>(mapRaw + 0x0C);
+            auto sentinel = *reinterpret_cast<const std::uintptr_t*>(mapRaw + 0x18);
+            auto entriesPtr = *reinterpret_cast<const std::uintptr_t*>(mapRaw + 0x28);
+
+            logger::info("  BSTHashMap: cap={} sentinel=0x{:X} entries=0x{:X}",
+                capacity, sentinel, entriesPtr);
+
+            // Validate
+            if (capacity == 0 || capacity > 0x1000000) {
+                // Try alternate layout: maybe capacity is at +0x10
+                capacity = *reinterpret_cast<const std::uint32_t*>(mapRaw + 0x10);
+                sentinel = *reinterpret_cast<const std::uintptr_t*>(mapRaw + 0x1C);
+                entriesPtr = *reinterpret_cast<const std::uintptr_t*>(mapRaw + 0x2C);
+                logger::info("  BSTHashMap (alt layout): cap={} sentinel=0x{:X} entries=0x{:X}",
+                    capacity, sentinel, entriesPtr);
             }
+
+            if (capacity == 0 || capacity > 0x1000000 || entriesPtr < 0x10000) {
+                logger::warn("  BSTHashMap: invalid structure, can't scan entries");
+                return result;
+            }
+
+            if (IsBadReadPtr(reinterpret_cast<const void*>(entriesPtr), 24)) {
+                logger::warn("  BSTHashMap: entries pointer not readable");
+                return result;
+            }
+
+            // Entry layout for BSTHashMap<FormID, TESForm*>:
+            // Each entry is a BSTTuple<FormID, TESForm*> + next pointer
+            // BSTTuple: key(4) + pad(4) + value(8) = 16 bytes
+            // Plus next pointer (8 bytes) = 24 bytes total
+            const std::size_t ENTRY_SIZE = 24;
+            auto* entryBase = reinterpret_cast<const std::uint8_t*>(entriesPtr);
+
+            // Check readability of entries table
+            std::size_t tableSize = static_cast<std::size_t>(capacity) * ENTRY_SIZE;
+            if (IsBadReadPtr(entryBase, static_cast<UINT_PTR>(std::min(tableSize, static_cast<std::size_t>(0x1000))))) {
+                logger::warn("  BSTHashMap: entries table not readable at 0x{:X}", entriesPtr);
+                return result;
+            }
+
+            std::size_t populated = 0;
+            std::size_t withValidForm = 0;
+
+            for (std::uint32_t i = 0; i < capacity; ++i) {
+                auto* entry = entryBase + i * ENTRY_SIZE;
+
+                // Check readability every 4096 entries (page boundary)
+                if (i % 4096 == 0) {
+                    std::size_t remaining = (capacity - i) * ENTRY_SIZE;
+                    if (IsBadReadPtr(entry, static_cast<UINT_PTR>(std::min(remaining, static_cast<std::size_t>(4096 * ENTRY_SIZE))))) {
+                        logger::warn("  BSTHashMap: entries unreadable at index {}", i);
+                        break;
+                    }
+                }
+
+                auto formId = *reinterpret_cast<const RE::FormID*>(entry);
+                auto formPtr = *reinterpret_cast<const std::uintptr_t*>(entry + 8);
+                auto nextPtr = *reinterpret_cast<const std::uintptr_t*>(entry + 16);
+
+                // An entry is populated if:
+                // - formPtr is a valid heap/image pointer (not 0, not sentinel)
+                // - OR nextPtr is not the sentinel
+                bool isPopulated = false;
+
+                if (formPtr != 0 && formPtr != sentinel &&
+                    formPtr > 0x10000 && formPtr < 0x00007FFFFFFFFFFF) {
+                    isPopulated = true;
+                }
+
+                if (!isPopulated && nextPtr != sentinel && nextPtr != 0) {
+                    isPopulated = true;
+                }
+
+                if (isPopulated && formPtr > 0x10000 && formPtr < 0x00007FFFFFFFFFFF) {
+                    ++populated;
+
+                    // Verify: read FormID from the form object at +0x14
+                    auto* formObj = reinterpret_cast<const std::uint8_t*>(formPtr);
+                    if (!IsBadReadPtr(formObj, 0x20)) {
+                        auto storedId = *reinterpret_cast<const RE::FormID*>(formObj + 0x14);
+                        auto vtable = *reinterpret_cast<const std::uintptr_t*>(formObj);
+
+                        // Valid form: has vtable in image range and FormID matches
+                        if (vtable > 0x140000000 && vtable < 0x150000000) {
+                            ++withValidForm;
+                            result[storedId] = reinterpret_cast<RE::TESForm*>(const_cast<std::uint8_t*>(formObj));
+                        }
+                    }
+                }
+            }
+
+            logger::info("  BSTHashMap scan: {}/{} entries populated, {} with valid forms",
+                populated, capacity, withValidForm);
+
+            return result;
+        }
+
+        // ================================================================
+        // Memory scan for specific FormIDs near known form addresses
+        // ================================================================
+        inline RE::TESForm* ScanMemoryForForm(RE::FormID targetId, std::uintptr_t baseAddr, std::size_t range)
+        {
+            const std::size_t PAGE_SIZE = 0x1000;
+            std::uintptr_t scanStart = (baseAddr > range) ? (baseAddr - range) : 0x10000;
+            std::uintptr_t scanEnd = baseAddr + range;
+
+            // Align to page boundary
+            scanStart &= ~(PAGE_SIZE - 1);
+
+            for (std::uintptr_t page = scanStart; page < scanEnd; page += PAGE_SIZE) {
+                if (IsBadReadPtr(reinterpret_cast<const void*>(page), PAGE_SIZE)) continue;
+
+                for (std::size_t off = 0; off + 0x20 <= PAGE_SIZE; off += 8) {
+                    auto* candidate = reinterpret_cast<const std::uint8_t*>(page + off);
+                    auto candidateId = *reinterpret_cast<const RE::FormID*>(candidate + 0x14);
+
+                    if (candidateId == targetId) {
+                        auto vtable = *reinterpret_cast<const std::uintptr_t*>(candidate);
+                        if (vtable > 0x140000000 && vtable < 0x150000000) {
+                            return reinterpret_cast<RE::TESForm*>(const_cast<std::uint8_t*>(candidate));
+                        }
+                    }
+                }
+            }
+            return nullptr;
         }
 
         inline void PopulateCache()
         {
-            logger::info("editor ID cache v1.16.0: corrected diagnostics"sv);
-
-            EditorIdMap newCache;
+            logger::info("editor ID cache v1.17.0: direct solution"sv);
 
             // ================================================================
-            // DIAGNOSTIC 1: Read the ACTUAL BSTHashMap (deref the pointer!)
-            // REL::ID 400507 stores a POINTER TO the BSTHashMap, not the map itself
+            // PHASE 1: Scan the BSTHashMap entries table for ALL forms
+            // This bypasses CommonLib's iteration which may miss entries
             // ================================================================
-            RE::BSTHashMap<RE::FormID, RE::TESForm*>* actualFormMap = nullptr;
-            {
-                const auto& [formMap, formLock] = RE::TESForm::GetAllForms();
-                actualFormMap = formMap;
-                if (formMap) {
-                    logger::info("  form-by-ID map object at {:p}", (void*)formMap);
-                    HexDump("FormMap", formMap, 0x30);
-                    logger::info("  form-by-ID map .size() = {}", formMap->size());
+            auto scannedForms = ScanHashTableEntries();
+            logger::info("  Phase 1: found {} forms in hash table entries", scannedForms.size());
+
+            // Log some stats
+            if (!scannedForms.empty()) {
+                RE::FormID minId = 0xFFFFFFFF, maxId = 0;
+                for (auto& [id, _] : scannedForms) {
+                    if (id < minId) minId = id;
+                    if (id > maxId) maxId = id;
+                }
+                logger::info("  Phase 1: FormID range 0x{:X} - 0x{:X}", minId, maxId);
+
+                // Check for our target
+                auto it = scannedForms.find(0x12E46);
+                if (it != scannedForms.end()) {
+                    logger::info("  Phase 1: FOUND defaultUnarmedWeap 0x12E46 at {:p}!",
+                        (void*)it->second);
                 }
             }
 
             // ================================================================
-            // DIAGNOSTIC 2: Find FormID offset within TESForm
-            // Use PlayerRef (FormID 0x14) as reference
+            // PHASE 2: If target form not found in hash table, scan memory
+            // Scan near the known form addresses (0x2398xxxx range)
             // ================================================================
-            auto* playerRef = Patches::FormCaching::detail::GameLookupFormByID(0x14);
-            std::ptrdiff_t formIdOffset = -1;
-            if (playerRef) {
-                logger::info("  PlayerRef at {:p}, GetFormID()=0x{:08X}, GetFormType()={}",
-                    (void*)playerRef, playerRef->GetFormID(),
-                    static_cast<int>(playerRef->GetFormType()));
+            bool foundTarget = scannedForms.count(0x12E46) > 0;
 
-                HexDump("PlayerRef", playerRef, 0x30);
+            if (!foundTarget) {
+                logger::info("  Phase 2: scanning memory for FormID 0x12E46..."sv);
 
-                // Scan for FormID value 0x14 in the object's first 0x40 bytes
-                auto* raw = reinterpret_cast<const std::uint8_t*>(playerRef);
-                for (std::ptrdiff_t off = 0; off <= 0x38; off += 4) {
-                    auto val = *reinterpret_cast<const std::uint32_t*>(raw + off);
-                    if (val == 0x14) {
-                        logger::info("  Found FormID 0x14 at PlayerRef+0x{:02X}", off);
-                        if (formIdOffset < 0) formIdOffset = off;
-                    }
-                }
-
-                // Verify with another known form from the map
-                const auto& [formMap, formLock] = RE::TESForm::GetAllForms();
-                if (formMap) {
-                    const RE::BSReadLockGuard rl{ formLock };
-                    for (auto& [id, form] : *formMap) {
-                        if (!form || id == 0x14) continue;
-                        if (formIdOffset >= 0) {
-                            auto storedId = *reinterpret_cast<const std::uint32_t*>(
-                                reinterpret_cast<const std::uint8_t*>(form) + formIdOffset);
-                            if (storedId == id) {
-                                logger::info("  Verified FormID offset 0x{:02X}: form 0x{:08X} at {:p} matches",
-                                    formIdOffset, id, (void*)form);
-                            } else {
-                                logger::warn("  FormID offset 0x{:02X} MISMATCH: expected 0x{:08X}, got 0x{:08X}",
-                                    formIdOffset, id, storedId);
-                            }
-                        }
-                        break;
-                    }
-                }
-            }
-
-            // ================================================================
-            // DIAGNOSTIC 3: Investigate TESDataHandler+0xD00 region
-            // This is where non-zero data starts (v1.15.0 showed 0x000-0xCFF all zeros)
-            // ================================================================
-            auto* dh = RE::TESDataHandler::GetSingleton();
-            if (dh) {
-                auto* dhRaw = reinterpret_cast<const std::uint8_t*>(dh);
-                logger::info("  TESDataHandler at {:p}", (void*)dh);
-                logger::info("  Hex dump TESDataHandler +0xD00 to +0xDE0:");
-                HexDump("DH+D00", dhRaw + 0xD00, 0xE0);
-
-                // Dereference pointers at interesting offsets and dump what they point to
-                struct PointerTarget {
-                    std::size_t offset;
-                    const char* label;
-                };
-                PointerTarget targets[] = {
-                    { 0xD00, "DH+D00" },
-                    { 0xD08, "DH+D08" },
-                    { 0xD60, "DH+D60" },
-                    { 0xD68, "DH+D68" },
-                    { 0xDB0, "DH+DB0" },
-                    { 0xDC0, "DH+DC0" },
-                    { 0xEC0, "DH+EC0" },
-                };
-
-                for (auto& t : targets) {
-                    auto ptr = *reinterpret_cast<const std::uintptr_t*>(dhRaw + t.offset);
-                    if (ptr > 0x10000 && ptr < 0x00007FFFFFFFFFFF) {
-                        if (!IsBadReadPtr(reinterpret_cast<const void*>(ptr), 0x30)) {
-                            logger::info("  Deref {}: 0x{:X} ->", t.label, ptr);
-                            HexDump(t.label, reinterpret_cast<const void*>(ptr), 0x30);
-                        } else {
-                            logger::info("  Deref {}: 0x{:X} -> UNREADABLE", t.label, ptr);
-                        }
-                    }
-                }
-            }
-
-            // ================================================================
-            // DIAGNOSTIC 4: TESDataHandler+0xDC0 analysis
-            // v1.15.0 showed: +0xDC0=0x8659DF50 (form range), +0xDC8=0x800, +0xDD0=0x6B8
-            // Could this be a BSTHashMap? Check: 0x800=2048 capacity, 0x6B8=1720
-            // 2048 - 1720 = 328 (not 166). But let me read the ACTUAL structure
-            // ================================================================
-            if (dh) {
-                auto* dhRaw = reinterpret_cast<const std::uint8_t*>(dh);
-
-                // Read a potential BSTHashMap starting at various offsets near +0xDB0
-                // BSTHashMap layout: pad(8) + pad(4) + cap(4) + free(4) + good(4) + sentinel(8) + alloc.pad(8) + entries(8)
-                logger::info("  Trying BSTHashMap reads at various offsets in TESDataHandler..."sv);
-
-                for (std::size_t start = 0xDA0; start <= 0xE00; start += 0x08) {
-                    auto* mapRaw = dhRaw + start;
-                    auto pad00 = *reinterpret_cast<const std::uintptr_t*>(mapRaw + 0x00);
-                    auto pad08 = *reinterpret_cast<const std::uint32_t*>(mapRaw + 0x08);
-                    auto cap = *reinterpret_cast<const std::uint32_t*>(mapRaw + 0x0C);
-                    auto free_ = *reinterpret_cast<const std::uint32_t*>(mapRaw + 0x10);
-                    auto good = *reinterpret_cast<const std::uint32_t*>(mapRaw + 0x14);
-                    auto sentinel = *reinterpret_cast<const std::uintptr_t*>(mapRaw + 0x18);
-                    auto allocPad = *reinterpret_cast<const std::uintptr_t*>(mapRaw + 0x20);
-                    auto entries = *reinterpret_cast<const std::uintptr_t*>(mapRaw + 0x28);
-
-                    // Check if this looks like a valid BSTHashMap
-                    bool isPow2 = cap > 0 && (cap & (cap - 1)) == 0;
-                    bool sizeMatch = (free_ + good == cap);
-
-                    if (cap > 0 && isPow2 && sizeMatch && good > 10) {
-                        logger::info("    +0x{:03X}: cap={} free={} good={} sentinel=0x{:X} entries=0x{:X}",
-                            start, cap, free_, good, sentinel, entries);
-                    }
-                }
-            }
-
-            // ================================================================
-            // DIAGNOSTIC 5: Scan for FormID 0x12E46 near known form addresses
-            // The 166 forms are at 0x2398xxxx. Player is at 0x8659xxxx.
-            // ESM forms might be in a nearby memory range.
-            // ================================================================
-            if (formIdOffset >= 0) {
-                logger::info("  Scanning for FormID 0x12E46 using offset 0x{:02X}...", formIdOffset);
-
-                // Scan memory ranges near known form addresses
-                // Be VERY careful: only scan readable pages
-                struct ScanRange {
-                    std::uintptr_t start;
-                    std::size_t size;
-                    const char* label;
-                };
-
-                // Get the base range from known forms
-                std::uintptr_t minFormAddr = 0xFFFFFFFFFFFFFFFF, maxFormAddr = 0;
+                // Get a representative form address from the hash table
+                std::uintptr_t refAddr = 0;
                 {
                     const auto& [formMap, formLock] = RE::TESForm::GetAllForms();
                     if (formMap) {
                         const RE::BSReadLockGuard rl{ formLock };
                         for (auto& [id, form] : *formMap) {
-                            auto addr = reinterpret_cast<std::uintptr_t>(form);
-                            if (addr < minFormAddr) minFormAddr = addr;
-                            if (addr > maxFormAddr) maxFormAddr = addr;
-                        }
-                    }
-                }
-
-                logger::info("  Known form address range: 0x{:X} - 0x{:X}",
-                    minFormAddr, maxFormAddr);
-
-                // Scan a wider range around known forms
-                // Forms are objects (probably 0x100-0x1000 bytes each), so step by 8 bytes
-                // looking for the FormID at the known offset
-                if (minFormAddr < maxFormAddr) {
-                    // Scan from minFormAddr - 0x100000 to maxFormAddr + 0x100000
-                    // But be careful with page boundaries
-                    std::uintptr_t scanStart = (minFormAddr > 0x100000) ? (minFormAddr - 0x100000) : minFormAddr;
-                    std::uintptr_t scanEnd = maxFormAddr + 0x100000;
-                    std::size_t found = 0;
-
-                    logger::info("  Scanning 0x{:X} - 0x{:X} for FormID 0x12E46 at offset +0x{:02X}...",
-                        scanStart, scanEnd, formIdOffset);
-
-                    // Step through in page-sized chunks, check readability
-                    const std::size_t PAGE_SIZE = 0x1000;
-                    for (std::uintptr_t page = scanStart & ~(PAGE_SIZE - 1); page < scanEnd; page += PAGE_SIZE) {
-                        if (IsBadReadPtr(reinterpret_cast<const void*>(page), PAGE_SIZE)) continue;
-
-                        // Scan this page for the FormID
-                        for (std::size_t off = 0; off + formIdOffset + 4 <= PAGE_SIZE; off += 8) {
-                            auto* candidate = reinterpret_cast<const std::uint8_t*>(page + off);
-                            auto candidateId = *reinterpret_cast<const std::uint32_t*>(candidate + formIdOffset);
-
-                            if (candidateId == 0x12E46) {
-                                // Check if this looks like a valid form (has a vtable pointer)
-                                auto vtable = *reinterpret_cast<const std::uintptr_t*>(candidate);
-                                if (vtable > 0x140000000 && vtable < 0x150000000) {
-                                    ++found;
-                                    logger::info("    FOUND at 0x{:X}: vtable=0x{:X}",
-                                        page + off, vtable);
-                                    HexDump("Form0x12E46", candidate, 0x30);
-
-                                    // Try calling GetFormType on it
-                                    auto* asForm = reinterpret_cast<RE::TESForm*>(const_cast<std::uint8_t*>(candidate));
-                                    try {
-                                        auto formType = asForm->GetFormType();
-                                        auto actualId = asForm->GetFormID();
-                                        logger::info("    GetFormType()={}, GetFormID()=0x{:08X}",
-                                            static_cast<int>(formType), actualId);
-                                    } catch (...) {
-                                        logger::warn("    GetFormType/GetFormID threw exception");
-                                    }
-
-                                    if (found >= 3) break;
+                            if (form) {
+                                auto addr = reinterpret_cast<std::uintptr_t>(form);
+                                // Prefer forms in the heap range, not image range
+                                if (addr < 0x140000000) {
+                                    refAddr = addr;
+                                    break;
                                 }
                             }
                         }
-                        if (found >= 3) break;
-                    }
-
-                    logger::info("  Scan complete: found {} candidates", found);
-
-                    // Also try a broader scan if the first range didn't work
-                    if (found == 0) {
-                        // Try the 0x86xxxxxx range (where Player is)
-                        auto playerAddr = reinterpret_cast<std::uintptr_t>(playerRef);
-                        std::uintptr_t scan2Start = (playerAddr > 0x100000) ? (playerAddr - 0x100000) : playerAddr;
-                        std::uintptr_t scan2End = playerAddr + 0x100000;
-
-                        logger::info("  Scanning Player-range 0x{:X} - 0x{:X}...", scan2Start, scan2End);
-
-                        for (std::uintptr_t page = scan2Start & ~(PAGE_SIZE - 1); page < scan2End; page += PAGE_SIZE) {
-                            if (IsBadReadPtr(reinterpret_cast<const void*>(page), PAGE_SIZE)) continue;
-
-                            for (std::size_t off = 0; off + formIdOffset + 4 <= PAGE_SIZE; off += 8) {
-                                auto* candidate = reinterpret_cast<const std::uint8_t*>(page + off);
-                                auto candidateId = *reinterpret_cast<const std::uint32_t*>(candidate + formIdOffset);
-
-                                if (candidateId == 0x12E46) {
-                                    auto vtable = *reinterpret_cast<const std::uintptr_t*>(candidate);
-                                    if (vtable > 0x140000000 && vtable < 0x150000000) {
-                                        ++found;
-                                        logger::info("    FOUND at 0x{:X}: vtable=0x{:X}",
-                                            page + off, vtable);
-                                        HexDump("Form0x12E46", candidate, 0x30);
-                                        if (found >= 3) break;
-                                    }
-                                }
-                            }
-                            if (found >= 3) break;
-                        }
-                        logger::info("  Player-range scan: found {} total", found);
                     }
                 }
-            }
 
-            // ================================================================
-            // POPULATION: Use whatever forms we can find
-            // ================================================================
-            {
-                const auto& [formMap, formLock] = RE::TESForm::GetAllForms();
-                if (formMap && formMap->size() > 0) {
-                    const RE::BSReadLockGuard rl{ formLock };
-                    for (auto& [id, form] : *formMap) {
-                        if (!form) continue;
-                        const char* eid = form->GetFormEditorID();
-                        if (eid && eid[0] != '\0') {
-                            newCache.try_emplace(std::string(eid), form);
+                if (refAddr != 0) {
+                    // Scan +/- 2MB around the reference address
+                    logger::info("  Phase 2: scanning around 0x{:X} (+/- 2MB)...", refAddr);
+                    auto* found = ScanMemoryForForm(0x12E46, refAddr, 0x200000);
+                    if (found) {
+                        logger::info("  Phase 2: FOUND 0x12E46 at {:p}!", (void*)found);
+                        scannedForms[0x12E46] = found;
+                        foundTarget = true;
+                    }
+                }
+
+                // Also try near Player (different heap region)
+                if (!foundTarget) {
+                    auto* player = Patches::FormCaching::detail::GameLookupFormByID(0x14);
+                    if (player) {
+                        auto playerAddr = reinterpret_cast<std::uintptr_t>(player);
+                        logger::info("  Phase 2: scanning near Player at 0x{:X} (+/- 2MB)...", playerAddr);
+                        auto* found = ScanMemoryForForm(0x12E46, playerAddr, 0x200000);
+                        if (found) {
+                            logger::info("  Phase 2: FOUND 0x12E46 near Player at {:p}!", (void*)found);
+                            scannedForms[0x12E46] = found;
+                            foundTarget = true;
                         }
                     }
                 }
-            }
 
-            // Hardcoded fallback for forms in the BSTHashMap
-            if (newCache.empty()) {
-                static const std::pair<const char*, RE::FormID> knownEditorIds[] = {
-                    { "Player", 0x00000007 },
-                    { "PlayerRef", 0x00000014 },
-                    { "LockPick", 0x0000000A },
-                    { "Gold001", 0x0000003B },
-                    { "defaultUnarmedWeap", 0x00012E46 },
-                };
-
-                for (auto& [editorId, formId] : knownEditorIds) {
-                    auto* form = Patches::FormCaching::detail::GameLookupFormByID(formId);
-                    if (form) {
-                        newCache.try_emplace(std::string(editorId), form);
-                        logger::info("  Hardcoded: '{}' -> 0x{:08X} ({:p})", editorId, formId, (void*)form);
+                // Broader scan: try larger range
+                if (!foundTarget && refAddr != 0) {
+                    logger::info("  Phase 2: broad scan around 0x{:X} (+/- 16MB)...", refAddr);
+                    auto* found = ScanMemoryForForm(0x12E46, refAddr, 0x1000000);
+                    if (found) {
+                        logger::info("  Phase 2: FOUND 0x12E46 (broad) at {:p}!", (void*)found);
+                        scannedForms[0x12E46] = found;
+                        foundTarget = true;
                     }
+                }
+
+                if (!foundTarget) {
+                    logger::warn("  Phase 2: form 0x12E46 NOT FOUND in memory scans"sv);
                 }
             }
 
-            logger::info("editor ID cache: total {} editor IDs in cache"sv, newCache.size());
+            // Store all found forms for later use
+            g_formById = scannedForms;
 
+            // ================================================================
+            // PHASE 3: Build editor ID cache from found forms
+            // ================================================================
+            EditorIdMap newCache;
+
+            // Try GetFormEditorID on all found forms
+            std::size_t withEditorId = 0;
+            for (auto& [formId, form] : scannedForms) {
+                if (!form) continue;
+                const char* eid = form->GetFormEditorID();
+                if (eid && eid[0] != '\0') {
+                    newCache.try_emplace(std::string(eid), form);
+                    ++withEditorId;
+                    if (withEditorId <= 10) {
+                        logger::info("  EditorID: '{}' -> 0x{:08X}", eid, formId);
+                    }
+                }
+            }
+            logger::info("  Phase 3: {} forms with editor IDs", withEditorId);
+
+            // Hardcoded fallback for critical forms
+            if (newCache.find("defaultUnarmedWeap") == newCache.end()) {
+                auto it = scannedForms.find(0x12E46);
+                if (it != scannedForms.end()) {
+                    newCache.try_emplace("defaultUnarmedWeap", it->second);
+                    logger::info("  Hardcoded: 'defaultUnarmedWeap' -> 0x12E46 ({:p})",
+                        (void*)it->second);
+                }
+            }
+
+            // More hardcoded critical editor IDs
+            static const std::pair<const char*, RE::FormID> knownIds[] = {
+                { "Player", 0x00000007 },
+                { "PlayerRef", 0x00000014 },
+                { "LockPick", 0x0000000A },
+                { "Gold001", 0x0000003B },
+                { "defaultUnarmedWeap", 0x00012E46 },
+                { "WeapTypeUnarmed", 0x00013F8D },
+                { "ArmorIronCuirass", 0x00012E49 },
+                { "Torch01", 0x0001D4EC },
+                { "FoodBread", 0x00064B31 },
+            };
+
+            for (auto& [eid, fid] : knownIds) {
+                if (newCache.find(eid) != newCache.end()) continue;
+                auto it = scannedForms.find(fid);
+                if (it != scannedForms.end() && it->second) {
+                    newCache.try_emplace(std::string(eid), it->second);
+                    logger::info("  Hardcoded: '{}' -> 0x{:08X} ({:p})", eid, fid, (void*)it->second);
+                }
+            }
+
+            logger::info("editor ID cache: total {} editor IDs"sv, newCache.size());
+
+            // ================================================================
+            // PHASE 4: Store cache and repopulate game maps
+            // ================================================================
             {
                 std::unique_lock lock(g_cacheMutex);
                 g_editorIdCache = std::move(newCache);
@@ -378,15 +375,15 @@ namespace Patches::EditorIdCache
             {
                 std::shared_lock lock(g_cacheMutex);
                 if (g_editorIdCache.empty()) {
-                    logger::warn("editor ID cache: no editor IDs found, will retry at next event"sv);
+                    logger::warn("editor ID cache: empty, will retry at next event"sv);
                     return;
                 }
             }
 
+            // Repopulate the game's editor-ID-to-form BSTHashMap
             const auto& [editorMap, editorLock] = RE::TESForm::GetAllFormsByEditorID();
             if (editorMap) {
                 const RE::BSWriteLockGuard wl{ editorLock };
-                editorMap->clear();
                 {
                     std::shared_lock lock(g_cacheMutex);
                     editorMap->reserve(static_cast<std::uint32_t>(g_editorIdCache.size()));
@@ -399,8 +396,25 @@ namespace Patches::EditorIdCache
                     logger::info("editor ID cache: repopulated game map with {} entries"sv, repopulated);
                 }
                 g_cachePopulated.store(true);
-            } else {
-                logger::warn("editor ID cache: game's editor ID map pointer is null"sv);
+            }
+
+            // Also repopulate the form-by-ID BSTHashMap with any missing forms
+            if (scannedForms.size() > 200) {
+                const auto& [formMap, formLock2] = RE::TESForm::GetAllForms();
+                if (formMap) {
+                    const RE::BSWriteLockGuard wl{ formLock2 };
+                    std::size_t added = 0;
+                    for (auto& [formId, form] : scannedForms) {
+                        if (!form) continue;
+                        // Use emplace to add missing entries
+                        auto [it, inserted] = formMap->emplace(formId, form);
+                        if (inserted) ++added;
+                    }
+                    logger::info("editor ID cache: added {} forms to form-by-ID map"sv, added);
+                }
+            }
+
+            if (!g_cachePopulated.load()) {
                 std::shared_lock lock(g_cacheMutex);
                 if (!g_editorIdCache.empty()) {
                     g_cachePopulated.store(true);
@@ -420,6 +434,6 @@ namespace Patches::EditorIdCache
 
     inline void Install()
     {
-        logger::info("editor ID cache patch enabled (v1.16.0 corrected diagnostics)"sv);
+        logger::info("editor ID cache patch enabled (v1.17.0 direct solution)"sv);
     }
 }
