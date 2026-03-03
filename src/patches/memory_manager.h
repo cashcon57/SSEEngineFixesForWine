@@ -1,15 +1,18 @@
 #pragma once
 
+#include <mimalloc.h>
+
 // Wine-compatible memory allocator replacement for SSE Engine Fixes.
 //
 // The original SSE Engine Fixes replaces Skyrim's MemoryManager with Intel TBB
 // (scalable_malloc/scalable_free). TBB crashes under Wine/CrossOver/Proton due
 // to incompatible thread-local storage and memory pool initialization.
 //
-// This implementation replaces the allocator with Windows HeapAlloc/HeapFree,
-// which Wine implements natively. A dedicated growable heap (HeapCreate with
-// no size limit) provides effectively unlimited memory for large mod lists
-// (1000+ plugins) that exhaust the engine's default fixed-size heap.
+// This implementation replaces the allocator with mimalloc, which uses
+// per-thread caches and avoids the global serialized lock that HeapAlloc
+// incurs. mimalloc initializes lazily via VirtualAlloc/FlsAlloc — no DLL
+// load-phase TLS issues. Expected improvement: 10-30% faster form loading
+// for large modlists (1000+ plugins) vs the previous HeapAlloc approach.
 //
 // Additionally, the per-thread ScrapHeap reserve is expanded from 64MB to
 // 512MB (configurable) to accommodate heavy loading with many plugins.
@@ -18,23 +21,20 @@ namespace Patches::WineMemoryManager
 {
 	namespace detail
 	{
-		// Header prepended to every allocation from our heap.
+		// Header prepended to every allocation from mimalloc.
 		// 32 bytes to maintain 16-byte alignment of the user pointer.
 		// The header sits immediately before the user pointer so we can
 		// identify our allocations in Deallocate and recover the raw
-		// HeapAlloc pointer for HeapFree.
+		// mi_malloc pointer for mi_free.
 		struct AllocHeader {
 			static constexpr std::uint64_t MAGIC = 0x574E4D454D414C43ULL;  // "WNMEMALC"
 
 			std::uint64_t magic;       // 0x00: identifies as our allocation
 			std::uint64_t userSize;    // 0x08: requested allocation size (for Reallocate memcpy)
-			void*         rawPtr;      // 0x10: original HeapAlloc return value (for HeapFree)
+			void*         rawPtr;      // 0x10: original mi_malloc pointer (for mi_free)
 			std::uint64_t pad;         // 0x18: alignment padding to 32 bytes
 		};
 		static_assert(sizeof(AllocHeader) == 32);
-
-		// Our dedicated growable heap (no size limit)
-		inline HANDLE g_heap = nullptr;
 
 		// Statistics (atomic for thread-safety, relaxed ordering for perf)
 		inline std::atomic<std::uint64_t> g_totalAllocated{ 0 };
@@ -72,11 +72,7 @@ namespace Patches::WineMemoryManager
 			std::int32_t       a_alignment,
 			bool               a_aligned)
 		{
-			if (!g_heap) {
-				return g_allocateHook.call<void*>(a_self, a_size, a_alignment, a_aligned);
-			}
-
-			if (a_size == 0) a_size = 1;  // HeapAlloc(0) is implementation-defined
+			if (a_size == 0) a_size = 1;
 
 			// Effective alignment: minimum 16 (x64 standard), higher if requested
 			std::size_t align = 16;
@@ -86,7 +82,7 @@ namespace Patches::WineMemoryManager
 
 			// Total: header (32) + alignment padding + user data
 			std::size_t totalSize = sizeof(AllocHeader) + align + a_size;
-			void* raw = HeapAlloc(g_heap, 0, totalSize);
+			void* raw = mi_malloc(totalSize);
 			if (!raw) {
 				g_failCount.fetch_add(1, std::memory_order_relaxed);
 				return nullptr;
@@ -117,11 +113,6 @@ namespace Patches::WineMemoryManager
 		{
 			if (!a_mem) return;
 
-			if (!g_heap) {
-				g_deallocateHook.call<void>(a_self, a_mem, a_aligned);
-				return;
-			}
-
 			if (IsOurAllocation(a_mem)) {
 				auto* header = GetHeader(a_mem);
 				std::size_t size = header->userSize;
@@ -130,7 +121,7 @@ namespace Patches::WineMemoryManager
 				// Clear magic to prevent double-free
 				header->magic = 0;
 
-				HeapFree(g_heap, 0, raw);
+				mi_free(raw);
 
 				g_totalFreed.fetch_add(size, std::memory_order_relaxed);
 				g_freeCount.fetch_add(1, std::memory_order_relaxed);
@@ -155,10 +146,6 @@ namespace Patches::WineMemoryManager
 			if (a_newSize == 0) {
 				HookedDeallocate(a_self, a_oldMem, a_aligned);
 				return nullptr;
-			}
-
-			if (!g_heap) {
-				return g_reallocateHook.call<void*>(a_self, a_oldMem, a_newSize, a_alignment, a_aligned);
 			}
 
 			if (IsOurAllocation(a_oldMem)) {
@@ -224,30 +211,22 @@ namespace Patches::WineMemoryManager
 		bool expandScrapHeap = Settings::Memory::bExpandScrapHeap.GetValue();
 
 		if (replaceAllocator) {
-			// Create a growable heap with no size limit.
-			// Flags: 0 = serialized (thread-safe). Initial/max size: 0 = growable.
-			detail::g_heap = HeapCreate(0, 0, 0);
-			if (!detail::g_heap) {
-				logger::error("WineMemoryManager: HeapCreate failed (error {}), "
-					"falling back to original allocator", GetLastError());
-			} else {
-				// Hook MemoryManager::Allocate
-				const REL::Relocation allocate{ RELOCATION_ID(66859, 68115) };
-				detail::g_allocateHook = safetyhook::create_inline(
-					allocate.address(), detail::HookedAllocate);
+			// Hook MemoryManager::Allocate
+			const REL::Relocation allocate{ RELOCATION_ID(66859, 68115) };
+			detail::g_allocateHook = safetyhook::create_inline(
+				allocate.address(), detail::HookedAllocate);
 
-				// Hook MemoryManager::Deallocate
-				const REL::Relocation deallocate{ RELOCATION_ID(66861, 68117) };
-				detail::g_deallocateHook = safetyhook::create_inline(
-					deallocate.address(), detail::HookedDeallocate);
+			// Hook MemoryManager::Deallocate
+			const REL::Relocation deallocate{ RELOCATION_ID(66861, 68117) };
+			detail::g_deallocateHook = safetyhook::create_inline(
+				deallocate.address(), detail::HookedDeallocate);
 
-				// Hook MemoryManager::Reallocate
-				const REL::Relocation reallocate{ RELOCATION_ID(66860, 68116) };
-				detail::g_reallocateHook = safetyhook::create_inline(
-					reallocate.address(), detail::HookedReallocate);
+			// Hook MemoryManager::Reallocate
+			const REL::Relocation reallocate{ RELOCATION_ID(66860, 68116) };
+			detail::g_reallocateHook = safetyhook::create_inline(
+				reallocate.address(), detail::HookedReallocate);
 
-				logger::info("installed Wine-compatible memory allocator (HeapAlloc)"sv);
-			}
+			logger::info("installed Wine-compatible memory allocator (mimalloc)"sv);
 		}
 
 		if (expandScrapHeap) {

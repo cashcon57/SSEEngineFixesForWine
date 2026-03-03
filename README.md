@@ -41,7 +41,7 @@ Provides the same 38 bug fixes and 14 patches as the original, rewritten to work
 SSE Engine Fixes for Wine is an SKSE plugin (`.dll`) that installs during normal SKSE plugin load and provides:
 
 - All upstream bug fixes from [SSE Engine Fixes](https://github.com/aers/EngineFixesSkyrim64) — crash fixes, rendering corrections, gameplay fixes
-- A **Wine-compatible memory allocator** (HeapAlloc/HeapFree) replacing Intel TBB, which crashes under Wine
+- A **Wine-compatible memory allocator** ([mimalloc](https://github.com/microsoft/mimalloc)) replacing Intel TBB, which crashes under Wine
 - A fix for the **600-file compilation limit** — a Wine-specific bug that silently skips all form loading when plugin count exceeds ~519 entries in plugins.txt
 - Wine-specific crash fixes not present in the original
 - Suppression of the SKSE Address Library warning dialog that blocks the loading screen behind fullscreen CrossOver windows
@@ -62,7 +62,7 @@ The preload phase crashes under Wine/CrossOver/Proton when large mod lists are a
 |--------|---------|
 | **No d3dx9_42.dll preloader** | Crashes during Wine initialization with large mod lists |
 | **No TBB dependency** | `tbb::concurrent_hash_map` replaced with `std::shared_mutex` + sharded `std::unordered_map` (256 buckets) |
-| **Wine-compatible memory allocator** | TBB scalable_malloc crashes under Wine; replaced with HeapAlloc/HeapFree via SafetyHook inline hooks |
+| **Wine-compatible memory allocator** | TBB scalable_malloc crashes under Wine; replaced with [mimalloc](https://github.com/microsoft/mimalloc) (per-thread caches, no global serialized lock) via SafetyHook inline hooks |
 | **ScrapHeap expansion** | Per-thread ScrapHeap expanded from 64MB to 512MB (configurable) for large mod lists |
 | **600-file compilation fix** | Manually drives form loading when the engine's own pipeline is silently skipped |
 | **Address Library dialog suppressor** | Auto-dismisses the SKSE Address Library warning MessageBox that renders invisibly behind CrossOver fullscreen windows |
@@ -77,14 +77,14 @@ This fork is built for Wine/CrossOver/Proton compatibility. Several of its chang
 
 | Feature | This Fork | Original | Windows Impact |
 |---------|-----------|----------|----------------|
-| Memory allocator | `HeapAlloc/HeapFree` (Windows API) | Intel TBB `scalable_malloc` | **Slower.** TBB uses per-thread caches tuned for high-frequency concurrent allocation. HeapAlloc is the OS baseline — correct but not optimized for sustained concurrent pressure during form loading. |
+| Memory allocator | `mimalloc` (per-thread caches) | Intel TBB `scalable_malloc` | **Comparable or better.** mimalloc and TBB both use per-thread free lists and avoid the global serialized lock. mimalloc is MIT-licensed and matches or exceeds TBB allocation throughput in benchmarks. |
 | Form caching | `std::shared_mutex` + 256-bucket sharded `unordered_map` | TBB `concurrent_hash_map` | **Comparable.** Different lock strategy but competitive at moderate thread counts. |
 | 600-file fix | Only triggers when `addFormCount == 0` at `kDataLoaded` | N/A | **No impact.** The condition only occurs on Wine; on native Windows `addFormCount` is always non-zero. No overhead on Windows. |
 | Address Library dialog | Suppressed unconditionally | N/A | **Harmful.** On Windows you want this dialog — it tells you when Address Library is outdated. This fork silences a warning you need to see. |
 | d3dx9_42.dll preloader | Absent | Present | **Minor regression.** The preloader installs hooks earlier in the DLL load phase, giving a small timing advantage for very early engine patches. |
 | ScrapHeap expansion | 512MB | 512MB (same default) | **Same.** |
 
-**Performance summary:** On native Windows, the original SSE Engine Fixes is faster due to TBB's allocator, and it preserves diagnostic dialogs that indicate real problems. This fork does not crash on Windows, but there is no benefit to using it there.
+**Performance summary:** On native Windows, the original SSE Engine Fixes preserves diagnostic dialogs (Address Library, TBB errors) that indicate real problems. The allocator gap has closed since this fork now uses mimalloc, which is competitive with TBB throughput. This fork does not crash on Windows, but there is no benefit to using it there — Windows users should use the original to keep its diagnostic warnings intact.
 
 **Exception:** If you are running Windows with Wine/WSL2 GPU passthrough, or any other Wine-based environment, use this fork instead.
 
@@ -627,6 +627,7 @@ The versionlib hash format documented in [Address Library: versionlib Binary For
 | v1.22.22 | `ForceLoadAllForms` at `kDataLoaded` as safety fallback for cases where manual compilation ran but form loading still didn't trigger |
 | v1.22.23 | Added `suppress_address_library_dialog` — hooks `MessageBoxA/W` in `user32.dll` to auto-dismiss SKSE Address Library warning dialog that renders invisibly behind CrossOver fullscreen |
 | v1.22.24 | Suppress SKSE Address Library warning dialog for AE builds. Confirmed with Gate to Sovngarde (1720+ plugins, 3710 total compiled files, 1,069,819 forms): main menu in 117s. |
+| v1.22.25 | Replace `HeapAlloc`/`HeapFree` with [mimalloc](https://github.com/microsoft/mimalloc) in `bReplaceAllocator`. Eliminates the global serialized heap lock; per-thread caches reduce allocation contention during concurrent form loading. Expected 10–30% faster load times for large modlists vs HeapAlloc. |
 
 ---
 

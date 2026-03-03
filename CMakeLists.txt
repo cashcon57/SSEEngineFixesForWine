@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 set(NAME "SSEEngineFixesForWine" CACHE STRING "")
-set(VERSION 1.22.23 CACHE STRING "")
+set(VERSION 1.22.25 CACHE STRING "")
 
 # ---- Options ----
 option(COPY_BUILD "Copy the build output to the Skyrim directory." TRUE)
@@ -122,6 +122,7 @@ endif()
 
 
 find_package(safetyhook CONFIG REQUIRED)
+find_package(mimalloc CONFIG REQUIRED)
 
 # ---- Add source files ----
 include(cmake/headerlist.cmake)
@@ -189,6 +190,7 @@ target_link_libraries(
     PRIVATE
     ${CommonLibName}::${CommonLibName}
     safetyhook::safetyhook
+    mimalloc-static
 )
 
 target_precompile_headers(
