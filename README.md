@@ -1,5 +1,7 @@
 # SSE Engine Fixes for Wine
 
+NOTE: This readme is being periodically updated by Claude as I have it iterate, check logs, and iterate over and over again. It is essentially reverse-engineering parts of Skyrim SE/AE's loading process by Brute-Force method. This document is constantly changing and it's current state is not going to be the same or even anywhere close to what it currently is at. Claude may make claims that turn out to be untrue after it discovers more things. Don't take this document as the 100% truth, yet. 
+
 A **Wine/Proton/CrossOver-compatible** fork of [SSE Engine Fixes](https://github.com/aers/EngineFixesSkyrim64) by aers.
 
 This mod provides the same bug fixes and performance patches as SSE Engine Fixes, rewritten to work under Wine, Proton, and CrossOver (macOS and Linux). It is a **drop-in replacement** — you do not need the original SSE Engine Fixes installed.
