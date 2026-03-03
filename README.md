@@ -44,7 +44,8 @@ All **38 bug fixes** and **14 patches** from SSE Engine Fixes are preserved, plu
 - **Wine null actor base crash fix** — prevents crashes from null parent cells and actor bases unique to Wine
 - **Wine-compatible memory allocator** — replaces TBB with HeapAlloc/HeapFree via SafetyHook inline hooks on MemoryManager::Allocate/Deallocate/Reallocate. Uses a dedicated growable heap (HeapCreate) with 32-byte allocation headers for tracking.
 - **ScrapHeap expansion** — hooks GetThreadScrapHeap to expand per-thread reserve from 64MB to 512MB before first use
-- **Editor ID cache** — diagnostic + safe repopulation of editor IDs for Wine compatibility (investigating form loading with large mod lists)
+- **Editor ID cache** — diagnostic + safe repopulation of editor IDs for Wine compatibility
+- **600-file compilation fix (v1.22.11+)** — runtime code scanner detects and patches the engine's file compilation limit under Wine (see below)
 
 ## Included Patches
 
@@ -90,53 +91,73 @@ cmake -B build -S . -DBUILD_SKYRIMAE=ON -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scri
 cmake --build build --config Release
 ```
 
-## Known Issues / Active Investigation
+## Wine 600-File Compilation Limit (v1.22.11)
 
-**Form loading with large mod lists under Wine (v1.22.x):**
+### The Problem
 
-With the Gate to Sovngarde modlist (1720 enabled plugins, 3368 total files, 485 BSAs), the game's record-loading pipeline is completely skipped — `AddCompileIndex` is never called, `loadingFiles` is never set to `true`, and `AddFormToDataHandler` registers 0 forms. The game goes from catalog scan (SeekNextForm) straight to `kDataLoaded` with only ~166 engine-internal forms.
+Under Wine/CrossOver/Proton, Skyrim SE's loading pipeline fails silently when the total compiled file count reaches **600 or more**. The engine's compile phase is skipped entirely — `AddCompileIndex` is never called, `loadingFiles` is never set to `true`, and zero forms are loaded. The game appears to load but arrives at the main menu with an empty world.
 
-**Root Cause: Under Investigation (v1.22.9)**
+This does NOT happen on native Windows. It is specific to Wine's runtime environment.
 
-Through extensive binary search and diagnostic instrumentation (v1.22.0–v1.22.9), the root cause has been narrowed but not yet identified:
+### Exact Threshold
 
-| Finding | Detail |
-|---------|--------|
-| **Threshold** | Exactly **599 compiled files** work; **600+ fails** |
-| **Count-based** | Swapping which plugins are enabled doesn't matter — only total compiled count |
-| **NOT file handles** | 3-way FD stress test (static CRT, dynamic ucrtbase, Win32 CreateFile) all show **2000+ available** after `_setmaxstdio(8192)` |
-| **NOT Unix FDs** | The game process has 4000+ Unix FDs available (via lsof); wineserver has 6000+ |
-| **NOT `_setmaxstdio` reset** | Hooked `_setmaxstdio` — game never calls it again after our patch; stays at 8192 |
+Through binary search across 12 test runs:
 
-**CRT file handle theory debunked (v1.22.8):**
-- v1.22.6–v1.22.7 appeared to show a CRT limit of 508/512 files, but this was a **measurement error**
-- Our SKSE DLL uses **static CRT** (`/MT` link), which has its own `MSVCRT_max_streams` separate from the game's dynamic ucrtbase.dll
-- The stress test was calling `_wfopen_s` in our own static CRT (maxstdio=512), not the game's dynamic CRT (maxstdio=8192)
-- After fixing the test to: (1) raise our own static CRT's maxstdio, and (2) test the game's ucrtbase via GetProcAddress — all three layers show 2000+
-- **Conclusion: file handles are NOT the bottleneck**
+| Enabled Entries | Compiled Files | Result |
+|-----------------|---------------|--------|
+| 519 | 599 (129 reg + 470 ESL) | **WORKS** — all forms loaded |
+| 520 | 600+ | **FAILS** — 0 compiled, 0 forms |
 
-**Current investigation (v1.22.9):**
-- Hooking CompileFiles pipeline functions (AE IDs 13707, 13716, 13721) to trace which loading phases execute
-- These unnamed TESDataHandler functions control compile index assignment and the `loadingFiles` flag
-- Goal: determine whether CompileFiles is never called, exits early, or the compile index loop iterates 0 times
+The threshold is **exactly 599→600 compiled files**. The engine auto-adds ~80 Creation Club files, so 519 entries in `plugins.txt` → 599 compiled files. The count is **total** (regular + ESL), not per-type.
 
-**Diagnostic versions:**
-- v1.22.0–v1.22.2: Instrumented all 10 loading pipeline functions (AddFormToDataHandler, OpenTES, AddCompileIndex, etc.)
-- v1.22.3: Added loading monitor thread with 200ms polling of TESDataHandler state
-- v1.22.4: Hooked `_setmaxstdio` — confirmed game never resets the limit
-- v1.22.5: Added kActive/kMaster/kSmallFile flag counting
-- v1.22.6–v1.22.7: FD stress tests (CRT + Win32) — initially appeared to show 512 CRT limit
-- v1.22.8: Fixed FD stress test (static vs dynamic CRT) — **debunked file handle theory**
-- v1.22.9: CompileFiles pipeline hooks to trace compile index assignment
+This is count-based, not file-specific — swapping which plugins are enabled at the same count produces the same result.
 
-**Eliminated causes:**
-- **CRT file handles** (v1.22.8 — static CRT measurement error; actual limit is 2000+)
-- Memory allocator (v1.21.0 HeapAlloc replacement works fine, 0 failures)
-- Skyrim.ini settings (AE ignores them)
-- FormScatterTable::SetAt hooks (disabled, not the cause)
-- Specific plugin files (count-based, not file-specific)
-- plugins.txt entry count (only compiled file count matters)
-- kActive flag (never set, even in working cases — normal behavior)
+### The Fix (v1.22.11)
+
+v1.22.11 adds a runtime code scanner and manual compilation fallback:
+
+1. **Runtime .text Scanner**: At plugin load time, scans the game's decrypted .text section in memory for CALL/JMP instructions targeting `AddCompileIndex` (RELOCATION_ID 14509/14667). This identifies which engine function contains the compile loop.
+
+2. **Dynamic Hook**: Hooks the identified function (found via Address Library Offset2ID lookup) to monitor whether compilation actually occurs.
+
+3. **Manual Fallback**: If the hooked function returns without calling AddCompileIndex (compilation was skipped), and active files exist but `compiledFileCollection` is empty, the plugin manually:
+   - Iterates through `TESDataHandler::files`
+   - Assigns sequential `compileIndex` (0-0xFD) to regular plugins
+   - Assigns `compileIndex = 0xFE` + sequential `smallFileCompileIndex` (0-0xFFF) to ESL/light plugins
+   - Populates `compiledFileCollection.files` and `compiledFileCollection.smallFiles`
+   - Sets `loadingFiles = true`
+
+The engine's form loading code then proceeds normally, as if the original CompileFiles had run.
+
+### Important: SKSE Working Directory Fix
+
+Wine's `wine` command does NOT set the working directory to the game folder. SKSE uses a relative path to load the Address Library (`Data\SKSE\Plugins\versionlib-*.bin`), so it fails silently without the correct CWD.
+
+**Fix**: Create a `launch_skse.bat` in the game directory:
+```batch
+@echo off
+cd /d "%~dp0"
+skse64_loader.exe
+```
+
+Then launch this `.bat` instead of `skse64_loader.exe` directly.
+
+### Bisection Methodology
+
+To determine the exact threshold, a systematic binary search was performed by modifying `plugins.txt` (located at `%LOCALAPPDATA%\Skyrim Special Edition\Plugins.txt`). The Python script disabled entries by removing the `*` prefix:
+
+```python
+# Disable entries beyond TARGET count
+for line in lines:
+    if line.strip().startswith('*'):
+        enabled_count += 1
+        if enabled_count <= TARGET:
+            result.append(line)
+        else:
+            result.append(line.replace('*', '', 1))
+```
+
+The test sequence: 1720 → 1100 → 810 → 665 → 592 → 555 → 537 → 528 → 523 → 521 → 520 → 519. All runs ≥520 entries showed 0 compiled files; 519 showed 599 compiled files and full form loading.
 
 ## Reverse Engineering Notes
 
@@ -171,13 +192,61 @@ The `RELOCATION_ID(SE_ID, AE_ID)` macro maps function IDs between Skyrim SE 1.5.
 
 | SE ID | AE ID | Function | Offset |
 |-------|-------|----------|--------|
-| 13597 | 13693 | TESDataHandler::AddForm | +96 |
+| 13597 | 13693 | TESDataHandler::AddFormToDataHandler | +96 |
 | 13618 | 13716 | TESDataHandler::GetExtCellData | +98 |
-| 13625 | 13723 | TESDataHandler::? | +98 |
-| 13635 | 13740 | TESDataHandler::? | +105 |
-| 13657 | 13766 | TESDataHandler::? | +109 |
+| 13855 | 13931 | TESFile::OpenTES | +76 |
+| 13894 | 13979 | TESFile::SeekNextForm | +85 |
+| 14461 | 14617 | TESForm::GetFormByNumericId | +156 |
+| 14509 | 14667 | AddCompileIndex | +158 |
 
 Guessing AE IDs by adding a fixed offset to SE IDs will hook the **wrong function**. Always verify against the Address Library databases or CommonLibSSE-NG source.
+
+### Steam DRM: Static Binary Analysis Is Impossible
+
+SkyrimSE.exe's `.text` section is **encrypted on disk** (Steam DRM). The bytes at known function offsets are garbage until Steam decrypts them at launch. This means:
+- Python scripts scanning the on-disk binary will find 0 CALL/JMP sites
+- PE section headers are readable, but code bytes are not meaningful
+- Must scan from **within a running SKSE plugin** (the .text section is decrypted by the time DLLs load)
+
+The v1.22.11 runtime scanner handles this by parsing the in-memory PE headers and scanning the decrypted .text section.
+
+### Runtime Code Scanning Technique
+
+To find which function calls a known function (when you know the target but not the caller):
+
+```cpp
+// Get .text section from in-memory PE headers
+auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(moduleBase);
+auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(moduleBase + dos->e_lfanew);
+auto* sec = IMAGE_FIRST_SECTION(nt);
+// Find .text, get textStart and textSize
+
+// Scan for CALL (E8) and JMP (E9) rel32 instructions
+auto* bytes = reinterpret_cast<const uint8_t*>(textStart);
+for (size_t i = 0; i + 5 <= textSize; ++i) {
+    if (bytes[i] == 0xE8 || bytes[i] == 0xE9) {
+        int32_t rel32;
+        memcpy(&rel32, &bytes[i + 1], 4);
+        auto target = textStart + i + 5 + rel32;
+        if (target == knownFunctionAddr) {
+            // Found a caller! Use Offset2ID to identify it
+        }
+    }
+}
+```
+
+Then use `REL::IDDatabase::Offset2ID` (binary search sorted by offset) to find the containing function's Address Library ID.
+
+### Address Library (versionlib) Binary Format
+
+The Address Library files (`versionlib-X-X-X-X.bin`) use a delta-encoded binary format:
+- **Header**: format(i32), version(4×i32), nameLen(i32), name(bytes), pointerSize(i32), addressCount(i32)
+- **Entries**: delta-encoded `{id, offset}` pairs, one type byte per entry
+- **Type byte**: lo nibble = ID encoding, hi nibble = offset encoding
+  - 0=full u64, 1=prev+1, 2=prev+u8, 3=prev-u8, 4=prev+u16, 5=prev-u16, 6=u16, 7=u32
+  - Hi bit 3 = divide/multiply by pointer_size
+
+Format 1 is SE (1.5.97), Format 2 is AE (1.6.x). The v1.6.1170 database contains 428,461 entries.
 
 ### Wine `_setmaxstdio` Behavior
 
@@ -187,26 +256,70 @@ Wine's ucrtbase implements `_setmaxstdio` with a two-level limit system:
 
 `_setmaxstdio(8192)` returns success and does raise `MSVCRT_max_streams`, but the interaction between these two levels can be confusing when debugging. Under our testing, Wine's CRT can actually open 2000+ files after `_setmaxstdio(8192)` — the 512 limit only applies when `_setmaxstdio` hasn't been called.
 
-### Loading Pipeline Instrumentation Approach
+### Loading Pipeline Architecture
 
-To diagnose why Skyrim's form loading fails silently (no error, just 0 forms), we hooked all 10 critical pipeline functions using SafetyHook inline hooks:
+Skyrim's form loading pipeline runs in this order:
 
-| Function | What It Tells You |
-|----------|-------------------|
-| `AddFormToDataHandler` | Whether forms are ever registered (the bottom line) |
-| `AddCompileIndex` | Whether compile indices are assigned to plugin files |
-| `OpenTES` / `CloseTES` | Whether plugin files are opened for record reading |
-| `SeekNextForm` | Whether the engine iterates TES4 record headers |
-| `SeekNextSubrecord` / `ReadData` | Whether full record data is read (not just headers) |
-| `ClearData` / `InitializeFormDataStructures` | Whether the loading pipeline resets state |
+1. **ClearData** — resets all data structures
+2. **Catalog scan** — `SeekNextForm` iterates TES4 headers in all files
+3. **CompileFiles** — assigns compile indices, populates `compiledFileCollection`, sets `loadingFiles = true`
+4. **Form loading loop** — for each compiled file: `OpenTES` → `SeekNextForm` → `ReadData` → `AddFormToDataHandler` → `CloseTES`
+5. **InitializeFormDataStructures** — sets up form hash tables
+6. **kDataLoaded** — signals loading complete
 
-A **200ms polling monitor thread** on `TESDataHandler` state (compiled file counts, `loadingFiles` flag, form array sizes) fills in the gaps between hook calls, giving a timeline of the entire ~51-second load process.
+If step 3 is skipped (as in the 600-file bug), steps 4-5 produce zero forms. The key diagnostic: `AddCompileIndex` call count = 0 means CompileFiles never ran.
+
+### TESDataHandler Key Offsets (AE 1.6.1170)
+
+| Offset | Member | Type |
+|--------|--------|------|
+| 0xD58 | activeFile | TESFile* |
+| 0xD60 | files | BSSimpleList\<TESFile*\> |
+| 0xD70 | compiledFileCollection | TESFileCollection |
+| 0xD70 | .files | BSTArray\<TESFile*\> (regular plugins) |
+| 0xD88 | .smallFiles | BSTArray\<TESFile*\> (ESL/light plugins) |
+| 0xDA8 | loadingFiles | bool |
+
+TESFile compile index fields: `compileIndex` (uint8_t at +0x478, 0xFF = uncompiled), `smallFileCompileIndex` (uint16_t at +0x47A).
+
+### Key RELOCATION_IDs for Loading Pipeline
+
+| Function | SE ID | AE ID | AE Offset |
+|----------|-------|-------|-----------|
+| TESDataHandler::GetSingleton | 514141 | 400269 | — |
+| TESDataHandler::AddFormToDataHandler | 13597 | 13693 | 0x1B14C0 |
+| TESDataHandler::ClearData | 13646 | 13754 | 0x1B9AB0 |
+| TESDataHandler::LoadScripts | 13657 | 13766 | 0x1BCBC0 |
+| TESFile::OpenTES | 13855 | 13931 | 0x1C4DA0 |
+| TESFile::CloseTES | 13857 | 13933 | 0x1C5580 |
+| TESFile::SeekNextForm | 13894 | 13979 | 0x1C7D30 |
+| TESFile::SeekNextSubrecord | 13903 | 13990 | 0x1C8590 |
+| TESFile::ReadData | 13904 | 13991 | 0x1C8640 |
+| TESForm::GetFormByNumericId | 14461 | 14617 | 0x1E01A0 |
+| AddCompileIndex | 14509 | 14667 | 0x1E1640 |
+| TESForm::InitializeFormDataStructures | 14511 | 14669 | 0x1E17F0 |
 
 ### Wine-Specific Observations
 
-- **`kActive` flag is never set** on TESFile records under Wine, even in working load orders. This appears to be normal Wine behavior — don't use it as a diagnostic signal.
-- **SeekNextForm fires during catalog scan** regardless of whether the full load succeeds. A high SeekNextForm count with zero AddCompileIndex/OpenTES/AddFormToDataHandler calls means the catalog scan ran but the compile phase was skipped entirely.
-- **`_wfopen` is deprecated** under MSVC `/sdl` — use `_wfopen_s` or the build will fail with C4996 treated as error.
+- **`kActive` flag behavior**: TESFile records may not have `kActive` set under Wine even in working load orders. The engine uses a combination of `kActive` and `kMaster` flags. Don't rely solely on `kActive` for diagnostics.
+- **SeekNextForm fires during catalog scan** regardless of whether the full load succeeds. A high SeekNextForm count with zero AddCompileIndex/OpenTES/AddFormToDataHandler calls means the catalog scan ran but the compile phase was skipped.
+- **Wine CWD**: `wine --bottle "path/to/skse64_loader.exe"` does NOT set CWD to the game directory. SKSE's relative Address Library path fails. Use a .bat wrapper with `cd /d "%~dp0"`.
+
+## Diagnostic Version History
+
+| Version | Change |
+|---------|--------|
+| v1.22.0 | Instrumented 10 loading pipeline functions + 200ms monitor thread |
+| v1.22.1 | Added OpenTES/CloseTES hooks |
+| v1.22.2 | Added AddCompileIndex + SeekNextForm hooks |
+| v1.22.3 | Added CloseTES hook + plugins.txt verification |
+| v1.22.4 | Hooked `_setmaxstdio` — confirmed game never resets the limit |
+| v1.22.5 | Added kActive/kMaster/kSmallFile flag counting |
+| v1.22.6–7 | FD stress tests (appeared to show 512 CRT limit — was measurement error) |
+| v1.22.8 | Fixed FD stress test (static vs dynamic CRT) — debunked file handle theory |
+| v1.22.9 | CompileFiles pipeline hooks (crashed — wrong RELOCATION_IDs) |
+| v1.22.10 | Removed crashed hooks, added DumpFilesListState diagnostics |
+| v1.22.11 | Runtime code scanner + manual compilation fallback (fixes 600-file limit) |
 
 ## Credits
 
