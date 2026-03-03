@@ -423,9 +423,8 @@ namespace Patches::FormCaching
 
             // First compile: trigger when enough catalog work is done.
             // Check every 200 CloseTES calls starting from 2000 (enough files to matter).
-            // Conditions: ClearData fired, no normal compilation, no form loading yet.
+            // Conditions: no normal compilation, no form loading yet, TDH exists with files.
             if (count >= 2000 && count % 200 == 0 &&
-                g_clearDataCalls.load(std::memory_order_relaxed) > 0 &&
                 g_addCompileIndexCalls.load(std::memory_order_relaxed) == 0 &&
                 g_openTESCalls.load(std::memory_order_relaxed) == 0)
             {
