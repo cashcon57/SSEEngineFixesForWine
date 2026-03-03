@@ -873,7 +873,7 @@ namespace Patches::FormCaching
                 return;
             }
 
-            logger::info("=== ForceLoadAllForms (v1.22.23) ==="sv);
+            logger::info("=== ForceLoadAllForms (v1.22.26) ==="sv);
 
             // Log TDH state before reset
             logger::info("  TDH: loadingFiles={} hasDesiredFiles={} saveLoadGame={} clearingData={}",
@@ -999,7 +999,7 @@ namespace Patches::FormCaching
             g_forceLoadInProgress.store(true, std::memory_order_release);
             auto* vehHandle = AddVectoredExceptionHandler(1, ForceLoadVEH);
 
-            logger::info(">>> Calling AE 13753(TDH*, false) with VEH null guard (v1.22.23) <<<");
+            logger::info(">>> Calling AE 13753(TDH*, false) with VEH null guard (v1.22.26) <<<");
             loadForms(tdh, false);
 
             RemoveVectoredExceptionHandler(vehHandle);
@@ -1023,7 +1023,7 @@ namespace Patches::FormCaching
             auto addFormDelta = addFormAfter - addFormBefore;
             auto openTESDelta = openTESAfter - openTESBefore;
 
-            logger::info("=== ForceLoadAllForms (v1.22.23) RESULTS ==="sv);
+            logger::info("=== ForceLoadAllForms (v1.22.26) RESULTS ==="sv);
             logger::info("  AddFormToDataHandler: {} → {} (+{})", addFormBefore, addFormAfter, addFormDelta);
             logger::info("  OpenTES calls: {} → {} (+{})", openTESBefore, openTESAfter, openTESDelta);
             logger::info("  TDH: nextID=0x{:08X} activeFile={}",
@@ -1075,7 +1075,70 @@ namespace Patches::FormCaching
                 logger::error("Next step: investigate SomeFunc (module+0x1C8E40) per-file filtering");
             }
 
-            logger::info("=== END ForceLoadAllForms (v1.22.23) ==="sv);
+            // ==========================================================
+            // v1.22.26: Form Reference Resolution (InitItemImpl)
+            //
+            // After loading forms from files, the engine normally runs a
+            // separate pass that calls InitItemImpl() on every form to
+            // resolve stored form IDs into live pointers. Our
+            // ForceLoadAllForms path bypasses this phase, leaving cross-
+            // references (NPC→AI package, actor→race, weapon→enchantment)
+            // as raw form IDs instead of resolved pointers.
+            //
+            // This causes crashes on New Game: the engine dereferences
+            // e.g. RAX=0x5000823 (form ID 0x05000823) as a pointer,
+            // reading address 0x500084B — access violation.
+            //
+            // Fix: iterate all forms in TESDataHandler::formArrays and
+            // call InitItem() (virtual → InitItemImpl, vtable index 0x13)
+            // to resolve all cross-references. We set kInitingForms on
+            // BGSSaveLoadGame to match the engine's expected state.
+            // ==========================================================
+            if (addFormDelta > 100) {
+                logger::info("=== InitItemImpl Phase (v1.22.26) ==="sv);
+
+                auto* saveLoadGame = RE::BGSSaveLoadGame::GetSingleton();
+                if (saveLoadGame) {
+                    saveLoadGame->globalFlags.set(
+                        RE::BGSSaveLoadGame::GlobalFlags::kInitingForms);
+                    logger::info("  Set kInitingForms flag");
+                }
+
+                std::uint64_t initCount = 0;
+                std::uint64_t nullCount = 0;
+                auto initStart = std::chrono::high_resolution_clock::now();
+
+                for (std::uint32_t i = 0;
+                     i < std::to_underlying(RE::FormType::Max); ++i)
+                {
+                    auto formType = static_cast<RE::FormType>(i);
+                    auto& formArray = tdh->GetFormArray(formType);
+
+                    for (auto* form : formArray) {
+                        if (!form) {
+                            ++nullCount;
+                            continue;
+                        }
+                        form->InitItem();
+                        ++initCount;
+                    }
+                }
+
+                auto initElapsed = std::chrono::high_resolution_clock::now() - initStart;
+                auto initMs = std::chrono::duration_cast<std::chrono::milliseconds>(initElapsed).count();
+
+                if (saveLoadGame) {
+                    saveLoadGame->globalFlags.reset(
+                        RE::BGSSaveLoadGame::GlobalFlags::kInitingForms);
+                    logger::info("  Cleared kInitingForms flag");
+                }
+
+                logger::info("  InitItemImpl: {} forms initialized, {} null entries skipped, {}ms",
+                    initCount, nullCount, initMs);
+                logger::info("=== END InitItemImpl Phase (v1.22.26) ==="sv);
+            }
+
+            logger::info("=== END ForceLoadAllForms (v1.22.26) ==="sv);
 #else
             logger::info("ForceLoadAllForms: SE build — skipping (AE-only fix)"sv);
 #endif

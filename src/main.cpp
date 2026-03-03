@@ -199,9 +199,9 @@ extern "C" __declspec(dllexport) bool SKSEAPI SKSEPlugin_Load(const SKSE::LoadIn
     }
 
     // Install Wine-compatible memory allocator FIRST — all subsequent allocations
-    // (including from other patches and ESM loading) use our HeapAlloc-based heap.
+    // (including from other patches and ESM loading) use our mimalloc-based allocator.
     // The original Engine Fixes uses Intel TBB which crashes under Wine; we replace
-    // with HeapAlloc/HeapFree which Wine implements natively.
+    // with mimalloc which uses per-thread caches and avoids global lock contention.
     Patches::WineMemoryManager::Install();
 
     // Install all patches and fixes during SKSE load (not preload).
