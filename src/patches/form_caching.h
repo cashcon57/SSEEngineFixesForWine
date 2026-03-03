@@ -1,8 +1,11 @@
 #pragma once
 
+#include <algorithm>
 #include <atomic>
+#include <cstring>
 #include <shared_mutex>
 #include <unordered_map>
+#include <vector>
 
 #include "tree_lod_reference_caching.h"
 
@@ -494,6 +497,294 @@ namespace Patches::FormCaching
             logger::info("form caching: hook summary — GetForm=0x{:X} AddForm=0x{:X} OpenTES=0x{:X} AddCompileIdx=0x{:X} SeekNextForm=0x{:X} CloseTES=0x{:X}"sv,
                 getForm.address(), AddForm.address(), OpenTES.address(),
                 AddCompileIndex.address(), SeekNextForm.address(), CloseTES.address());
+
+            // ================================================================
+            // v1.22.11: Runtime code scanner — find callers of AddCompileIndex
+            // The binary is encrypted on disk (Steam DRM), so we scan the
+            // decrypted .text section in memory at runtime to find which
+            // function calls AddCompileIndex. This identifies "CompileFiles"
+            // (the engine function that assigns compile indices to all files).
+            // We then hook that function to detect + fix the 600-file skip.
+            // ================================================================
+            ScanAndHookCompileCaller(AddCompileIndex.address());
+        }
+
+        // ================================================================
+        // v1.22.11: Runtime code scanner + dynamic hook installer
+        //
+        // Problem: With 600+ compiled files under Wine, the engine skips
+        // the entire compilation step (loadingFiles never becomes true,
+        // AddCompileIndex is never called, no forms are loaded).
+        //
+        // Approach:
+        // 1. Scan decrypted .text for CALL instructions targeting AddCompileIndex
+        // 2. Find the containing function (= "CompileFiles") via Address Library
+        // 3. Hook it to detect when compilation is skipped
+        // 4. If skipped, manually assign compile indices and set loadingFiles
+        // ================================================================
+        inline SafetyHookInline g_hk_compileCaller{};
+        inline std::uintptr_t g_compileCallerAddr = 0;
+        inline std::uint64_t g_compileCallerAeId = 0;
+        inline std::atomic<bool> g_manualCompileDone{ false };
+
+        // Manual compilation: assign compile indices to all active files
+        // and populate compiledFileCollection. This replicates what the
+        // engine's CompileFiles does when it doesn't skip.
+        inline void ManuallyCompileFiles()
+        {
+            auto* tdh = RE::TESDataHandler::GetSingleton();
+            if (!tdh) {
+                logger::error("ManuallyCompileFiles: TDH is null!"sv);
+                return;
+            }
+
+            std::uint8_t nextRegIdx = 0;
+            std::uint16_t nextEslIdx = 0;
+            std::size_t regCount = 0;
+            std::size_t eslCount = 0;
+            std::size_t skippedInactive = 0;
+
+            for (auto& file : tdh->files) {
+                if (!file) continue;
+
+                // Only compile active files (those enabled in plugins.txt / load order)
+                // The engine would also skip files that aren't active
+                // Note: Skyrim.esm and other always-on files have kActive set
+                bool isActive = file->recordFlags.all(RE::TESFile::RecordFlag::kActive) ||
+                                file->recordFlags.all(RE::TESFile::RecordFlag::kMaster);
+                if (!isActive) {
+                    ++skippedInactive;
+                    continue;
+                }
+
+                if (file->IsLight()) {
+                    // ESL/light plugin → compileIndex = 0xFE, smallFileCompileIndex = sequential
+                    if (nextEslIdx <= 0xFFF) {
+                        file->compileIndex = 0xFE;
+                        file->smallFileCompileIndex = nextEslIdx++;
+                        tdh->compiledFileCollection.smallFiles.push_back(file);
+                        ++eslCount;
+                    } else {
+                        logger::warn("ManualCompile: ESL limit exceeded at '{}'", file->fileName);
+                    }
+                } else {
+                    // Regular plugin → compileIndex = sequential (0-0xFD)
+                    if (nextRegIdx <= 0xFD) {
+                        file->compileIndex = nextRegIdx++;
+                        tdh->compiledFileCollection.files.push_back(file);
+                        ++regCount;
+                    } else {
+                        logger::warn("ManualCompile: regular plugin limit exceeded at '{}'", file->fileName);
+                    }
+                }
+            }
+
+            // Set loadingFiles = true so the engine proceeds with form loading
+            tdh->loadingFiles = true;
+
+            logger::info("ManuallyCompileFiles: assigned {} reg + {} ESL = {} total (skipped {} inactive)",
+                regCount, eslCount, regCount + eslCount, skippedInactive);
+            logger::info("ManuallyCompileFiles: compiledFileCollection.files={} .smallFiles={}",
+                tdh->compiledFileCollection.files.size(),
+                tdh->compiledFileCollection.smallFiles.size());
+            logger::info("ManuallyCompileFiles: loadingFiles set to TRUE"sv);
+        }
+
+        // Hook function for the compile caller (signature-agnostic using void* args)
+        // x64 Windows: first 4 args in RCX, RDX, R8, R9; this pointer in RCX for member funcs
+        // Returns void* to preserve whatever return value the original function has
+        inline void* HookedCompileCaller(void* a_this, void* a2, void* a3, void* a4)
+        {
+            auto beforeCount = g_addCompileIndexCalls.load(std::memory_order_relaxed);
+            logger::info(">>> CompileCaller ENTERED (AE {}, addr 0x{:X}), AddCompileIndex count before: {}",
+                g_compileCallerAeId, g_compileCallerAddr, beforeCount);
+
+            // Call the original function and preserve its return value
+            auto result = g_hk_compileCaller.call<void*>(a_this, a2, a3, a4);
+
+            auto afterCount = g_addCompileIndexCalls.load(std::memory_order_relaxed);
+            logger::info(">>> CompileCaller RETURNED, AddCompileIndex count after: {} (delta: {})",
+                afterCount, afterCount - beforeCount);
+
+            // Check if compilation was skipped (no AddCompileIndex calls were made)
+            if (afterCount == beforeCount) {
+                // Check if there are active files that should have been compiled
+                auto* tdh = RE::TESDataHandler::GetSingleton();
+                if (tdh) {
+                    std::size_t activeFiles = 0;
+                    for (auto& file : tdh->files) {
+                        if (file && (file->recordFlags.all(RE::TESFile::RecordFlag::kActive) ||
+                                     file->recordFlags.all(RE::TESFile::RecordFlag::kMaster))) {
+                            ++activeFiles;
+                        }
+                    }
+
+                    bool collectionEmpty = tdh->compiledFileCollection.files.empty() &&
+                                          tdh->compiledFileCollection.smallFiles.empty();
+
+                    logger::warn(">>> COMPILE SKIPPED! active files: {}, collection empty: {}, loadingFiles: {}",
+                        activeFiles, collectionEmpty, tdh->loadingFiles);
+
+                    if (activeFiles > 0 && collectionEmpty && !tdh->loadingFiles &&
+                        !g_manualCompileDone.exchange(true)) {
+                        logger::warn(">>> TRIGGERING MANUAL COMPILATION FALLBACK <<<"sv);
+                        ManuallyCompileFiles();
+                    }
+                }
+            }
+
+            return result;
+        }
+
+        inline void ScanAndHookCompileCaller(std::uintptr_t addCompileIndexAddr)
+        {
+            // Get module info for .text section scanning
+            auto moduleBase = REL::Module::get().base();
+            auto moduleSize = REL::Module::get().size();
+
+            logger::info("=== RUNTIME CODE SCANNER ==="sv);
+            logger::info("  Module base: 0x{:X}, size: 0x{:X}", moduleBase, moduleSize);
+            logger::info("  AddCompileIndex addr: 0x{:X} (offset 0x{:X})",
+                addCompileIndexAddr, addCompileIndexAddr - moduleBase);
+
+            // Parse PE headers from memory to find .text section
+            auto dosHeader = reinterpret_cast<const IMAGE_DOS_HEADER*>(moduleBase);
+            auto ntHeaders = reinterpret_cast<const IMAGE_NT_HEADERS64*>(moduleBase + dosHeader->e_lfanew);
+            auto sectionHeader = IMAGE_FIRST_SECTION(ntHeaders);
+            auto numSections = ntHeaders->FileHeader.NumberOfSections;
+
+            std::uintptr_t textStart = 0;
+            std::size_t textSize = 0;
+
+            for (int i = 0; i < numSections; ++i) {
+                char name[9] = {};
+                std::memcpy(name, sectionHeader[i].Name, 8);
+                if (std::strcmp(name, ".text") == 0 && textStart == 0) {
+                    textStart = moduleBase + sectionHeader[i].VirtualAddress;
+                    textSize = sectionHeader[i].Misc.VirtualSize;
+                    logger::info("  .text section: VA 0x{:X}, size 0x{:X} ({:.1f} MB)",
+                        textStart, textSize, textSize / (1024.0 * 1024.0));
+                    break;
+                }
+            }
+
+            if (textStart == 0 || textSize == 0) {
+                logger::error("  Failed to find .text section in memory!"sv);
+                return;
+            }
+
+            // Scan for E8 (CALL rel32) and E9 (JMP rel32) targeting AddCompileIndex
+            struct CallerInfo {
+                std::uintptr_t callAddr;  // Address of the CALL/JMP instruction
+                std::uintptr_t callRva;   // RVA from module base
+                bool isJmp;               // true if JMP (tail call), false if CALL
+            };
+            std::vector<CallerInfo> callers;
+
+            auto* textBytes = reinterpret_cast<const std::uint8_t*>(textStart);
+            for (std::size_t i = 0; i + 5 <= textSize; ++i) {
+                if (textBytes[i] == 0xE8 || textBytes[i] == 0xE9) {  // CALL or JMP rel32
+                    std::int32_t rel32;
+                    std::memcpy(&rel32, &textBytes[i + 1], 4);
+                    auto callAddr = textStart + i;
+                    auto target = callAddr + 5 + rel32;
+                    if (target == addCompileIndexAddr) {
+                        callers.push_back({
+                            callAddr,
+                            callAddr - moduleBase,
+                            textBytes[i] == 0xE9
+                        });
+                    }
+                }
+            }
+
+            logger::info("  Found {} CALL/JMP sites targeting AddCompileIndex:", callers.size());
+            for (auto& c : callers) {
+                logger::info("    {} at 0x{:X} (RVA 0x{:X})",
+                    c.isJmp ? "JMP" : "CALL", c.callAddr, c.callRva);
+            }
+
+            if (callers.empty()) {
+                logger::warn("  No CALL sites found! AddCompileIndex may be called indirectly."sv);
+                return;
+            }
+
+            // Use Address Library Offset2ID to find containing functions
+            REL::IDDatabase::Offset2ID offset2id;
+            logger::info("  Offset2ID database loaded ({} entries)", offset2id.size());
+
+            // For each caller, find the containing function
+            struct ContainingFunc {
+                std::uint64_t aeId;
+                std::uintptr_t funcOffset;
+                std::uintptr_t funcAddr;
+                std::size_t callSiteCount;  // how many CALL sites this function has
+            };
+            std::vector<ContainingFunc> containingFuncs;
+
+            for (auto& c : callers) {
+                // Binary search for the first function with offset > callRva
+                // Then back up one to get the function containing our call site
+                auto it = std::upper_bound(
+                    offset2id.begin(), offset2id.end(), c.callRva,
+                    [](std::uint64_t rva, const auto& mapping) {
+                        return rva < mapping.offset;
+                    });
+
+                if (it != offset2id.begin()) {
+                    --it;  // Go back to the function that starts at or before our address
+                    auto funcOffset = it->offset;
+                    auto funcId = it->id;
+                    auto funcAddr = moduleBase + funcOffset;
+                    auto distFromStart = c.callRva - funcOffset;
+
+                    logger::info("    -> Containing function: AE {} at offset 0x{:X} (+0x{:X} into func)",
+                        funcId, funcOffset, distFromStart);
+
+                    // Track unique containing functions
+                    bool found = false;
+                    for (auto& f : containingFuncs) {
+                        if (f.aeId == funcId) {
+                            f.callSiteCount++;
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        containingFuncs.push_back({ funcId, funcOffset, funcAddr, 1 });
+                    }
+                }
+            }
+
+            logger::info("  Unique containing functions: {}", containingFuncs.size());
+            for (auto& f : containingFuncs) {
+                logger::info("    AE {} at 0x{:X}: {} CALL site(s)",
+                    f.aeId, f.funcOffset, f.callSiteCount);
+            }
+
+            // Hook the containing function with the most CALL sites to AddCompileIndex
+            // This is most likely "CompileFiles" — the main compile loop
+            if (!containingFuncs.empty()) {
+                auto& primary = *std::max_element(containingFuncs.begin(), containingFuncs.end(),
+                    [](const auto& a, const auto& b) { return a.callSiteCount < b.callSiteCount; });
+                g_compileCallerAddr = primary.funcAddr;
+                g_compileCallerAeId = primary.aeId;
+
+                logger::info("  >>> HOOKING AE {} at 0x{:X} as CompileCaller <<<",
+                    primary.aeId, primary.funcAddr);
+
+                g_hk_compileCaller = safetyhook::create_inline(
+                    reinterpret_cast<void*>(primary.funcAddr),
+                    HookedCompileCaller);
+
+                if (g_hk_compileCaller) {
+                    logger::info("  CompileCaller hook installed successfully"sv);
+                } else {
+                    logger::error("  FAILED to install CompileCaller hook!"sv);
+                }
+            }
+
+            logger::info("=== END RUNTIME CODE SCANNER ==="sv);
         }
     }
 
