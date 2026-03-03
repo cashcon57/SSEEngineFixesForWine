@@ -407,6 +407,9 @@ namespace Patches::FormCaching
             return g_hk_ReadData.call<bool>(a_self, a_buf, a_inLength);
         }
 
+        // Forward declarations for v1.22.11 compile caller scanner
+        inline void ScanAndHookCompileCaller(std::uintptr_t addCompileIndexAddr);
+
         inline void ReplaceFormMapFunctions()
         {
             const REL::Relocation getForm{ RELOCATION_ID(14461, 14617) };
@@ -640,10 +643,9 @@ namespace Patches::FormCaching
         {
             // Get module info for .text section scanning
             auto moduleBase = REL::Module::get().base();
-            auto moduleSize = REL::Module::get().size();
 
             logger::info("=== RUNTIME CODE SCANNER ==="sv);
-            logger::info("  Module base: 0x{:X}, size: 0x{:X}", moduleBase, moduleSize);
+            logger::info("  Module base: 0x{:X}", moduleBase);
             logger::info("  AddCompileIndex addr: 0x{:X} (offset 0x{:X})",
                 addCompileIndexAddr, addCompileIndexAddr - moduleBase);
 
