@@ -57,6 +57,14 @@ namespace Patches::FormCaching
         inline std::atomic<std::uint64_t> g_readDataBytes{ 0 };
         inline std::atomic<bool> g_seekNextFormReturnedFalse{ false };
 
+        // v1.22.23: ForceLoadAllForms VEH support
+        // g_forceLoadInProgress: true while AE 13753 is executing — suppresses
+        // CloseTES hook's ManuallyCompileFiles call (prevents compiledFileCollection
+        // iterator invalidation while AE 13753 iterates it).
+        // g_vehSkipCount: number of null dereferences skipped by ForceLoadVEH.
+        inline std::atomic<bool> g_forceLoadInProgress{ false };
+        inline std::atomic<std::uint64_t> g_vehSkipCount{ 0 };
+
         // v1.22.10: Enhanced ClearData diagnostic — dumps files list state
         // when ClearData fires, to see what the engine knew about before compile
         inline void DumpFilesListState(RE::TESDataHandler* a_self, const char* context)
@@ -368,6 +376,87 @@ namespace Patches::FormCaching
             return g_hk_SeekNextForm.call<bool>(a_self, a_skipIgnored);
         }
 
+        // ================================================================
+        // v1.22.23: Minimal x86-64 instruction length decoder.
+        // Used by ForceLoadVEH to advance RIP past null-dereference faults.
+        // Handles REX prefix, ModRM, SIB, and disp8/disp32.
+        // Covers all common memory-read patterns in Skyrim AE code.
+        // ================================================================
+        inline std::size_t x86_instr_len(const std::uint8_t* ip)
+        {
+            const auto* start = ip;
+
+            // Consume REX prefix (40–4F)
+            if ((*ip & 0xF0) == 0x40) ++ip;
+
+            // Consume legacy prefixes (operand-size, address-size, REP, segment)
+            while (*ip == 0x66 || *ip == 0xF2 || *ip == 0xF3 ||
+                   *ip == 0x2E || *ip == 0x3E || *ip == 0x26 ||
+                   *ip == 0x36 || *ip == 0x64 || *ip == 0x65) ++ip;
+
+            const auto op = *ip++;
+
+            // Two-byte escape (0F xx); three-byte escape (0F 38 xx / 0F 3A xx)
+            if (op == 0x0F) {
+                const auto op2 = *ip++;
+                if (op2 == 0x38 || op2 == 0x3A) ++ip; // third opcode byte
+            }
+
+            // All crashing memory-access instructions have a ModRM byte.
+            const auto modrm = *ip++;
+            const auto mod   = (modrm >> 6) & 0x3;
+            const auto rm    = modrm & 0x7;
+
+            if (mod != 3) {
+                if (rm == 4) ++ip;            // SIB byte
+                if      (mod == 0 && rm == 5) ip += 4; // RIP-relative disp32
+                else if (mod == 1)            ip += 1; // disp8
+                else if (mod == 2)            ip += 4; // disp32
+            }
+
+            return static_cast<std::size_t>(ip - start);
+        }
+
+        // ================================================================
+        // v1.22.23: Vectored Exception Handler — null-dereference guard
+        // for AE 13753 (ForceLoadAllForms).
+        //
+        // Large modlists (GTS 1720+ plugins) contain ESL-range actor forms
+        // whose race/template pointer is null. AE 13753's loading loop
+        // crashes at `mov ecx, [rax+0x38]` (AE 37791+0x8D, RAX=0) when
+        // it hits one of these forms.
+        //
+        // This VEH catches the null AV, decodes the instruction length,
+        // advances RIP past the failing instruction, and continues.
+        // The destination register is left zero, which is the same as if
+        // the load had returned 0 — null checks downstream handle it.
+        // ================================================================
+        inline LONG CALLBACK ForceLoadVEH(PEXCEPTION_POINTERS pep)
+        {
+            // Only active during ForceLoadAllForms
+            if (!g_forceLoadInProgress.load(std::memory_order_relaxed))
+                return EXCEPTION_CONTINUE_SEARCH;
+
+            // Only handle access violations
+            if (pep->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION)
+                return EXCEPTION_CONTINUE_SEARCH;
+
+            // Only handle null dereferences (target address < 0x10000)
+            // to avoid masking legitimate faults in unrelated code
+            ULONG_PTR targetAddr = 0;
+            if (pep->ExceptionRecord->NumberParameters >= 2)
+                targetAddr = pep->ExceptionRecord->ExceptionInformation[1];
+            if (targetAddr >= 0x10000)
+                return EXCEPTION_CONTINUE_SEARCH;
+
+            // Advance RIP past the failing instruction
+            const auto* rip = reinterpret_cast<const std::uint8_t*>(pep->ContextRecord->Rip);
+            pep->ContextRecord->Rip += x86_instr_len(rip);
+
+            g_vehSkipCount.fetch_add(1, std::memory_order_relaxed);
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+
         // Forward declarations (defined after CloseTES hook)
         inline void ManuallyCompileFiles();
         inline std::atomic<bool> g_manualCompileDone{ false };
@@ -414,8 +503,11 @@ namespace Patches::FormCaching
                     }
                 }
 
-                // Re-compile every 1000 CloseTES calls to pick up newly-cataloged files
-                if (count >= s_lastCompileAtClose + 1000) {
+                // Re-compile every 1000 CloseTES calls to pick up newly-cataloged files.
+                // SUPPRESSED during ForceLoadAllForms: AE 13753 iterates compiledFileCollection
+                // and calling ManuallyCompileFiles here would clear+rebuild it (iterator invalidation).
+                if (!g_forceLoadInProgress.load(std::memory_order_relaxed) &&
+                    count >= s_lastCompileAtClose + 1000) {
                     s_lastCompileAtClose = count;
                     ManuallyCompileFiles();
                 }
@@ -781,7 +873,7 @@ namespace Patches::FormCaching
                 return;
             }
 
-            logger::info("=== ForceLoadAllForms (v1.22.21) ==="sv);
+            logger::info("=== ForceLoadAllForms (v1.22.23) ==="sv);
 
             // Log TDH state before reset
             logger::info("  TDH: loadingFiles={} hasDesiredFiles={} saveLoadGame={} clearingData={}",
@@ -897,8 +989,23 @@ namespace Patches::FormCaching
             using LoadFormsFn = void(*)(RE::TESDataHandler*, bool);
             REL::Relocation<LoadFormsFn> loadForms{ REL::ID(13753) };
 
-            logger::info(">>> Calling AE 13753(TDH*, false) — engine form loading with validation bypass <<<");
+            // v1.22.23: Install VEH to skip null dereferences inside AE 13753.
+            // Large modlists contain ESL-range actor forms with null race/template
+            // pointers. The VEH catches the AV, advances RIP past the bad instruction,
+            // and continues — allowing the loading loop to proceed to the next form.
+            // The CloseTES guard (g_forceLoadInProgress) prevents ManuallyCompileFiles
+            // from invalidating compiledFileCollection while AE 13753 iterates it.
+            g_vehSkipCount.store(0, std::memory_order_relaxed);
+            g_forceLoadInProgress.store(true, std::memory_order_release);
+            auto* vehHandle = AddVectoredExceptionHandler(1, ForceLoadVEH);
+
+            logger::info(">>> Calling AE 13753(TDH*, false) with VEH null guard (v1.22.23) <<<");
             loadForms(tdh, false);
+
+            RemoveVectoredExceptionHandler(vehHandle);
+            g_forceLoadInProgress.store(false, std::memory_order_release);
+            auto skipCount = g_vehSkipCount.load(std::memory_order_relaxed);
+            logger::info("  VEH skipped {} null dereferences during AE 13753", skipCount);
 
             auto addFormAfter = g_addFormCalls.load(std::memory_order_relaxed);
             auto openTESAfter = g_openTESCalls.load(std::memory_order_relaxed);
@@ -916,7 +1023,7 @@ namespace Patches::FormCaching
             auto addFormDelta = addFormAfter - addFormBefore;
             auto openTESDelta = openTESAfter - openTESBefore;
 
-            logger::info("=== ForceLoadAllForms (v1.22.22) RESULTS ==="sv);
+            logger::info("=== ForceLoadAllForms (v1.22.23) RESULTS ==="sv);
             logger::info("  AddFormToDataHandler: {} → {} (+{})", addFormBefore, addFormAfter, addFormDelta);
             logger::info("  OpenTES calls: {} → {} (+{})", openTESBefore, openTESAfter, openTESDelta);
             logger::info("  TDH: nextID=0x{:08X} activeFile={}",
@@ -968,7 +1075,7 @@ namespace Patches::FormCaching
                 logger::error("Next step: investigate SomeFunc (module+0x1C8E40) per-file filtering");
             }
 
-            logger::info("=== END ForceLoadAllForms (v1.22.22) ==="sv);
+            logger::info("=== END ForceLoadAllForms (v1.22.23) ==="sv);
 #else
             logger::info("ForceLoadAllForms: SE build — skipping (AE-only fix)"sv);
 #endif
