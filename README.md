@@ -131,26 +131,26 @@ This is count-based, not file-specific — swapping which plugins are enabled at
 
 **Result:** compiledFileCollection is correctly populated (211 reg + 1589 ESL = 1800 files), loadingFiles=true on the main thread during the catalog scan.
 
-**Phase 2 — Form Loading (IN PROGRESS, v1.22.18):** Despite successful compilation, form loading never starts on its own. The engine's code path already branched past form loading before ManuallyCompileFiles ran. We must invoke form loading ourselves at kDataLoaded. Key findings:
+**Phase 2 — Form Loading (BREAKTHROUGH, v1.22.19–20):** Despite successful compilation, form loading never starts on its own. The engine's code path already branched past form loading before ManuallyCompileFiles ran. We must invoke form loading ourselves at kDataLoaded.
 
-- **AE 11596 is NOT the initial loading function** (v1.22.16): Hook installed but never entered. The initial data load uses a different code path.
-- **loadingFiles is a status flag, not a gate** (v1.22.15): Setting it to true on the main thread does not cause the form loading loop to start.
-- **v1.22.17 .text scanner identified two candidates** but had to be removed — its Offset2ID allocation (428K entries) caused a total startup hang (zero activity, TDH never created, 202% CPU for 47 min):
-  - **AE 13698** at offset 0x1B1D30: 54 AddFormToDataHandler call sites
-  - **AE 13753** at offset 0x1B96E0: 2 OpenTES call sites (loading orchestration)
-  - AE 13785 at offset 0x1BE460: 3 OpenTES calls (HotLoadPlugin — irrelevant)
-- **v1.22.18 tested both candidates via ForceLoadAllForms():**
-  - **AE 13753** (orchestration): Called as `void(TESDataHandler*)` — returned in 7ms producing 0 forms, 0 OpenTES calls. Likely wrong signature or checks an internal state flag that causes early return.
-  - **AE 13698** (form loading): Called as `void(TESDataHandler*)` — produced 78 AddFormToDataHandler calls but 0 OpenTES calls. All 78 forms were low-formID engine defaults (0x1F5, 0x1A, 0x1B, etc.). **This function creates built-in default forms, not file-loaded forms.**
-- **Neither AE function loads forms from plugin files.** The actual per-file form loading loop must be implemented manually.
+**v1.22.18 — Candidate testing:**
+- **AE 13753** (orchestration): Called as `void(TESDataHandler*)` — 0 forms, 0 OpenTES. Wrong signature (see v1.22.19).
+- **AE 13698** (form loading): 78 AddFormToDataHandler calls, 0 OpenTES — all engine defaults, not file-loaded forms.
 
-**Next step (v1.22.19):** Implement a custom form loading loop using CommonLib primitives:
-1. Iterate `compiledFileCollection.files` and `.smallFiles`
-2. For each file: `file->OpenTES()` → iterate records with `file->SeekNextForm(true)` → `file->GetFormType()` → `IFormFactory::GetFormFactoryByType(ft)->Create()` → `form->Load(file)` → `TESDataHandler::AddFormToDataHandler(form)`
-3. Handle FormID compilation via `TESForm::AddCompileIndex(&id, file)`
-4. Skip TES4/GRUP header records
+**v1.22.19 — BREAKTHROUGH via hex dump analysis:**
+Dumped 512 bytes of AE 13753 machine code at runtime and performed full x86-64 disassembly, revealing:
 
-All required CommonLib wrappers verified available: `TESFile::OpenTES` (AE 13931), `SeekNextForm` (AE 13979), `GetFormType` (AE 13982), `ReadData` (AE 13991), `CloseTES` (AE 13933), `IFormFactory::GetFormFactoryByType` (global array at AE 400508), `TESForm::AddCompileIndex` (AE 14667).
+1. **Wrong function signature (v1.22.18 bug):** AE 13753 is `void(TESDataHandler*, bool)` — at offset +0x21, `movzx r12d, dl` reads the second parameter. v1.22.18 called it with only one parameter.
+2. **Validation loop at +0xE0:** Iterates ALL files in TDH->files linked list, calling two functions per file:
+   - **SomeFunc** (module+0x1C8E40): if returns false → skip file (continue to next)
+   - **AnotherFunc** (module+0x1C6E90): if returns false → **ABORT ENTIRE FUNCTION** (return false)
+3. **Abort instruction at +0x106:** `74 09` (JE +9) jumps to abort path that sets TLS flag to 0 and returns
+4. **Form loading loop at +0x11C:** Only executes if validation completes without abort — iterates files, calls OpenTES, loads forms using the engine's native code
+
+Also confirmed via diagnostic form iteration: all 8 test files opened successfully (mode 0), 1057 records across 8 files, all form types had valid IFormFactory entries. **The files are readable — the validation is the only blocker.**
+
+**v1.22.20 — Validation bypass fix:**
+Temporarily NOPs the abort jump at +0x106 (`74 09` → `90 90`), converting "abort all loading" into "skip this file, continue to next." Then calls AE 13753 with the correct 2-parameter signature `(TDH*, false)`. The engine's own form loading loop at +0x11C then executes, loading forms using native code. Original bytes are restored after the call.
 
 ### Important: SKSE Working Directory Fix
 
@@ -294,7 +294,7 @@ If step 2 is skipped (the 600-file bug), step 3 never runs — `OpenTES` stays a
 
 **Critical finding (v1.22.16):** AE 11596 (identified by the v1.22.11 scanner as containing AddCompileIndex call sites) is NEVER called during initial loading. The initial loading pipeline uses a **different code path** — possibly inlined code or indirect calls that the E8/E9 scanner doesn't detect.
 
-**Current status (v1.22.18):** ManuallyCompileFiles successfully populates compiledFileCollection (211 reg + 1589 ESL = 1800 files) and sets loadingFiles=true on the main thread during the catalog scan. However, the form loading loop (step 3) never executes because the engine's code path already branched past it. The v1.22.17 .text scanner identified AE 13698 and AE 13753 as candidates, but testing in v1.22.18 revealed that AE 13698 only creates 78 built-in engine forms (not file-loaded) and AE 13753 returns without doing anything. **The actual form loading must be implemented as a custom loop using CommonLib's TESFile I/O + IFormFactory primitives** — this is the v1.22.19 task.
+**Current status (v1.22.20):** ManuallyCompileFiles successfully populates compiledFileCollection (211 reg + 1589 ESL = 1800 files). v1.22.19's hex dump analysis identified the root cause: AE 13753's internal validation loop aborts when any file fails a check function. v1.22.20 applies a temporary NOP patch to the abort instruction and calls AE 13753 with the correct signature, allowing the engine's native form loading loop to execute. **Testing in progress.**
 
 ### TESDataHandler Key Offsets (AE 1.6.1170)
 
@@ -305,6 +305,9 @@ If step 2 is skipped (the 600-file bug), step 3 never runs — `OpenTES` stays a
 | 0xD70 | compiledFileCollection | TESFileCollection |
 | 0xD70 | .files | BSTArray\<TESFile*\> (regular plugins) |
 | 0xD88 | .smallFiles | BSTArray\<TESFile*\> (ESL/light plugins) |
+| 0xDA0 | (unknown flag) | bool |
+| 0xDA2 | saveLoadGame | bool |
+| 0xDA6 | hasDesiredFiles | bool |
 | 0xDA8 | loadingFiles | bool |
 
 TESFile compile index fields: `compileIndex` (uint8_t at +0x478, 0xFF = uncompiled), `smallFileCompileIndex` (uint16_t at +0x47A).
@@ -326,23 +329,57 @@ TESFile compile index fields: `compileIndex` (uint8_t at +0x478, 0xFF = uncompil
 | AddCompileIndex | 14509 | 14667 | 0x1E1640 |
 | TESForm::InitializeFormDataStructures | 14511 | 14669 | 0x1E17F0 |
 
-### AE 13698 and AE 13753: Not the File-Loading Functions (v1.22.18)
+### AE 13698: Default Form Factory (v1.22.18)
 
-The v1.22.17 .text scanner identified two promising functions by counting call sites to known loading primitives:
-
-- **AE 13698** (offset 0x1B1D30): 54 `AddFormToDataHandler` call sites — appeared to be the big form-type switch that loads all ~54 form types from files.
-- **AE 13753** (offset 0x1B96E0): 2 `OpenTES` call sites — appeared to be the orchestrator that opens files and calls the form reader.
-
-**Testing in v1.22.18 proved both wrong:**
-
-| Function | Signature Used | Result |
-|----------|---------------|--------|
-| AE 13753 | `void(TESDataHandler*)` | 0 forms, 0 OpenTES, returned in 7ms |
-| AE 13698 | `void(TESDataHandler*)` | 78 AddForm calls, 0 OpenTES — all low-formID engine defaults |
-
-AE 13698's 78 forms had formIDs like 0x1F5, 0x1A, 0x1B — these are hardcoded engine defaults created without reading any files. The 54 AddFormToDataHandler call sites correspond to 54 different default form type initializations, not per-file form reading. AE 13753 likely checks an internal state flag or requires additional parameters.
+AE 13698 (offset 0x1B1D30) has 54 `AddFormToDataHandler` call sites, but these are hardcoded engine defaults (formIDs like 0x1F5, 0x1A, 0x1B) — built-in form type initializations created without reading any files.
 
 **Lesson:** A high count of `AddFormToDataHandler` call sites does NOT mean the function reads forms from files — it may just create built-in default instances of many different form types.
+
+### AE 13753: Form Loading Orchestrator — Full Disassembly (v1.22.19)
+
+AE 13753 (offset 0x1B96E0, ~976 bytes) IS the form loading orchestrator. v1.22.18 failed because it was called with the **wrong signature** (`void(TDH*)` instead of `void(TDH*, bool)`).
+
+**Key disassembly findings from runtime hex dump:**
+
+```
+Signature: void(TESDataHandler* rcx, bool dl)
+  +0x21: movzx r12d, dl     — stores 2nd param (bool: false=initial, true=save)
+  +0x25: mov rsi, rcx        — stores TDH*
+
+TLS setup:
+  +0x28: mov r8d, [rip+...]  — load TLS index
+  +0x38: mov r9, [rax+r8*8]  — get TLS slot
+  +0x4F: mov dword [rax], 100 — set loading token to 100
+  +0x5B: add r13, r9          — r13 = TLS_slot + 0x5D8 (status flag)
+  +0x5E: mov byte [r13], 1    — set TLS status = 1 (loading)
+
+saveLoadGame check:
+  +0xB7: cmp [rsi+0xDA2], dil — check saveLoadGame flag
+  +0xBE: je +0x20 → 0xE0      — if false (initial load), go to validation
+
+VALIDATION LOOP (+0xE0–0x10F):
+  Iterates TDH->files linked list (r14 = node, [r14] = TESFile*, [r14+8] = next)
+  For each file:
+    +0xF3: call module+0x1C8E40  — SomeFunc(file): if false → SKIP file
+    +0xFF: call module+0x1C6E90  — AnotherFunc(file): if false → ABORT ALL
+    +0x106: JE +0x09 → abort path (THIS IS THE BUG)
+
+  Abort path (+0x111):
+    mov byte [r13], 0     — clear TLS status flag
+    xor al, al            — return false
+    jmp to epilogue
+
+FORM LOADING LOOP (+0x11C–0x1B6):
+  Only reached if validation completes without abort.
+  Iterates same file list via rbx:
+    +0x14E: call module+0x1C8E40  — SomeFunc again (per-file filter)
+    +0x15A: call module+0x1C8D10  — ValidateFunc2
+    +0x177: call module+0x1C9EE0  — OpenFileFunc (sets activeFile)
+    +0x180: mov [rsi+0xD58], rdi  — TDH->activeFile = file
+  Loop continues until all files processed.
+```
+
+**The fix (v1.22.20):** NOP the abort jump at +0x106 (`74 09` → `90 90`). This converts "if file fails validation, abort everything" into "if file fails validation, skip to next file." The form loading loop at +0x11C then executes using the engine's native code.
 
 ### Wine-Specific Observations
 
@@ -373,6 +410,8 @@ AE 13698's 78 forms had formIDs like 0x1F5, 0x1A, 0x1B — these are hardcoded e
 | v1.22.16 | Hook AE 11596 (CompileFiles candidate) — confirmed NEVER called during initial loading. The engine uses a different code path. |
 | v1.22.17 | Multi-target .text scanner: scan for callers of OpenTES + AddFormToDataHandler + AddCompileIndex to identify the actual form loading function |
 | v1.22.18 | Removed .text scanner (caused zero-activity startup hang via Offset2ID 428K allocation). Removed FD stress test from monitor thread (killed thread at tick 10). Added ForceLoadAllForms() at kDataLoaded — tested AE 13753 (0 forms, wrong sig) and AE 13698 (78 engine defaults only, not file-loaded). Confirmed: neither function loads forms from plugin files. |
+| v1.22.19 | **BREAKTHROUGH:** Hex dump of AE 13753 (512 bytes) + diagnostic form iteration. Disassembly revealed: (1) correct signature is `void(TDH*, bool)` not `void(TDH*)`, (2) validation loop at +0xE0 aborts ALL loading if any file fails check at module+0x1C6E90, (3) abort instruction at +0x106 (`JE 74 09`), (4) form loading loop at +0x11C never runs because validation aborts. Diagnostic iteration confirmed all files readable with valid IFormFactory entries. |
+| v1.22.20 | Validation bypass: temporarily NOP abort jump at +0x106 (`74 09` → `90 90`), call AE 13753 with correct 2-param signature `(TDH*, false)`. Restores original bytes after call. |
 
 ## Credits
 
