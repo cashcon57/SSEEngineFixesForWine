@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <set>
 #include <shared_mutex>
+#include <sstream>
 #include <unordered_map>
 #include <vector>
 
@@ -529,9 +531,13 @@ namespace Patches::FormCaching
         inline std::uint64_t g_compileCallerAeId = 0;
         inline std::atomic<bool> g_manualCompileDone{ false };
 
-        // Manual compilation: assign compile indices to all active files
+        // Manual compilation: assign compile indices to all enabled files
         // and populate compiledFileCollection. This replicates what the
         // engine's CompileFiles does when it doesn't skip.
+        //
+        // v1.22.14: The kActive flag is set BY the compilation process, so it's
+        // always 0 when compilation is skipped. Instead, we parse plugins.txt
+        // to determine which files are enabled (same source the engine uses).
         inline void ManuallyCompileFiles()
         {
             auto* tdh = RE::TESDataHandler::GetSingleton();
@@ -540,22 +546,84 @@ namespace Patches::FormCaching
                 return;
             }
 
+            // --- Parse plugins.txt to determine enabled files ---
+            std::set<std::string> enabledNames;   // lowercase enabled plugin names
+            std::set<std::string> disabledNames;   // lowercase disabled plugin names
+            bool pluginsTxtParsed = false;
+
+            WCHAR localAppData[MAX_PATH] = {};
+            HRESULT hr = SHGetFolderPathW(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, localAppData);
+            if (hr == S_OK) {
+                std::wstring pluginsPath = localAppData;
+                pluginsPath += L"\\Skyrim Special Edition\\Plugins.txt";
+
+                HANDLE hFile = CreateFileW(pluginsPath.c_str(), GENERIC_READ,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                    OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+
+                if (hFile != INVALID_HANDLE_VALUE) {
+                    DWORD fileSize = GetFileSize(hFile, NULL);
+                    if (fileSize > 0 && fileSize < 10 * 1024 * 1024) {
+                        std::vector<char> buf(fileSize + 1, 0);
+                        DWORD bytesRead = 0;
+                        if (ReadFile(hFile, buf.data(), fileSize, &bytesRead, NULL) && bytesRead > 0) {
+                            std::string content(buf.data(), bytesRead);
+                            std::istringstream stream(content);
+                            std::string line;
+                            while (std::getline(stream, line)) {
+                                if (!line.empty() && line.back() == '\r') line.pop_back();
+                                if (line.empty() || line[0] == '#') continue;
+
+                                if (line[0] == '*') {
+                                    std::string name = line.substr(1);
+                                    std::transform(name.begin(), name.end(), name.begin(),
+                                        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                                    enabledNames.insert(std::move(name));
+                                } else {
+                                    std::string name = line;
+                                    std::transform(name.begin(), name.end(), name.begin(),
+                                        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                                    disabledNames.insert(std::move(name));
+                                }
+                            }
+                            pluginsTxtParsed = true;
+                        }
+                    }
+                    CloseHandle(hFile);
+                }
+            }
+
+            logger::info("ManuallyCompileFiles: plugins.txt parsed={}, {} enabled, {} disabled",
+                pluginsTxtParsed, enabledNames.size(), disabledNames.size());
+
+            // --- Assign compile indices ---
             std::uint8_t nextRegIdx = 0;
             std::uint16_t nextEslIdx = 0;
             std::size_t regCount = 0;
             std::size_t eslCount = 0;
-            std::size_t skippedInactive = 0;
+            std::size_t skippedDisabled = 0;
 
             for (auto& file : tdh->files) {
                 if (!file) continue;
 
-                // Only compile active files (those enabled in plugins.txt / load order)
-                // The engine would also skip files that aren't active
-                // Note: Skyrim.esm and other always-on files have kActive set
-                bool isActive = file->recordFlags.all(RE::TESFile::RecordFlag::kActive) ||
-                                file->recordFlags.all(RE::TESFile::RecordFlag::kMaster);
-                if (!isActive) {
-                    ++skippedInactive;
+                // Determine if this file should be compiled:
+                // 1. If plugins.txt was parsed: compile if enabled or not listed (base game/CC)
+                // 2. If plugins.txt couldn't be parsed: compile everything (safe fallback)
+                bool shouldCompile;
+                if (pluginsTxtParsed) {
+                    std::string lowerName(file->fileName);
+                    std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(),
+                        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                    bool isEnabled = enabledNames.count(lowerName) > 0;
+                    bool isDisabled = disabledNames.count(lowerName) > 0;
+                    // Compile if: enabled in plugins.txt, OR not listed at all (base game file)
+                    shouldCompile = isEnabled || !isDisabled;
+                } else {
+                    shouldCompile = true;  // fallback: compile everything
+                }
+
+                if (!shouldCompile) {
+                    ++skippedDisabled;
                     continue;
                 }
 
@@ -584,8 +652,8 @@ namespace Patches::FormCaching
             // Set loadingFiles = true so the engine proceeds with form loading
             tdh->loadingFiles = true;
 
-            logger::info("ManuallyCompileFiles: assigned {} reg + {} ESL = {} total (skipped {} inactive)",
-                regCount, eslCount, regCount + eslCount, skippedInactive);
+            logger::info("ManuallyCompileFiles: assigned {} reg + {} ESL = {} total (skipped {} disabled)",
+                regCount, eslCount, regCount + eslCount, skippedDisabled);
             logger::info("ManuallyCompileFiles: compiledFileCollection.files={} .smallFiles={}",
                 tdh->compiledFileCollection.files.size(),
                 tdh->compiledFileCollection.smallFiles.size());
