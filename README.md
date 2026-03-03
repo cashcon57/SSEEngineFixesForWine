@@ -12,7 +12,7 @@ SSE Engine Fixes uses a two-phase loading mechanism:
 1. **Phase 1 (Preload):** A DLL disguised as `d3dx9_42.dll` loads before SKSE and installs most hooks
 2. **Phase 2 (SKSE Load):** The SKSE plugin registers message handlers
 
-This preload phase is **incompatible with Wine/CrossOver/Proton** — it causes crashes during game initialization, especially with large mod lists.
+This preload phase is **incompatible with Wine/CrossOver/Proton** (after a certain number of plugins are loaded, ~600) — it causes crashes during game initialization, especially with large mod lists.
 
 **SSE Engine Fixes for Wine** moves all hooks to the normal SKSE plugin load phase and makes three key changes:
 
