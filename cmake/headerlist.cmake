@@ -55,6 +55,7 @@ set(headers ${headers}
 	src/patches/save_added_sound_categories.h
 	src/patches/save_game_max_size.h
 	src/patches/scrolling_doesnt_switch_pov.h
+	src/patches/suppress_address_library_dialog.h
 	src/patches/sleep_wait_time.h
 	src/patches/tree_lod_reference_caching.h
 	src/patches/waterflow_animation.h

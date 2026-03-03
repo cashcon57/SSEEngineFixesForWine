@@ -1,6 +1,7 @@
 #include "patches.h"
 
 #include "disable_chargen_precache.h"
+#include "suppress_address_library_dialog.h"
 #include "disable_snow_flag.h"
 #include "editor_id_cache.h"
 #include "enable_achievements.h"
@@ -20,6 +21,11 @@ namespace Patches
 {
     void Install()
     {
+        // Always-on: suppress the SKSE Address Library warning dialog.
+        // Under Wine/CrossOver the dialog appears behind the fullscreen game window
+        // and permanently blocks the loading screen.  Auto-dismiss it with IDNO.
+        SuppressAddressLibraryDialog::Install();
+
         if (Settings::Patches::bDisableChargenPrecache.GetValue())
             DisableChargenPrecache::Install();
 
