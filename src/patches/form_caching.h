@@ -367,6 +367,10 @@ namespace Patches::FormCaching
             return g_hk_SeekNextForm.call<bool>(a_self, a_skipIgnored);
         }
 
+        // Forward declarations (defined after CloseTES hook)
+        inline void ManuallyCompileFiles();
+        inline std::atomic<bool> g_manualCompileDone{ false };
+
         // ================================================================
         // v1.22.3: Hook TESFile::CloseTES — detect if files are closed
         // after catalog scan (would indicate catalog is a separate pass)
@@ -604,7 +608,6 @@ namespace Patches::FormCaching
         inline SafetyHookInline g_hk_compileCaller{};
         inline std::uintptr_t g_compileCallerAddr = 0;
         inline std::uint64_t g_compileCallerAeId = 0;
-        inline std::atomic<bool> g_manualCompileDone{ false };
 
         // Cached plugins.txt data (parsed once, reused across idempotent calls)
         inline std::set<std::string> g_enabledNames;   // lowercase enabled plugin names
