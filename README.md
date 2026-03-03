@@ -296,7 +296,7 @@ If step 2 is skipped (the 600-file bug), step 3 never runs — `OpenTES` stays a
 
 **Critical finding (v1.22.16):** AE 11596 (identified by the v1.22.11 scanner as containing AddCompileIndex call sites) is NEVER called during initial loading. The initial loading pipeline uses a **different code path** — possibly inlined code or indirect calls that the E8/E9 scanner doesn't detect.
 
-**Current status (v1.22.20):** ManuallyCompileFiles successfully populates compiledFileCollection (211 reg + 1589 ESL = 1800 files). v1.22.19's hex dump analysis identified the root cause: AE 13753's internal validation loop aborts when any file fails a check function. v1.22.20 applies a temporary NOP patch to the abort instruction and calls AE 13753 with the correct signature, allowing the engine's native form loading loop to execute. **Testing in progress.**
+**Current status (v1.22.21): FULLY SOLVED.** ManuallyCompileFiles populates compiledFileCollection (211 reg + 1589 ESL = 1800 files). v1.22.20 NOPs the abort jump and calls AE 13753. v1.22.21 fixes an infinite-loop regression by resetting compile state before the AE 13753 call. **Result: 284,294 forms loaded, 1,064,567 total in TDH hash table, game reaches main menu in ~110s with 1720 enabled plugins.** See v1.22.20–21 details below.
 
 ### TESDataHandler Key Offsets (AE 1.6.1170)
 
@@ -381,7 +381,13 @@ FORM LOADING LOOP (+0x11C–0x1B6):
   Loop continues until all files processed.
 ```
 
-**The fix (v1.22.20):** NOP the abort jump at +0x106 (`74 09` → `90 90`). This converts "if file fails validation, abort everything" into "if file fails validation, skip to next file." The form loading loop at +0x11C then executes using the engine's native code.
+**The fix (v1.22.20–21):** Two-step solution:
+
+1. **NOP the abort jump at +0x106** (`74 09` → `90 90`): Converts "if file fails validation, abort everything" into "if file fails validation, skip to next file." The form loading loop at +0x11C can now execute.
+
+2. **Reset compile state before calling AE 13753 (v1.22.21):** ManuallyCompileFiles pre-sets `file->compileIndex` on each TESFile and populates `compiledFileCollection`. When AE 13753's own compilation pass then calls `TESForm::AddCompileIndex` per form, the pre-set `compileIndex` causes the function's internal file iterator to lock — the same form is returned on every iteration, producing an infinite loop (observed: `Denizens of Morthal - AI Overhaul Patch.esp` at formID 0x00044381, 1.5 billion calls with no `SeekNextForm` between them). Fix: wipe `file->compileIndex` and clear `compiledFileCollection` before calling AE 13753 so it compiles from scratch with no state conflict.
+
+**Result:** 284,294 `AddFormToDataHandler` calls, 3,636 `OpenTES` calls, 1,064,567 forms in TDH hash table, 376,879 editor IDs. Game reaches main menu with full world state in ~110 seconds with 1720 enabled plugins (1800 compiled files: 211 regular + 1589 ESL).
 
 ### Wine-Specific Observations
 
@@ -413,7 +419,8 @@ FORM LOADING LOOP (+0x11C–0x1B6):
 | v1.22.17 | Multi-target .text scanner: scan for callers of OpenTES + AddFormToDataHandler + AddCompileIndex to identify the actual form loading function |
 | v1.22.18 | Removed .text scanner (caused zero-activity startup hang via Offset2ID 428K allocation). Removed FD stress test from monitor thread (killed thread at tick 10). Added ForceLoadAllForms() at kDataLoaded — tested AE 13753 (0 forms, wrong sig) and AE 13698 (78 engine defaults only, not file-loaded). Confirmed: neither function loads forms from plugin files. |
 | v1.22.19 | **BREAKTHROUGH:** Hex dump of AE 13753 (512 bytes) + diagnostic form iteration. Disassembly revealed: (1) correct signature is `void(TDH*, bool)` not `void(TDH*)`, (2) validation loop at +0xE0 aborts ALL loading if any file fails check at module+0x1C6E90, (3) abort instruction at +0x106 (`JE 74 09`), (4) form loading loop at +0x11C never runs because validation aborts. Diagnostic iteration confirmed all files readable with valid IFormFactory entries. |
-| v1.22.20 | Validation bypass: temporarily NOP abort jump at +0x106 (`74 09` → `90 90`), call AE 13753 with correct 2-param signature `(TDH*, false)`. Restores original bytes after call. |
+| v1.22.20 | Validation bypass: temporarily NOP abort jump at +0x106 (`74 09` → `90 90`), call AE 13753 with correct 2-param signature `(TDH*, false)`. Restores original bytes after call. AddForm counts go up, OpenTES fires — but infinite loop on `Denizens of Morthal - AI Overhaul Patch.esp` (1.5B AddCompileIndex calls, 0 SeekNextForm). |
+| v1.22.21 | **FULL SOLUTION:** Root cause of infinite loop: ManuallyCompileFiles pre-sets `file->compileIndex`, conflicting with AE 13753's own compilation pass → `TESForm::AddCompileIndex` locks on the same form. Fix: reset all `file->compileIndex = 0xFF` and clear `compiledFileCollection` before calling AE 13753, giving it a clean slate. **Result: 284,294 forms loaded (AddFormToDataHandler), 3,636 OpenTES calls, 1,064,567 total forms in TDH hash table, game reaches main menu with 1720 enabled plugins.** |
 
 ## Credits
 
