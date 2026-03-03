@@ -45,7 +45,7 @@ All **38 bug fixes** and **14 patches** from SSE Engine Fixes are preserved, plu
 - **Wine-compatible memory allocator** — replaces TBB with HeapAlloc/HeapFree via SafetyHook inline hooks on MemoryManager::Allocate/Deallocate/Reallocate. Uses a dedicated growable heap (HeapCreate) with 32-byte allocation headers for tracking.
 - **ScrapHeap expansion** — hooks GetThreadScrapHeap to expand per-thread reserve from 64MB to 512MB before first use
 - **Editor ID cache** — diagnostic + safe repopulation of editor IDs for Wine compatibility
-- **600-file compilation fix (v1.22.11+)** — runtime code scanner detects and patches the engine's file compilation limit under Wine (see below)
+- **600-file compilation fix (v1.22.11–14)** — monitor-based detection and manual compilation fallback for the engine's file compilation limit under Wine (see below)
 
 ## Included Patches
 
@@ -112,22 +112,26 @@ The threshold is **exactly 599→600 compiled files**. The engine auto-adds ~80 
 
 This is count-based, not file-specific — swapping which plugins are enabled at the same count produces the same result.
 
-### The Fix (v1.22.11)
+### The Fix (v1.22.11–v1.22.14)
 
-v1.22.11 adds a runtime code scanner and manual compilation fallback:
+The fix uses a **monitor-based detection** approach with a **manual compilation fallback**:
 
-1. **Runtime .text Scanner**: At plugin load time, scans the game's decrypted .text section in memory for CALL/JMP instructions targeting `AddCompileIndex` (RELOCATION_ID 14509/14667). This identifies which engine function contains the compile loop.
+1. **Loading Monitor Thread** (editor_id_cache.h): A background thread starts at plugin load and polls every 200ms (2s before TDH appears). It tracks all loading pipeline counters — AddCompileIndex calls, file counts, compilation status, memory usage.
 
-2. **Dynamic Hook**: Hooks the identified function (found via Address Library Offset2ID lookup) to monitor whether compilation actually occurs.
+2. **Compilation Skip Detection** (v1.22.12): When TDH exists and files are being loaded but `AddCompileIndex` has never been called and `compiledFileCollection` is empty for 10+ consecutive ticks, the monitor confirms the engine skipped compilation.
 
-3. **Manual Fallback**: If the hooked function returns without calling AddCompileIndex (compilation was skipped), and active files exist but `compiledFileCollection` is empty, the plugin manually:
-   - Iterates through `TESDataHandler::files`
+3. **Manual Compilation** (v1.22.14): `ManuallyCompileFiles()` parses `plugins.txt` via Win32 API to determine which files are enabled (the `kActive` flag can't be used because it's set BY the compilation process, which was skipped). Then:
+   - Files enabled in `plugins.txt` (with `*` prefix) → compiled
+   - Files not listed in `plugins.txt` (base game/CC always-on files) → compiled
+   - Files listed but disabled (without `*` prefix) → skipped
    - Assigns sequential `compileIndex` (0-0xFD) to regular plugins
    - Assigns `compileIndex = 0xFE` + sequential `smallFileCompileIndex` (0-0xFFF) to ESL/light plugins
    - Populates `compiledFileCollection.files` and `compiledFileCollection.smallFiles`
    - Sets `loadingFiles = true`
 
 The engine's form loading code then proceeds normally, as if the original CompileFiles had run.
+
+**v1.22.11** also included a runtime .text section scanner (scans 23MB of decrypted game code for CALL/JMP sites targeting AddCompileIndex) used for diagnostic purposes. This is currently disabled in v1.22.13+ as it's not needed for the fix.
 
 ### Important: SKSE Working Directory Fix
 
@@ -301,7 +305,7 @@ TESFile compile index fields: `compileIndex` (uint8_t at +0x478, 0xFF = uncompil
 
 ### Wine-Specific Observations
 
-- **`kActive` flag behavior**: TESFile records may not have `kActive` set under Wine even in working load orders. The engine uses a combination of `kActive` and `kMaster` flags. Don't rely solely on `kActive` for diagnostics.
+- **`kActive` flag is set BY compilation**: `TESFile::RecordFlag::kActive` (bit 3) is set during the `CompileFiles` process, not before. When `CompileFiles` is skipped (the 600-file bug), ALL files have `kActive = 0`. You CANNOT use `kActive` to determine which files should be compiled — parse `plugins.txt` instead.
 - **SeekNextForm fires during catalog scan** regardless of whether the full load succeeds. A high SeekNextForm count with zero AddCompileIndex/OpenTES/AddFormToDataHandler calls means the catalog scan ran but the compile phase was skipped.
 - **Wine CWD**: `wine --bottle "path/to/skse64_loader.exe"` does NOT set CWD to the game directory. SKSE's relative Address Library path fails. Use a .bat wrapper with `cd /d "%~dp0"`.
 
@@ -320,6 +324,9 @@ TESFile compile index fields: `compileIndex` (uint8_t at +0x478, 0xFF = uncompil
 | v1.22.9 | CompileFiles pipeline hooks (crashed — wrong RELOCATION_IDs) |
 | v1.22.10 | Removed crashed hooks, added DumpFilesListState diagnostics |
 | v1.22.11 | Runtime code scanner + manual compilation fallback (fixes 600-file limit) |
+| v1.22.12 | Monitor-based compilation detection (replaced broken inline hook that crashed on AE 11596) |
+| v1.22.13 | Disabled runtime scanner (not needed, was suspected of causing early termination) |
+| v1.22.14 | Fixed ManuallyCompileFiles — parse plugins.txt for enabled status (kActive is 0 when compilation is skipped) |
 
 ## Credits
 
