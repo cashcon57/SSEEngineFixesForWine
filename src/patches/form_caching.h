@@ -487,72 +487,14 @@ namespace Patches::FormCaching
             return g_hk_ReadData.call<bool>(a_self, a_buf, a_inLength);
         }
 
-        // Forward declarations for v1.22.11 compile caller scanner (diagnostic only)
-        inline void ScanAndHookCompileCaller(std::uintptr_t addCompileIndexAddr);
+        // Forward declarations for v1.22.17 multi-target scanner
+        inline void ScanForLoadingPipelineFunctions(
+            std::uintptr_t addCompileIndexAddr,
+            std::uintptr_t openTESAddr,
+            std::uintptr_t addFormAddr);
 
-        // ================================================================
-        // v1.22.16: Minimal hook on AE 11596 (CompileFiles candidate)
-        // Just log entry/exit to determine if it's called during loading.
-        // No state modification — pure diagnostic.
-        // ================================================================
-        inline SafetyHookInline g_hk_ae11596{};
-
-        inline void HookedAE11596(void* a_this)
-        {
-            auto* tdh = RE::TESDataHandler::GetSingleton();
-            auto tdhAddr = tdh ? reinterpret_cast<std::uintptr_t>(tdh) : 0;
-
-            logger::warn(">>> AE 11596 ENTERED: this={:p}, TDH={:p}, loadingFiles(CommonLib)={}, "
-                         "loadingFiles(raw@0xDA8)=0x{:02X}",
-                (void*)a_this, (void*)tdh,
-                tdh ? tdh->loadingFiles : false,
-                (tdh && tdhAddr) ? *reinterpret_cast<const std::uint8_t*>(tdhAddr + 0xDA8) : 0xFF);
-
-            // Dump bytes around loadingFiles offset for verification
-            if (tdh && tdhAddr) {
-                auto* bytes = reinterpret_cast<const std::uint8_t*>(tdhAddr + 0xDA0);
-                logger::info("  TDH+0xDA0..0xDAF: {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} "
-                             "{:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X}",
-                    bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-                    bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]);
-            }
-
-            auto beforeCompile = g_addCompileIndexCalls.load(std::memory_order_relaxed);
-            auto beforeOpenTES = g_openTESCalls.load(std::memory_order_relaxed);
-
-            g_hk_ae11596.call(a_this);
-
-            auto afterCompile = g_addCompileIndexCalls.load(std::memory_order_relaxed);
-            auto afterOpenTES = g_openTESCalls.load(std::memory_order_relaxed);
-
-            logger::warn(">>> AE 11596 RETURNED: AddCompileIndex delta={}, OpenTES delta={}, "
-                         "loadingFiles(CommonLib)={}, loadingFiles(raw@0xDA8)=0x{:02X}",
-                afterCompile - beforeCompile, afterOpenTES - beforeOpenTES,
-                tdh ? tdh->loadingFiles : false,
-                (tdh && tdhAddr) ? *reinterpret_cast<const std::uint8_t*>(tdhAddr + 0xDA8) : 0xFF);
-
-            // After AE 11596 returns, if compilation was skipped, trigger manual compile
-            // This runs on the MAIN thread, at the exact point where CompileFiles returns
-            if (afterCompile == beforeCompile && afterOpenTES == beforeOpenTES) {
-                if (tdh && !g_manualCompileDone.load(std::memory_order_relaxed)) {
-                    std::size_t fileCount = 0;
-                    for (auto& file : tdh->files) { if (file) ++fileCount; }
-
-                    if (fileCount > 100) {
-                        logger::warn(">>> AE 11596 SKIPPED compilation ({} files, 0 compiled) — "
-                                     "triggering ManuallyCompileFiles from CompileFiles return point <<<",
-                            fileCount);
-                        g_manualCompileDone.store(true, std::memory_order_release);
-                        ManuallyCompileFiles();
-                        logger::info(">>> POST-AE11596 compile done: loadingFiles={}, "
-                                     "compiledCollection={} reg + {} ESL <<<",
-                            tdh->loadingFiles,
-                            tdh->compiledFileCollection.files.size(),
-                            tdh->compiledFileCollection.smallFiles.size());
-                    }
-                }
-            }
-        }
+        // v1.22.16: AE 11596 hook REMOVED — confirmed never called during initial loading.
+        // The initial data load uses a different code path than AE 11596.
 
         inline void ReplaceFormMapFunctions()
         {
@@ -636,48 +578,27 @@ namespace Patches::FormCaching
             g_hk_ReadData = safetyhook::create_inline(ReadData.address(), TESFile_ReadData);
             logger::info("form caching: ReadData hook at 0x{:X}"sv, ReadData.address());
 
-            // v1.22.16: Hook AE 11596 (CompileFiles candidate) — diagnostic + post-return trigger
-            // v1.22.9: Previously crashed with wrong RELOCATION_IDs. AE 11596 was identified
-            // by the v1.22.11 scanner as the function containing AddCompileIndex call sites.
-            // Using 0 for SE ID (SE-only builds will skip this hook).
-            {
-                const REL::Relocation ae11596{ REL::ID(11596) };
-                g_hk_ae11596 = safetyhook::create_inline(ae11596.address(), HookedAE11596);
-                logger::info("form caching: AE 11596 hook at 0x{:X} (offset 0x{:X})"sv,
-                    ae11596.address(), ae11596.address() - REL::Module::get().base());
-            }
-
             // Log all hook addresses for verification
             logger::info("form caching: hook summary — GetForm=0x{:X} AddForm=0x{:X} OpenTES=0x{:X} AddCompileIdx=0x{:X} SeekNextForm=0x{:X} CloseTES=0x{:X}"sv,
                 getForm.address(), AddForm.address(), OpenTES.address(),
                 AddCompileIndex.address(), SeekNextForm.address(), CloseTES.address());
 
             // ================================================================
-            // v1.22.11-12: Runtime code scanner (diagnostic only, no hook).
-            // v1.22.13: DISABLED — scanner loads Offset2ID (428K entries) and
-            // processes 23MB of .text, which may cause early termination.
-            // The monitor thread in editor_id_cache.h handles compilation
-            // fallback without needing the scanner.
+            // v1.22.17: Multi-target .text scanner — find the REAL loading
+            // pipeline functions by scanning for callers of:
+            //   1. AddCompileIndex (AE 14667) — find the compile function
+            //   2. OpenTES (AE 13931) — find the form loading function
+            //   3. AddFormToDataHandler (AE 13693) — find form creation callers
+            //
+            // v1.22.16 proved AE 11596 (found by v1.22.11 scanner) is NEVER
+            // called during initial loading. The real loading pipeline uses
+            // a different code path we haven't identified yet.
             // ================================================================
-            // ScanAndHookCompileCaller(AddCompileIndex.address());
+            ScanForLoadingPipelineFunctions(
+                AddCompileIndex.address(),
+                OpenTES.address(),
+                AddForm.address());
         }
-
-        // ================================================================
-        // v1.22.11: Runtime code scanner + dynamic hook installer
-        //
-        // Problem: With 600+ compiled files under Wine, the engine skips
-        // the entire compilation step (loadingFiles never becomes true,
-        // AddCompileIndex is never called, no forms are loaded).
-        //
-        // Approach:
-        // 1. Scan decrypted .text for CALL instructions targeting AddCompileIndex
-        // 2. Find the containing function (= "CompileFiles") via Address Library
-        // 3. Hook it to detect when compilation is skipped
-        // 4. If skipped, manually assign compile indices and set loadingFiles
-        // ================================================================
-        inline SafetyHookInline g_hk_compileCaller{};
-        inline std::uintptr_t g_compileCallerAddr = 0;
-        inline std::uint64_t g_compileCallerAeId = 0;
 
         // Cached plugins.txt data (parsed once, reused across idempotent calls)
         inline std::set<std::string> g_enabledNames;   // lowercase enabled plugin names
@@ -839,63 +760,40 @@ namespace Patches::FormCaching
                 tdh->compiledFileCollection.smallFiles.size());
         }
 
-        // Hook function for the compile caller (signature-agnostic using void* args)
-        // x64 Windows: first 4 args in RCX, RDX, R8, R9; this pointer in RCX for member funcs
-        // Returns void* to preserve whatever return value the original function has
-        inline void* HookedCompileCaller(void* a_this, void* a2, void* a3, void* a4)
+        // ================================================================
+        // v1.22.17: Multi-target .text scanner
+        //
+        // Scans the decrypted .text section for E8/E9 (CALL/JMP rel32)
+        // instructions targeting multiple known functions, then uses the
+        // Address Library Offset2ID database to identify containing functions.
+        //
+        // Targets:
+        //   1. AddCompileIndex — find the compilation function (previously found AE 11596)
+        //   2. OpenTES — find the form loading function (THE KEY UNKNOWN)
+        //   3. AddFormToDataHandler — find form creation callers
+        //
+        // The form loading function (OpenTES caller) is the function we need
+        // to call ourselves after ManuallyCompileFiles, because the engine
+        // skips it when compilation is skipped under Wine.
+        // ================================================================
+        inline void ScanForLoadingPipelineFunctions(
+            std::uintptr_t addCompileIndexAddr,
+            std::uintptr_t openTESAddr,
+            std::uintptr_t addFormAddr)
         {
-            auto beforeCount = g_addCompileIndexCalls.load(std::memory_order_relaxed);
-            logger::info(">>> CompileCaller ENTERED (AE {}, addr 0x{:X}), AddCompileIndex count before: {}",
-                g_compileCallerAeId, g_compileCallerAddr, beforeCount);
-
-            // Call the original function and preserve its return value
-            auto result = g_hk_compileCaller.call<void*>(a_this, a2, a3, a4);
-
-            auto afterCount = g_addCompileIndexCalls.load(std::memory_order_relaxed);
-            logger::info(">>> CompileCaller RETURNED, AddCompileIndex count after: {} (delta: {})",
-                afterCount, afterCount - beforeCount);
-
-            // Check if compilation was skipped (no AddCompileIndex calls were made)
-            if (afterCount == beforeCount) {
-                // Check if there are active files that should have been compiled
-                auto* tdh = RE::TESDataHandler::GetSingleton();
-                if (tdh) {
-                    std::size_t activeFiles = 0;
-                    for (auto& file : tdh->files) {
-                        if (file && (file->recordFlags.all(RE::TESFile::RecordFlag::kActive) ||
-                                     file->recordFlags.all(RE::TESFile::RecordFlag::kMaster))) {
-                            ++activeFiles;
-                        }
-                    }
-
-                    bool collectionEmpty = tdh->compiledFileCollection.files.empty() &&
-                                          tdh->compiledFileCollection.smallFiles.empty();
-
-                    logger::warn(">>> COMPILE SKIPPED! active files: {}, collection empty: {}, loadingFiles: {}",
-                        activeFiles, collectionEmpty, tdh->loadingFiles);
-
-                    if (activeFiles > 0 && collectionEmpty && !tdh->loadingFiles &&
-                        !g_manualCompileDone.exchange(true)) {
-                        logger::warn(">>> TRIGGERING MANUAL COMPILATION FALLBACK <<<"sv);
-                        ManuallyCompileFiles();
-                    }
-                }
-            }
-
-            return result;
-        }
-
-        inline void ScanAndHookCompileCaller(std::uintptr_t addCompileIndexAddr)
-        {
-            // Get module info for .text section scanning
             auto moduleBase = REL::Module::get().base();
 
-            logger::info("=== RUNTIME CODE SCANNER ==="sv);
+            logger::info("=== MULTI-TARGET .TEXT SCANNER (v1.22.17) ==="sv);
             logger::info("  Module base: 0x{:X}", moduleBase);
-            logger::info("  AddCompileIndex addr: 0x{:X} (offset 0x{:X})",
+            logger::info("  Targets:");
+            logger::info("    AddCompileIndex: 0x{:X} (offset 0x{:X})",
                 addCompileIndexAddr, addCompileIndexAddr - moduleBase);
+            logger::info("    OpenTES:         0x{:X} (offset 0x{:X})",
+                openTESAddr, openTESAddr - moduleBase);
+            logger::info("    AddForm:         0x{:X} (offset 0x{:X})",
+                addFormAddr, addFormAddr - moduleBase);
 
-            // Parse PE headers from memory to find .text section
+            // Parse PE headers to find .text section
             auto dosHeader = reinterpret_cast<const IMAGE_DOS_HEADER*>(moduleBase);
             auto ntHeaders = reinterpret_cast<const IMAGE_NT_HEADERS64*>(moduleBase + dosHeader->e_lfanew);
             auto sectionHeader = IMAGE_FIRST_SECTION(ntHeaders);
@@ -917,115 +815,125 @@ namespace Patches::FormCaching
             }
 
             if (textStart == 0 || textSize == 0) {
-                logger::error("  Failed to find .text section in memory!"sv);
+                logger::error("  Failed to find .text section!"sv);
                 return;
             }
 
-            // Scan for E8 (CALL rel32) and E9 (JMP rel32) targeting AddCompileIndex
+            // Scan for all E8/E9 instructions targeting any of our targets
             struct CallerInfo {
-                std::uintptr_t callAddr;  // Address of the CALL/JMP instruction
-                std::uintptr_t callRva;   // RVA from module base
-                bool isJmp;               // true if JMP (tail call), false if CALL
+                std::uintptr_t callAddr;
+                std::uintptr_t callRva;
+                bool isJmp;
+                int targetIndex;  // 0=AddCompileIndex, 1=OpenTES, 2=AddForm
             };
-            std::vector<CallerInfo> callers;
+
+            std::uintptr_t targets[3] = { addCompileIndexAddr, openTESAddr, addFormAddr };
+            const char* targetNames[3] = { "AddCompileIndex", "OpenTES", "AddFormToDataHandler" };
+            std::vector<CallerInfo> allCallers;
 
             auto* textBytes = reinterpret_cast<const std::uint8_t*>(textStart);
             for (std::size_t i = 0; i + 5 <= textSize; ++i) {
-                if (textBytes[i] == 0xE8 || textBytes[i] == 0xE9) {  // CALL or JMP rel32
+                if (textBytes[i] == 0xE8 || textBytes[i] == 0xE9) {
                     std::int32_t rel32;
                     std::memcpy(&rel32, &textBytes[i + 1], 4);
                     auto callAddr = textStart + i;
                     auto target = callAddr + 5 + rel32;
-                    if (target == addCompileIndexAddr) {
-                        callers.push_back({
-                            callAddr,
-                            callAddr - moduleBase,
-                            textBytes[i] == 0xE9
-                        });
+
+                    for (int t = 0; t < 3; ++t) {
+                        if (target == targets[t]) {
+                            allCallers.push_back({
+                                callAddr,
+                                callAddr - moduleBase,
+                                textBytes[i] == 0xE9,
+                                t
+                            });
+                            break;
+                        }
                     }
                 }
             }
 
-            logger::info("  Found {} CALL/JMP sites targeting AddCompileIndex:", callers.size());
-            for (auto& c : callers) {
-                logger::info("    {} at 0x{:X} (RVA 0x{:X})",
-                    c.isJmp ? "JMP" : "CALL", c.callAddr, c.callRva);
-            }
+            // Count per target
+            int counts[3] = {};
+            for (auto& c : allCallers) counts[c.targetIndex]++;
+            logger::info("  Scan complete: {} AddCompileIndex, {} OpenTES, {} AddForm call sites",
+                counts[0], counts[1], counts[2]);
 
-            if (callers.empty()) {
-                logger::warn("  No CALL sites found! AddCompileIndex may be called indirectly."sv);
-                return;
-            }
-
-            // Use Address Library Offset2ID to find containing functions
+            // Load Address Library Offset2ID for function identification
             REL::IDDatabase::Offset2ID offset2id;
-            logger::info("  Offset2ID database loaded ({} entries)", offset2id.size());
+            logger::info("  Offset2ID loaded ({} entries)", offset2id.size());
 
-            // For each caller, find the containing function
+            // For each target, find containing functions
             struct ContainingFunc {
                 std::uint64_t aeId;
                 std::uintptr_t funcOffset;
                 std::uintptr_t funcAddr;
-                std::size_t callSiteCount;  // how many CALL sites this function has
+                std::size_t callSiteCount;
             };
-            std::vector<ContainingFunc> containingFuncs;
 
-            for (auto& c : callers) {
-                // Binary search for the first function with offset > callRva
-                // Then back up one to get the function containing our call site
-                auto it = std::upper_bound(
-                    offset2id.begin(), offset2id.end(), c.callRva,
-                    [](std::uint64_t rva, const auto& mapping) {
-                        return rva < mapping.offset;
-                    });
+            for (int t = 0; t < 3; ++t) {
+                logger::info("  --- {} callers ---", targetNames[t]);
 
-                if (it != offset2id.begin()) {
-                    --it;  // Go back to the function that starts at or before our address
-                    auto funcOffset = it->offset;
-                    auto funcId = it->id;
-                    auto funcAddr = moduleBase + funcOffset;
-                    auto distFromStart = c.callRva - funcOffset;
+                std::vector<ContainingFunc> funcs;
+                int siteCount = 0;
 
-                    logger::info("    -> Containing function: AE {} at offset 0x{:X} (+0x{:X} into func)",
-                        funcId, funcOffset, distFromStart);
+                for (auto& c : allCallers) {
+                    if (c.targetIndex != t) continue;
+                    ++siteCount;
 
-                    // Track unique containing functions
-                    bool found = false;
-                    for (auto& f : containingFuncs) {
-                        if (f.aeId == funcId) {
-                            f.callSiteCount++;
-                            found = true;
-                            break;
+                    // Log first 20 call sites per target
+                    if (siteCount <= 20) {
+                        logger::info("    {} at RVA 0x{:X}",
+                            c.isJmp ? "JMP" : "CALL", c.callRva);
+                    }
+
+                    // Find containing function via Offset2ID
+                    auto it = std::upper_bound(
+                        offset2id.begin(), offset2id.end(), c.callRva,
+                        [](std::uint64_t rva, const auto& mapping) {
+                            return rva < mapping.offset;
+                        });
+
+                    if (it != offset2id.begin()) {
+                        --it;
+                        auto funcId = it->id;
+                        auto funcOffset = it->offset;
+
+                        bool found = false;
+                        for (auto& f : funcs) {
+                            if (f.aeId == funcId) {
+                                f.callSiteCount++;
+                                found = true;
+                                break;
+                            }
+                        }
+                        if (!found) {
+                            funcs.push_back({ funcId, funcOffset, moduleBase + funcOffset, 1 });
                         }
                     }
-                    if (!found) {
-                        containingFuncs.push_back({ funcId, funcOffset, funcAddr, 1 });
-                    }
+                }
+
+                if (siteCount > 20) {
+                    logger::info("    ... ({} total call sites, showing first 20)", siteCount);
+                }
+
+                // Sort by call site count descending
+                std::sort(funcs.begin(), funcs.end(),
+                    [](const auto& a, const auto& b) { return a.callSiteCount > b.callSiteCount; });
+
+                logger::info("    {} unique containing functions:", funcs.size());
+                // Log all functions (most important diagnostic output)
+                for (std::size_t i = 0; i < funcs.size() && i < 30; ++i) {
+                    auto& f = funcs[i];
+                    logger::info("      AE {} at offset 0x{:X} (addr 0x{:X}): {} call site(s)",
+                        f.aeId, f.funcOffset, f.funcAddr, f.callSiteCount);
+                }
+                if (funcs.size() > 30) {
+                    logger::info("      ... ({} total, showing top 30)", funcs.size());
                 }
             }
 
-            logger::info("  Unique containing functions: {}", containingFuncs.size());
-            for (auto& f : containingFuncs) {
-                logger::info("    AE {} at 0x{:X}: {} CALL site(s)",
-                    f.aeId, f.funcOffset, f.callSiteCount);
-            }
-
-            // v1.22.11: Originally hooked the function with the most CALL sites.
-            // v1.22.12: REMOVED hook — hooking AE 11596 crashed the game because
-            // the function signature (4 args, void* return) didn't match the actual
-            // function. Instead, we detect "compilation skipped" from the monitor
-            // thread in editor_id_cache.h and trigger manual compilation there.
-            if (!containingFuncs.empty()) {
-                auto& primary = *std::max_element(containingFuncs.begin(), containingFuncs.end(),
-                    [](const auto& a, const auto& b) { return a.callSiteCount < b.callSiteCount; });
-                g_compileCallerAddr = primary.funcAddr;
-                g_compileCallerAeId = primary.aeId;
-
-                logger::info("  Primary candidate: AE {} at 0x{:X} ({} CALL sites) — NOT hooking (monitor-based fallback instead)",
-                    primary.aeId, primary.funcAddr, primary.callSiteCount);
-            }
-
-            logger::info("=== END RUNTIME CODE SCANNER ==="sv);
+            logger::info("=== END MULTI-TARGET SCANNER ==="sv);
         }
     }
 
