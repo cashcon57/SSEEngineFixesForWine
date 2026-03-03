@@ -22,6 +22,7 @@
 #include "fixes/save_screenshots.h"
 #include "fixes/tree_reflections.h"
 #include "patches/editor_id_cache.h"
+#include "patches/form_caching.h"
 #include "patches/memory_manager.h"
 #include "patches/patches.h"
 #include "patches/save_added_sound_categories.h"
@@ -39,16 +40,36 @@ void MessageHandler(SKSE::MessagingInterface::Message* a_msg)
             Patches::EditorIdCache::LoadingMonitor::Stop();
             Patches::EditorIdCache::LoadingMonitor::LogFinalState();
 
+            // Log memory allocator stats before other kDataLoaded work
+            if (Settings::Memory::bReplaceAllocator.GetValue())
+                Patches::WineMemoryManager::LogStats();
+
+            // v1.22.18: Force form loading if the engine skipped it.
+            // Under Wine with 600+ plugins, CompileFiles is skipped, which
+            // causes the entire form loading pipeline to be skipped too.
+            // ManuallyCompileFiles (CloseTES hook) populates compiledFileCollection,
+            // but the engine's code path already branched past form loading.
+            // We detect this by checking AddFormToDataHandler count: if zero,
+            // we invoke the engine's form loading functions directly.
+            {
+                auto addFormCount = Patches::FormCaching::detail::g_addFormCalls.load(std::memory_order_relaxed);
+                if (addFormCount == 0) {
+                    logger::warn(">>> kDataLoaded: ZERO AddFormToDataHandler calls — form loading was SKIPPED <<<");
+                    logger::warn(">>> Invoking ForceLoadAllForms to load forms from compiled files <<<");
+                    if (Settings::Patches::bFormCaching.GetValue()) {
+                        Patches::FormCaching::detail::ForceLoadAllForms();
+                    }
+                } else {
+                    logger::info("kDataLoaded: {} AddFormToDataHandler calls — forms loaded normally", addFormCount);
+                }
+            }
+
             // Editor ID cache: populate NOW at kDataLoaded, BEFORE other plugins.
             // Our handler fires first (alphabetical: 0_ < C < p), so we MUST
             // populate before CoreImpactFramework (C) tries LookupByEditorID.
             // po3_Tweaks installed its "Load EditorIDs" hook at kPostLoad (before
             // ESM loading), so forms should have editor IDs by now.
             // We enumerate via TESDataHandler (BSTArray, no hashing — Wine-safe).
-            // Log memory allocator stats before other kDataLoaded work
-            if (Settings::Memory::bReplaceAllocator.GetValue())
-                Patches::WineMemoryManager::LogStats();
-
             if (Settings::Patches::bEditorIdCache.GetValue())
                 Patches::EditorIdCache::OnDataLoaded();
 

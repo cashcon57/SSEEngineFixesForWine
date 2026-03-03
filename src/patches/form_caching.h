@@ -487,14 +487,13 @@ namespace Patches::FormCaching
             return g_hk_ReadData.call<bool>(a_self, a_buf, a_inLength);
         }
 
-        // Forward declarations for v1.22.17 multi-target scanner
-        inline void ScanForLoadingPipelineFunctions(
-            std::uintptr_t addCompileIndexAddr,
-            std::uintptr_t openTESAddr,
-            std::uintptr_t addFormAddr);
-
         // v1.22.16: AE 11596 hook REMOVED — confirmed never called during initial loading.
         // The initial data load uses a different code path than AE 11596.
+
+        // v1.22.17: Multi-target .text scanner REMOVED in v1.22.18 — served its
+        // purpose identifying AE 13698 (form loading, 54 AddForm call sites) and
+        // AE 13753 (loading orchestration, 2 OpenTES calls). Scanner caused
+        // zero-activity startup (possible Offset2ID allocation interference).
 
         inline void ReplaceFormMapFunctions()
         {
@@ -583,21 +582,11 @@ namespace Patches::FormCaching
                 getForm.address(), AddForm.address(), OpenTES.address(),
                 AddCompileIndex.address(), SeekNextForm.address(), CloseTES.address());
 
-            // ================================================================
-            // v1.22.17: Multi-target .text scanner — find the REAL loading
-            // pipeline functions by scanning for callers of:
-            //   1. AddCompileIndex (AE 14667) — find the compile function
-            //   2. OpenTES (AE 13931) — find the form loading function
-            //   3. AddFormToDataHandler (AE 13693) — find form creation callers
-            //
-            // v1.22.16 proved AE 11596 (found by v1.22.11 scanner) is NEVER
-            // called during initial loading. The real loading pipeline uses
-            // a different code path we haven't identified yet.
-            // ================================================================
-            ScanForLoadingPipelineFunctions(
-                AddCompileIndex.address(),
-                OpenTES.address(),
-                AddForm.address());
+            // v1.22.17 scanner results (now removed — caused startup hang):
+            //   AE 13698 at 0x1B1D30: 54 AddFormToDataHandler calls = FORM LOADING FUNCTION
+            //   AE 13753 at 0x1B96E0: 2 OpenTES calls = LOADING ORCHESTRATION
+            //   AE 13785 at 0x1BE460: 3 OpenTES calls = HotLoadPlugin (irrelevant)
+            // See ForceLoadAllForms() for the actual fix.
         }
 
         // Cached plugins.txt data (parsed once, reused across idempotent calls)
@@ -761,179 +750,133 @@ namespace Patches::FormCaching
         }
 
         // ================================================================
-        // v1.22.17: Multi-target .text scanner
+        // v1.22.18: ForceLoadAllForms
         //
-        // Scans the decrypted .text section for E8/E9 (CALL/JMP rel32)
-        // instructions targeting multiple known functions, then uses the
-        // Address Library Offset2ID database to identify containing functions.
+        // Called at kDataLoaded when the form loading pipeline was skipped
+        // (detected by zero AddFormToDataHandler calls). Under Wine with
+        // 600+ plugins, CompileFiles is skipped entirely, which causes the
+        // engine to skip form loading too.
         //
-        // Targets:
-        //   1. AddCompileIndex — find the compilation function (previously found AE 11596)
-        //   2. OpenTES — find the form loading function (THE KEY UNKNOWN)
-        //   3. AddFormToDataHandler — find form creation callers
+        // ManuallyCompileFiles (v1.22.14) populates compiledFileCollection,
+        // but the engine's form loading code path was already skipped.
+        // This function directly invokes the engine's form loading functions:
         //
-        // The form loading function (OpenTES caller) is the function we need
-        // to call ourselves after ManuallyCompileFiles, because the engine
-        // skips it when compilation is skipped under Wine.
+        //   AE 13753 — Loading orchestration (2 OpenTES calls)
+        //              Likely opens files and calls the form reader.
+        //   AE 13698 — Form loading (54 AddFormToDataHandler calls)
+        //              Handles all ~54 form types via big switch.
+        //
+        // These AE IDs were identified by the v1.22.17 .text scanner.
         // ================================================================
-        inline void ScanForLoadingPipelineFunctions(
-            std::uintptr_t addCompileIndexAddr,
-            std::uintptr_t openTESAddr,
-            std::uintptr_t addFormAddr)
+        inline void ForceLoadAllForms()
         {
-            auto moduleBase = REL::Module::get().base();
-
-            logger::info("=== MULTI-TARGET .TEXT SCANNER (v1.22.17) ==="sv);
-            logger::info("  Module base: 0x{:X}", moduleBase);
-            logger::info("  Targets:");
-            logger::info("    AddCompileIndex: 0x{:X} (offset 0x{:X})",
-                addCompileIndexAddr, addCompileIndexAddr - moduleBase);
-            logger::info("    OpenTES:         0x{:X} (offset 0x{:X})",
-                openTESAddr, openTESAddr - moduleBase);
-            logger::info("    AddForm:         0x{:X} (offset 0x{:X})",
-                addFormAddr, addFormAddr - moduleBase);
-
-            // Parse PE headers to find .text section
-            auto dosHeader = reinterpret_cast<const IMAGE_DOS_HEADER*>(moduleBase);
-            auto ntHeaders = reinterpret_cast<const IMAGE_NT_HEADERS64*>(moduleBase + dosHeader->e_lfanew);
-            auto sectionHeader = IMAGE_FIRST_SECTION(ntHeaders);
-            auto numSections = ntHeaders->FileHeader.NumberOfSections;
-
-            std::uintptr_t textStart = 0;
-            std::size_t textSize = 0;
-
-            for (int i = 0; i < numSections; ++i) {
-                char name[9] = {};
-                std::memcpy(name, sectionHeader[i].Name, 8);
-                if (std::strcmp(name, ".text") == 0 && textStart == 0) {
-                    textStart = moduleBase + sectionHeader[i].VirtualAddress;
-                    textSize = sectionHeader[i].Misc.VirtualSize;
-                    logger::info("  .text section: VA 0x{:X}, size 0x{:X} ({:.1f} MB)",
-                        textStart, textSize, textSize / (1024.0 * 1024.0));
-                    break;
-                }
-            }
-
-            if (textStart == 0 || textSize == 0) {
-                logger::error("  Failed to find .text section!"sv);
+#ifdef SKYRIM_AE
+            auto* tdh = RE::TESDataHandler::GetSingleton();
+            if (!tdh) {
+                logger::error("ForceLoadAllForms: TDH is null — cannot proceed"sv);
                 return;
             }
 
-            // Scan for all E8/E9 instructions targeting any of our targets
-            struct CallerInfo {
-                std::uintptr_t callAddr;
-                std::uintptr_t callRva;
-                bool isJmp;
-                int targetIndex;  // 0=AddCompileIndex, 1=OpenTES, 2=AddForm
-            };
+            // Ensure compilation happened
+            if (tdh->compiledFileCollection.files.empty() &&
+                tdh->compiledFileCollection.smallFiles.empty())
+            {
+                logger::warn("ForceLoadAllForms: compiledFileCollection is EMPTY — running ManuallyCompileFiles first"sv);
+                ManuallyCompileFiles();
+            }
 
-            std::uintptr_t targets[3] = { addCompileIndexAddr, openTESAddr, addFormAddr };
-            const char* targetNames[3] = { "AddCompileIndex", "OpenTES", "AddFormToDataHandler" };
-            std::vector<CallerInfo> allCallers;
+            auto regCount = tdh->compiledFileCollection.files.size();
+            auto eslCount = tdh->compiledFileCollection.smallFiles.size();
+            logger::info("=== ForceLoadAllForms (v1.22.18) ==="sv);
+            logger::info("  compiledFileCollection: {} reg + {} ESL = {} total",
+                regCount, eslCount, regCount + eslCount);
+            logger::info("  loadingFiles: {}", tdh->loadingFiles);
+            logger::info("  AddForm calls before: {}",
+                g_addFormCalls.load(std::memory_order_relaxed));
 
-            auto* textBytes = reinterpret_cast<const std::uint8_t*>(textStart);
-            for (std::size_t i = 0; i + 5 <= textSize; ++i) {
-                if (textBytes[i] == 0xE8 || textBytes[i] == 0xE9) {
-                    std::int32_t rel32;
-                    std::memcpy(&rel32, &textBytes[i + 1], 4);
-                    auto callAddr = textStart + i;
-                    auto target = callAddr + 5 + rel32;
+            // Ensure loadingFiles is true (form loading functions may check this)
+            tdh->loadingFiles = true;
 
-                    for (int t = 0; t < 3; ++t) {
-                        if (target == targets[t]) {
-                            allCallers.push_back({
-                                callAddr,
-                                callAddr - moduleBase,
-                                textBytes[i] == 0xE9,
-                                t
-                            });
-                            break;
-                        }
-                    }
+            // Log first few compiled files for verification
+            for (std::size_t i = 0; i < std::min<std::size_t>(5, regCount); ++i) {
+                auto* f = tdh->compiledFileCollection.files[i];
+                if (f) {
+                    logger::info("  reg[{}]: '{}' compIdx=0x{:02X}",
+                        i, f->fileName, f->compileIndex);
+                }
+            }
+            for (std::size_t i = 0; i < std::min<std::size_t>(3, eslCount); ++i) {
+                auto* f = tdh->compiledFileCollection.smallFiles[i];
+                if (f) {
+                    logger::info("  esl[{}]: '{}' compIdx=0x{:02X} smallIdx=0x{:04X}",
+                        i, f->fileName, f->compileIndex, f->smallFileCompileIndex);
                 }
             }
 
-            // Count per target
-            int counts[3] = {};
-            for (auto& c : allCallers) counts[c.targetIndex]++;
-            logger::info("  Scan complete: {} AddCompileIndex, {} OpenTES, {} AddForm call sites",
-                counts[0], counts[1], counts[2]);
+            // ----------------------------------------------------------
+            // Attempt 1: Call AE 13753 (loading orchestration function)
+            // This function has 2 OpenTES calls and is in the TESDataHandler
+            // range. It likely opens files, reads records, and creates forms.
+            // Signature assumed: void TESDataHandler::DoFormLoading()
+            // ----------------------------------------------------------
+            logger::info(">>> Attempt 1: Calling AE 13753 (orchestration) <<<");
 
-            // Load Address Library Offset2ID for function identification
-            REL::IDDatabase::Offset2ID offset2id;
-            logger::info("  Offset2ID loaded ({} entries)", offset2id.size());
+            using OrchestratorFn = void(*)(RE::TESDataHandler*);
+            REL::Relocation<OrchestratorFn> orchestrator{ REL::ID(13753) };
+            logger::info("  AE 13753 address: 0x{:X} (offset 0x{:X})",
+                orchestrator.address(),
+                orchestrator.address() - REL::Module::get().base());
 
-            // For each target, find containing functions
-            struct ContainingFunc {
-                std::uint64_t aeId;
-                std::uintptr_t funcOffset;
-                std::uintptr_t funcAddr;
-                std::size_t callSiteCount;
-            };
+            orchestrator(tdh);
 
-            for (int t = 0; t < 3; ++t) {
-                logger::info("  --- {} callers ---", targetNames[t]);
+            auto addFormAfter1 = g_addFormCalls.load(std::memory_order_relaxed);
+            auto openTESAfter1 = g_openTESCalls.load(std::memory_order_relaxed);
+            logger::info("  After AE 13753: AddForm={}, OpenTES={}",
+                addFormAfter1, openTESAfter1);
 
-                std::vector<ContainingFunc> funcs;
-                int siteCount = 0;
-
-                for (auto& c : allCallers) {
-                    if (c.targetIndex != t) continue;
-                    ++siteCount;
-
-                    // Log first 20 call sites per target
-                    if (siteCount <= 20) {
-                        logger::info("    {} at RVA 0x{:X}",
-                            c.isJmp ? "JMP" : "CALL", c.callRva);
-                    }
-
-                    // Find containing function via Offset2ID
-                    auto it = std::upper_bound(
-                        offset2id.begin(), offset2id.end(), c.callRva,
-                        [](std::uint64_t rva, const auto& mapping) {
-                            return rva < mapping.offset;
-                        });
-
-                    if (it != offset2id.begin()) {
-                        --it;
-                        auto funcId = it->id;
-                        auto funcOffset = it->offset;
-
-                        bool found = false;
-                        for (auto& f : funcs) {
-                            if (f.aeId == funcId) {
-                                f.callSiteCount++;
-                                found = true;
-                                break;
-                            }
-                        }
-                        if (!found) {
-                            funcs.push_back({ funcId, funcOffset, moduleBase + funcOffset, 1 });
-                        }
-                    }
-                }
-
-                if (siteCount > 20) {
-                    logger::info("    ... ({} total call sites, showing first 20)", siteCount);
-                }
-
-                // Sort by call site count descending
-                std::sort(funcs.begin(), funcs.end(),
-                    [](const auto& a, const auto& b) { return a.callSiteCount > b.callSiteCount; });
-
-                logger::info("    {} unique containing functions:", funcs.size());
-                // Log all functions (most important diagnostic output)
-                for (std::size_t i = 0; i < funcs.size() && i < 30; ++i) {
-                    auto& f = funcs[i];
-                    logger::info("      AE {} at offset 0x{:X} (addr 0x{:X}): {} call site(s)",
-                        f.aeId, f.funcOffset, f.funcAddr, f.callSiteCount);
-                }
-                if (funcs.size() > 30) {
-                    logger::info("      ... ({} total, showing top 30)", funcs.size());
-                }
+            if (addFormAfter1 > 0) {
+                logger::info(">>> ForceLoadAllForms SUCCESS via AE 13753! {} forms loaded <<<",
+                    addFormAfter1);
+                logger::info("=== END ForceLoadAllForms ==="sv);
+                return;
             }
 
-            logger::info("=== END MULTI-TARGET SCANNER ==="sv);
+            // ----------------------------------------------------------
+            // Attempt 2: Call AE 13698 (the big form loading function)
+            // Has 54 AddFormToDataHandler call sites — one per form type.
+            // If AE 13753 didn't work (perhaps wrong signature or it
+            // checks some condition), try the inner form loader directly.
+            // Signature assumed: void TESDataHandler::LoadAllFormRecords()
+            // ----------------------------------------------------------
+            logger::info(">>> Attempt 2: Calling AE 13698 (form loading) <<<");
+
+            using FormLoaderFn = void(*)(RE::TESDataHandler*);
+            REL::Relocation<FormLoaderFn> formLoader{ REL::ID(13698) };
+            logger::info("  AE 13698 address: 0x{:X} (offset 0x{:X})",
+                formLoader.address(),
+                formLoader.address() - REL::Module::get().base());
+
+            formLoader(tdh);
+
+            auto addFormAfter2 = g_addFormCalls.load(std::memory_order_relaxed);
+            auto openTESAfter2 = g_openTESCalls.load(std::memory_order_relaxed);
+            logger::info("  After AE 13698: AddForm={}, OpenTES={}",
+                addFormAfter2, openTESAfter2);
+
+            if (addFormAfter2 > addFormAfter1) {
+                logger::info(">>> ForceLoadAllForms SUCCESS via AE 13698! {} new forms <<<",
+                    addFormAfter2 - addFormAfter1);
+            } else {
+                logger::error(">>> ForceLoadAllForms FAILED: no forms loaded by either function <<<");
+                logger::error("  This likely means the functions have different signatures or");
+                logger::error("  require additional setup. Need to analyze disassembly.");
+            }
+
+            logger::info("=== END ForceLoadAllForms ==="sv);
+#else
+            // SE: the 600-file skip may not be an issue, but log a note
+            logger::info("ForceLoadAllForms: SE build — skipping (AE-only fix)"sv);
+#endif
         }
     }
 

@@ -1007,82 +1007,10 @@ namespace Patches::EditorIdCache
                     logger::info("  TDH: null (raw ptr at reloc: 0x{:X})", rawPtr);
                 }
 
-                // CRT stdio limit + FD stress test
+                // CRT stdio limit (FD stress test removed in v1.22.18 — was crashing monitor thread)
                 if (Patches::MaxStdIO::g_getmaxstdio) {
                     auto maxStdio = Patches::MaxStdIO::g_getmaxstdio();
-
-                    // FD stress test: compare static CRT vs dynamic ucrtbase vs Win32
-                    if (tick == 1 || (tick % 10 == 0)) {
-                        // 1. Our STATIC CRT's _wfopen_s (linked into this DLL)
-                        //    First, raise OUR OWN static CRT's maxstdio
-                        static bool ownCrtRaised = false;
-                        if (!ownCrtRaised) {
-                            auto r = ::_setmaxstdio(8192);
-                            logger::info("  raised OWN static CRT maxstdio: {} (getmax={})", r, ::_getmaxstdio());
-                            ownCrtRaised = true;
-                        }
-
-                        std::vector<FILE*> testFiles;
-                        int opened = 0;
-                        errno_t lastErr = 0;
-                        for (int i = 0; i < 2000; i++) {
-                            FILE* f = nullptr;
-                            errno = 0;
-                            errno_t err = _wfopen_s(&f, L"NUL", L"rb");
-                            if (err == 0 && f) {
-                                testFiles.push_back(f);
-                                ++opened;
-                            } else {
-                                lastErr = err ? err : errno;
-                                break;
-                            }
-                        }
-                        for (auto fp : testFiles) fclose(fp);
-
-                        // 2. DYNAMIC ucrtbase's _wfopen_s (what the GAME uses)
-                        using wfopen_s_t = errno_t(__cdecl*)(FILE**, const wchar_t*, const wchar_t*);
-                        using fclose_t = int(__cdecl*)(FILE*);
-                        auto ucrt = REX::W32::GetModuleHandleW(L"API-MS-WIN-CRT-STDIO-L1-1-0.DLL");
-                        auto dyn_wfopen_s = ucrt ? reinterpret_cast<wfopen_s_t>(REX::W32::GetProcAddress(ucrt, "_wfopen_s")) : nullptr;
-                        auto dyn_fclose = ucrt ? reinterpret_cast<fclose_t>(REX::W32::GetProcAddress(ucrt, "fclose")) : nullptr;
-                        int dynOpened = 0;
-                        errno_t dynErr = 0;
-                        if (dyn_wfopen_s && dyn_fclose) {
-                            std::vector<FILE*> dynFiles;
-                            for (int i = 0; i < 2000; i++) {
-                                FILE* f = nullptr;
-                                errno_t err = dyn_wfopen_s(&f, L"NUL", L"rb");
-                                if (err == 0 && f) {
-                                    dynFiles.push_back(f);
-                                    ++dynOpened;
-                                } else {
-                                    dynErr = err;
-                                    break;
-                                }
-                            }
-                            for (auto fp : dynFiles) dyn_fclose(fp);
-                        }
-
-                        // 3. Win32 CreateFile (no CRT involvement)
-                        std::vector<void*> winHandles;
-                        int winOpened = 0;
-                        for (int i = 0; i < 2000; i++) {
-                            auto h = ::CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ,
-                                nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-                            if (h != INVALID_HANDLE_VALUE) {
-                                winHandles.push_back(h);
-                                ++winOpened;
-                            } else {
-                                break;
-                            }
-                        }
-                        for (auto h : winHandles) ::CloseHandle(h);
-
-                        logger::info("  maxStdio: {} | staticCRT: {} (e={}) | dynUcrt: {} (e={}) | Win32: {}",
-                            maxStdio, opened, lastErr, dynOpened, dynErr, winOpened);
-                    } else {
-                        logger::info("  maxStdio: {}", maxStdio);
-                    }
+                    logger::info("  maxStdio: {}", maxStdio);
                 }
 
                 // Memory allocator stats (if active)
