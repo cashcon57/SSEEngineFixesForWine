@@ -864,6 +864,7 @@ namespace Patches::EditorIdCache
         {
             logger::info("=== LOADING MONITOR STARTED (2s, then 200ms after TDH) ==="sv);
             int tick = 0;
+            int compileSkipTicks = 0;  // consecutive ticks where compilation appears skipped
             auto startTime = std::chrono::high_resolution_clock::now();
 
             while (g_running.load(std::memory_order_relaxed)) {
@@ -949,6 +950,54 @@ namespace Patches::EditorIdCache
                         } else {
                             logger::info("  compiled: {} reg + {} ESL | loadingFiles: {}",
                                 regCount, eslCount, isLoading);
+                        }
+
+                        // ============================================================
+                        // v1.22.12: Monitor-based compilation fallback
+                        //
+                        // Under Wine, with 600+ compiled files, the engine skips
+                        // compilation entirely (AddCompileIndex is never called,
+                        // loadingFiles never becomes true). We detect this by
+                        // checking: TDH exists, files are loaded, but compilation
+                        // collection is empty and no compile index calls were made.
+                        //
+                        // We count files every tick during the suspect window to
+                        // ensure accurate detection.
+                        // ============================================================
+                        auto compileIdxCount = Patches::FormCaching::detail::g_addCompileIndexCalls.load(std::memory_order_relaxed);
+
+                        if (!isLoading && regCount == 0 && eslCount == 0 && compileIdxCount == 0) {
+                            // Potentially in the "compilation skipped" state
+                            // Count files to confirm they're loaded
+                            std::size_t quickFileCount = 0;
+                            if (fileCount == 0) {  // wasn't counted this tick
+                                for (auto& file : tdh->files) {
+                                    if (file) ++quickFileCount;
+                                }
+                            } else {
+                                quickFileCount = fileCount;
+                            }
+
+                            if (quickFileCount > 0) {
+                                ++compileSkipTicks;
+                                if (compileSkipTicks == 1) {
+                                    logger::warn("  >>> COMPILATION SUSPECT: {} files loaded, 0 compiled, 0 AddCompileIndex calls",
+                                        quickFileCount);
+                                }
+
+                                // After 10 consecutive ticks (~2 seconds at 200ms) with
+                                // files loaded but nothing compiled, trigger fallback
+                                if (compileSkipTicks >= 10 &&
+                                    !Patches::FormCaching::detail::g_manualCompileDone.load(std::memory_order_relaxed)) {
+                                    logger::warn("  >>> COMPILE SKIP CONFIRMED after {} ticks ({} files, 0 compiled) — TRIGGERING MANUAL COMPILATION <<<",
+                                        compileSkipTicks, quickFileCount);
+                                    Patches::FormCaching::detail::ManuallyCompileFiles();
+                                }
+                            } else {
+                                compileSkipTicks = 0;  // no files yet
+                            }
+                        } else {
+                            compileSkipTicks = 0;  // compilation happened or in progress
                         }
                     }
                 } else {

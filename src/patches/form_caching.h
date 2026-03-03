@@ -407,7 +407,7 @@ namespace Patches::FormCaching
             return g_hk_ReadData.call<bool>(a_self, a_buf, a_inLength);
         }
 
-        // Forward declarations for v1.22.11 compile caller scanner
+        // Forward declarations for v1.22.11 compile caller scanner (diagnostic only)
         inline void ScanAndHookCompileCaller(std::uintptr_t addCompileIndexAddr);
 
         inline void ReplaceFormMapFunctions()
@@ -764,26 +764,19 @@ namespace Patches::FormCaching
                     f.aeId, f.funcOffset, f.callSiteCount);
             }
 
-            // Hook the containing function with the most CALL sites to AddCompileIndex
-            // This is most likely "CompileFiles" — the main compile loop
+            // v1.22.11: Originally hooked the function with the most CALL sites.
+            // v1.22.12: REMOVED hook — hooking AE 11596 crashed the game because
+            // the function signature (4 args, void* return) didn't match the actual
+            // function. Instead, we detect "compilation skipped" from the monitor
+            // thread in editor_id_cache.h and trigger manual compilation there.
             if (!containingFuncs.empty()) {
                 auto& primary = *std::max_element(containingFuncs.begin(), containingFuncs.end(),
                     [](const auto& a, const auto& b) { return a.callSiteCount < b.callSiteCount; });
                 g_compileCallerAddr = primary.funcAddr;
                 g_compileCallerAeId = primary.aeId;
 
-                logger::info("  >>> HOOKING AE {} at 0x{:X} as CompileCaller <<<",
-                    primary.aeId, primary.funcAddr);
-
-                g_hk_compileCaller = safetyhook::create_inline(
-                    reinterpret_cast<void*>(primary.funcAddr),
-                    HookedCompileCaller);
-
-                if (g_hk_compileCaller) {
-                    logger::info("  CompileCaller hook installed successfully"sv);
-                } else {
-                    logger::error("  FAILED to install CompileCaller hook!"sv);
-                }
+                logger::info("  Primary candidate: AE {} at 0x{:X} ({} CALL sites) — NOT hooking (monitor-based fallback instead)",
+                    primary.aeId, primary.funcAddr, primary.callSiteCount);
             }
 
             logger::info("=== END RUNTIME CODE SCANNER ==="sv);
