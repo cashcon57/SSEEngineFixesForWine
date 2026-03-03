@@ -751,7 +751,7 @@ namespace Patches::FormCaching
         }
 
         // ================================================================
-        // v1.22.20: ForceLoadAllForms — VALIDATION BYPASS
+        // v1.22.21: ForceLoadAllForms — VALIDATION BYPASS + CLEAN COMPILE STATE
         //
         // Called at kDataLoaded when form loading was skipped (0 AddForm
         // calls). Under Wine with 600+ plugins, the engine skips
@@ -781,21 +781,9 @@ namespace Patches::FormCaching
                 return;
             }
 
-            // Ensure compilation happened
-            if (tdh->compiledFileCollection.files.empty() &&
-                tdh->compiledFileCollection.smallFiles.empty())
-            {
-                logger::warn("ForceLoadAllForms: compiledFileCollection is EMPTY — running ManuallyCompileFiles first"sv);
-                ManuallyCompileFiles();
-            }
+            logger::info("=== ForceLoadAllForms (v1.22.21) ==="sv);
 
-            auto regCount = tdh->compiledFileCollection.files.size();
-            auto eslCount = tdh->compiledFileCollection.smallFiles.size();
-            logger::info("=== ForceLoadAllForms (v1.22.20) ==="sv);
-            logger::info("  compiledFileCollection: {} reg + {} ESL = {} total",
-                regCount, eslCount, regCount + eslCount);
-
-            // Log TDH state for debugging
+            // Log TDH state before reset
             logger::info("  TDH: loadingFiles={} hasDesiredFiles={} saveLoadGame={} clearingData={}",
                 tdh->loadingFiles, tdh->hasDesiredFiles, tdh->saveLoadGame, tdh->clearingData);
             logger::info("  TDH: nextID=0x{:08X} activeFile={} AddForm={}",
@@ -803,7 +791,42 @@ namespace Patches::FormCaching
                 tdh->activeFile ? tdh->activeFile->fileName : "null",
                 g_addFormCalls.load(std::memory_order_relaxed));
 
-            // Ensure required flags are set
+            // ==========================================================
+            // CRITICAL: Reset all compile state before calling AE 13753.
+            //
+            // ManuallyCompileFiles (CloseTES hook) pre-sets file->compileIndex
+            // on each TESFile and populates compiledFileCollection. When AE
+            // 13753 runs its own compilation pass (calling AddCompileIndex per
+            // form), the pre-set compileIndex causes TESForm::AddCompileIndex
+            // to enter an infinite loop for some files (observed: Denizens of
+            // Morthal - AI Overhaul Patch.esp looped 1.5 billion times).
+            //
+            // Root cause: TESForm::AddCompileIndex uses file->compileIndex to
+            // build the global form slot. When the slot was pre-assigned by
+            // ManuallyCompileFiles, the function's internal file iterator
+            // cannot advance, producing an infinite loop.
+            //
+            // Fix: wipe all compile state so AE 13753 compiles from scratch.
+            // This makes its compilation pass work cleanly with no conflicts.
+            // ==========================================================
+            std::size_t resetCount = 0;
+            for (auto& file : tdh->files) {
+                if (!file) continue;
+                if (file->compileIndex != 0xFF) {
+                    file->compileIndex = 0xFF;
+                    file->smallFileCompileIndex = 0;
+                    ++resetCount;
+                }
+            }
+            auto prevReg = tdh->compiledFileCollection.files.size();
+            auto prevEsl = tdh->compiledFileCollection.smallFiles.size();
+            tdh->compiledFileCollection.files.clear();
+            tdh->compiledFileCollection.smallFiles.clear();
+
+            logger::info("  Compile state RESET: {} files cleared, compiledFileCollection was {} reg + {} ESL",
+                resetCount, prevReg, prevEsl);
+
+            // Set required flags
             tdh->loadingFiles = true;
             tdh->hasDesiredFiles = true;
             tdh->clearingData = false;
@@ -862,7 +885,7 @@ namespace Patches::FormCaching
             VirtualProtect(patchAddr, 2, oldProtect, &oldProtect);
             FlushInstructionCache(GetCurrentProcess(), patchAddr, 2);
 
-            logger::info("  PATCH APPLIED: AE 13753 +0x106 = 90 90 (validation abort → skip)");
+            logger::info("  PATCH APPLIED: AE 13753 +0x106 = 90 90 (validation abort → skip-to-next-file)");
 
             // Record counters before the call
             auto addFormBefore = g_addFormCalls.load(std::memory_order_relaxed);
@@ -893,7 +916,7 @@ namespace Patches::FormCaching
             auto addFormDelta = addFormAfter - addFormBefore;
             auto openTESDelta = openTESAfter - openTESBefore;
 
-            logger::info("=== ForceLoadAllForms RESULTS ==="sv);
+            logger::info("=== ForceLoadAllForms (v1.22.21) RESULTS ==="sv);
             logger::info("  AddFormToDataHandler: {} → {} (+{})", addFormBefore, addFormAfter, addFormDelta);
             logger::info("  OpenTES calls: {} → {} (+{})", openTESBefore, openTESAfter, openTESDelta);
             logger::info("  TDH: nextID=0x{:08X} activeFile={}",
@@ -914,7 +937,7 @@ namespace Patches::FormCaching
                 logger::error("Next step: investigate SomeFunc (module+0x1C8E40) per-file filtering");
             }
 
-            logger::info("=== END ForceLoadAllForms (v1.22.20) ==="sv);
+            logger::info("=== END ForceLoadAllForms (v1.22.21) ==="sv);
 #else
             logger::info("ForceLoadAllForms: SE build — skipping (AE-only fix)"sv);
 #endif
