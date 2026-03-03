@@ -45,7 +45,7 @@ All **38 bug fixes** and **14 patches** from SSE Engine Fixes are preserved, plu
 - **Wine-compatible memory allocator** — replaces TBB with HeapAlloc/HeapFree via SafetyHook inline hooks on MemoryManager::Allocate/Deallocate/Reallocate. Uses a dedicated growable heap (HeapCreate) with 32-byte allocation headers for tracking.
 - **ScrapHeap expansion** — hooks GetThreadScrapHeap to expand per-thread reserve from 64MB to 512MB before first use
 - **Editor ID cache** — diagnostic + safe repopulation of editor IDs for Wine compatibility
-- **600-file compilation fix (v1.22.11–14)** — monitor-based detection and manual compilation fallback for the engine's file compilation limit under Wine (see below)
+- **600-file compilation fix (v1.22.11–17)** — monitor-based detection and manual compilation fallback for the engine's file compilation limit under Wine (see below)
 
 ## Included Patches
 
@@ -112,15 +112,15 @@ The threshold is **exactly 599→600 compiled files**. The engine auto-adds ~80 
 
 This is count-based, not file-specific — swapping which plugins are enabled at the same count produces the same result.
 
-### The Fix (v1.22.11–v1.22.14)
+### The Fix (v1.22.11–v1.22.17, IN PROGRESS)
 
-The fix uses a **monitor-based detection** approach with a **manual compilation fallback**:
+**Phase 1 — Compilation (SOLVED):** Manual compilation successfully populates the engine's data structures:
 
-1. **Loading Monitor Thread** (editor_id_cache.h): A background thread starts at plugin load and polls every 200ms (2s before TDH appears). It tracks all loading pipeline counters — AddCompileIndex calls, file counts, compilation status, memory usage.
+1. **Loading Monitor Thread** (editor_id_cache.h): A background thread polls every 200ms, tracking all loading pipeline counters.
 
-2. **Compilation Skip Detection** (v1.22.12): When TDH exists and files are being loaded but `AddCompileIndex` has never been called and `compiledFileCollection` is empty for 10+ consecutive ticks, the monitor confirms the engine skipped compilation.
+2. **Main-Thread Compilation Trigger** (v1.22.15): The CloseTES hook fires on the main thread during the catalog scan. After 2000+ CloseTES calls with 0 AddCompileIndex calls, it triggers `ManuallyCompileFiles()` — which is idempotent and re-runs every 1000 CloseTES calls to pick up newly-cataloged files.
 
-3. **Manual Compilation** (v1.22.14): `ManuallyCompileFiles()` parses `plugins.txt` via Win32 API to determine which files are enabled (the `kActive` flag can't be used because it's set BY the compilation process, which was skipped). Then:
+3. **Manual Compilation** (v1.22.14+): `ManuallyCompileFiles()` parses `plugins.txt` via Win32 API to determine which files are enabled (the `kActive` flag can't be used because it's set BY the compilation process, which was skipped). Then:
    - Files enabled in `plugins.txt` (with `*` prefix) → compiled
    - Files not listed in `plugins.txt` (base game/CC always-on files) → compiled
    - Files listed but disabled (without `*` prefix) → skipped
@@ -129,9 +129,13 @@ The fix uses a **monitor-based detection** approach with a **manual compilation 
    - Populates `compiledFileCollection.files` and `compiledFileCollection.smallFiles`
    - Sets `loadingFiles = true`
 
-The engine's form loading code then proceeds normally, as if the original CompileFiles had run.
+**Result:** compiledFileCollection is correctly populated (211 reg + 1589 ESL = 1800 files), loadingFiles=true on the main thread during the catalog scan.
 
-**v1.22.11** also included a runtime .text section scanner (scans 23MB of decrypted game code for CALL/JMP sites targeting AddCompileIndex) used for diagnostic purposes. This is currently disabled in v1.22.13+ as it's not needed for the fix.
+**Phase 2 — Form Loading (UNSOLVED):** Despite successful compilation, form loading never starts. OpenTES remains at 0, meaning the form loading function is never called. Key findings:
+
+- **AE 11596 is NOT the initial loading function** (v1.22.16): Hook installed but never entered. The initial data load uses a different code path.
+- **loadingFiles is a status flag, not a gate** (v1.22.15): Setting it to true on the main thread does not cause the form loading loop to start.
+- **The form loading function itself needs to be called** (v1.22.17): The .text scanner is being re-enabled to scan for OpenTES callers, which will identify the actual form loading function that needs to be invoked after manual compilation.
 
 ### Important: SKSE Working Directory Fix
 
@@ -262,16 +266,20 @@ Wine's ucrtbase implements `_setmaxstdio` with a two-level limit system:
 
 ### Loading Pipeline Architecture
 
-Skyrim's form loading pipeline runs in this order:
+Skyrim's form loading pipeline runs in this order (based on v1.22.0–17 instrumentation):
 
-1. **ClearData** — resets all data structures
-2. **Catalog scan** — `SeekNextForm` iterates TES4 headers in all files
-3. **CompileFiles** — assigns compile indices, populates `compiledFileCollection`, sets `loadingFiles = true`
-4. **Form loading loop** — for each compiled file: `OpenTES` → `SeekNextForm` → `ReadData` → `AddFormToDataHandler` → `CloseTES`
-5. **InitializeFormDataStructures** — sets up form hash tables
+1. **Catalog scan** — TESFile objects constructed with open file handles; `SeekNextForm` iterates TES4 headers, `CloseTES` closes each file (2× per file). Note: `OpenTES` is NOT called during the catalog scan — files are already open from construction.
+2. **CompileFiles** — assigns compile indices via `AddCompileIndex`, populates `compiledFileCollection`, sets `loadingFiles = true`
+3. **Form loading loop** — for each compiled file: `OpenTES` (re-opens) → `SeekNextForm` → `ReadData` → `AddFormToDataHandler` → `CloseTES`
+4. **Batch close** — all files closed again (1× per file, total 3× CloseTES per file)
+5. **Post-catalog reads** — ~600 additional SeekNextForm + ~7000 SeekNextSubrecord + ~6400 ReadData calls (without OpenTES — files accessed via a different mechanism)
 6. **kDataLoaded** — signals loading complete
 
-If step 3 is skipped (as in the 600-file bug), steps 4-5 produce zero forms. The key diagnostic: `AddCompileIndex` call count = 0 means CompileFiles never ran.
+If step 2 is skipped (the 600-file bug), step 3 never runs — `OpenTES` stays at 0, zero forms are created. ClearData is NOT called during initial loading (it's a reset function for game reloads). InitializeFormDataStructures is also not called.
+
+**Critical finding (v1.22.16):** AE 11596 (identified by the v1.22.11 scanner as containing AddCompileIndex call sites) is NEVER called during initial loading. The initial loading pipeline uses a **different code path** — possibly inlined code or indirect calls that the E8/E9 scanner doesn't detect.
+
+**Current status (v1.22.17):** ManuallyCompileFiles successfully populates compiledFileCollection (211 reg + 1589 ESL = 1800 files) and sets loadingFiles=true on the main thread during the catalog scan. However, the form loading loop (step 3) still never executes. The problem is not that loadingFiles isn't set — the form loading function itself is never called. v1.22.17 re-enables the .text scanner targeting OpenTES callers to identify the actual form loading function.
 
 ### TESDataHandler Key Offsets (AE 1.6.1170)
 
@@ -327,6 +335,9 @@ TESFile compile index fields: `compileIndex` (uint8_t at +0x478, 0xFF = uncompil
 | v1.22.12 | Monitor-based compilation detection (replaced broken inline hook that crashed on AE 11596) |
 | v1.22.13 | Disabled runtime scanner (not needed, was suspected of causing early termination) |
 | v1.22.14 | Fixed ManuallyCompileFiles — parse plugins.txt for enabled status (kActive is 0 when compilation is skipped) |
+| v1.22.15 | Main-thread compilation trigger via CloseTES hook (idempotent ManuallyCompileFiles, cached plugins.txt). Confirmed: loadingFiles=true on main thread still doesn't trigger form loading |
+| v1.22.16 | Hook AE 11596 (CompileFiles candidate) — confirmed NEVER called during initial loading. The engine uses a different code path. |
+| v1.22.17 | Multi-target .text scanner: scan for callers of OpenTES + AddFormToDataHandler + AddCompileIndex to identify the actual form loading function |
 
 ## Credits
 
