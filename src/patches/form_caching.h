@@ -916,7 +916,7 @@ namespace Patches::FormCaching
             auto addFormDelta = addFormAfter - addFormBefore;
             auto openTESDelta = openTESAfter - openTESBefore;
 
-            logger::info("=== ForceLoadAllForms (v1.22.21) RESULTS ==="sv);
+            logger::info("=== ForceLoadAllForms (v1.22.22) RESULTS ==="sv);
             logger::info("  AddFormToDataHandler: {} → {} (+{})", addFormBefore, addFormAfter, addFormDelta);
             logger::info("  OpenTES calls: {} → {} (+{})", openTESBefore, openTESAfter, openTESDelta);
             logger::info("  TDH: nextID=0x{:08X} activeFile={}",
@@ -926,6 +926,37 @@ namespace Patches::FormCaching
                 tdh->loadingFiles,
                 tdh->compiledFileCollection.files.size(),
                 tdh->compiledFileCollection.smallFiles.size());
+
+            // v1.22.22: Diagnostic — enumerate files that AE 13753 skipped (still at 0xFF).
+            // These files were NOT loaded by the engine. Possible causes:
+            //   (a) File not installed on disk (SomeFunc/existence check failed)
+            //   (b) File skipped by per-file validation (SomeFunc at module+0x1C8E40)
+            //   (c) File skipped by AnotherFunc (module+0x1C6E90) despite our NOP
+            {
+                std::vector<std::string> skippedFiles;
+                std::size_t totalInTDH = 0;
+                for (auto& file : tdh->files) {
+                    if (!file) continue;
+                    ++totalInTDH;
+                    if (file->compileIndex == 0xFF && file->smallFileCompileIndex == 0) {
+                        // Still uncompiled — AE 13753 skipped this file
+                        skippedFiles.push_back(std::string(file->fileName ? file->fileName : "<null>"));
+                    }
+                }
+                logger::info("  TDH->files total: {} | skipped by AE 13753: {}", totalInTDH, skippedFiles.size());
+                if (!skippedFiles.empty()) {
+                    logger::warn("=== FILES SKIPPED BY AE 13753 (compileIndex still 0xFF) ===");
+                    // Log up to 100 skipped files to keep log manageable
+                    std::size_t logLimit = std::min(skippedFiles.size(), std::size_t(100));
+                    for (std::size_t i = 0; i < logLimit; ++i) {
+                        logger::warn("  SKIPPED[{}]: {}", i, skippedFiles[i]);
+                    }
+                    if (skippedFiles.size() > 100) {
+                        logger::warn("  ... and {} more skipped files (truncated)", skippedFiles.size() - 100);
+                    }
+                    logger::warn("=== END SKIPPED FILES LIST ===");
+                }
+            }
 
             if (addFormDelta > 100) {
                 logger::info(">>> SUCCESS! Engine loaded {} forms via native form loading! <<<", addFormDelta);
@@ -937,7 +968,7 @@ namespace Patches::FormCaching
                 logger::error("Next step: investigate SomeFunc (module+0x1C8E40) per-file filtering");
             }
 
-            logger::info("=== END ForceLoadAllForms (v1.22.21) ==="sv);
+            logger::info("=== END ForceLoadAllForms (v1.22.22) ==="sv);
 #else
             logger::info("ForceLoadAllForms: SE build — skipping (AE-only fix)"sv);
 #endif
