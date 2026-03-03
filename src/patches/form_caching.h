@@ -490,6 +490,70 @@ namespace Patches::FormCaching
         // Forward declarations for v1.22.11 compile caller scanner (diagnostic only)
         inline void ScanAndHookCompileCaller(std::uintptr_t addCompileIndexAddr);
 
+        // ================================================================
+        // v1.22.16: Minimal hook on AE 11596 (CompileFiles candidate)
+        // Just log entry/exit to determine if it's called during loading.
+        // No state modification — pure diagnostic.
+        // ================================================================
+        inline SafetyHookInline g_hk_ae11596{};
+
+        inline void HookedAE11596(void* a_this)
+        {
+            auto* tdh = RE::TESDataHandler::GetSingleton();
+            auto tdhAddr = tdh ? reinterpret_cast<std::uintptr_t>(tdh) : 0;
+
+            logger::warn(">>> AE 11596 ENTERED: this={:p}, TDH={:p}, loadingFiles(CommonLib)={}, "
+                         "loadingFiles(raw@0xDA8)=0x{:02X}",
+                (void*)a_this, (void*)tdh,
+                tdh ? tdh->loadingFiles : false,
+                (tdh && tdhAddr) ? *reinterpret_cast<const std::uint8_t*>(tdhAddr + 0xDA8) : 0xFF);
+
+            // Dump bytes around loadingFiles offset for verification
+            if (tdh && tdhAddr) {
+                auto* bytes = reinterpret_cast<const std::uint8_t*>(tdhAddr + 0xDA0);
+                logger::info("  TDH+0xDA0..0xDAF: {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} "
+                             "{:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X}",
+                    bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+                    bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]);
+            }
+
+            auto beforeCompile = g_addCompileIndexCalls.load(std::memory_order_relaxed);
+            auto beforeOpenTES = g_openTESCalls.load(std::memory_order_relaxed);
+
+            g_hk_ae11596.call(a_this);
+
+            auto afterCompile = g_addCompileIndexCalls.load(std::memory_order_relaxed);
+            auto afterOpenTES = g_openTESCalls.load(std::memory_order_relaxed);
+
+            logger::warn(">>> AE 11596 RETURNED: AddCompileIndex delta={}, OpenTES delta={}, "
+                         "loadingFiles(CommonLib)={}, loadingFiles(raw@0xDA8)=0x{:02X}",
+                afterCompile - beforeCompile, afterOpenTES - beforeOpenTES,
+                tdh ? tdh->loadingFiles : false,
+                (tdh && tdhAddr) ? *reinterpret_cast<const std::uint8_t*>(tdhAddr + 0xDA8) : 0xFF);
+
+            // After AE 11596 returns, if compilation was skipped, trigger manual compile
+            // This runs on the MAIN thread, at the exact point where CompileFiles returns
+            if (afterCompile == beforeCompile && afterOpenTES == beforeOpenTES) {
+                if (tdh && !g_manualCompileDone.load(std::memory_order_relaxed)) {
+                    std::size_t fileCount = 0;
+                    for (auto& file : tdh->files) { if (file) ++fileCount; }
+
+                    if (fileCount > 100) {
+                        logger::warn(">>> AE 11596 SKIPPED compilation ({} files, 0 compiled) — "
+                                     "triggering ManuallyCompileFiles from CompileFiles return point <<<",
+                            fileCount);
+                        g_manualCompileDone.store(true, std::memory_order_release);
+                        ManuallyCompileFiles();
+                        logger::info(">>> POST-AE11596 compile done: loadingFiles={}, "
+                                     "compiledCollection={} reg + {} ESL <<<",
+                            tdh->loadingFiles,
+                            tdh->compiledFileCollection.files.size(),
+                            tdh->compiledFileCollection.smallFiles.size());
+                    }
+                }
+            }
+        }
+
         inline void ReplaceFormMapFunctions()
         {
             const REL::Relocation getForm{ RELOCATION_ID(14461, 14617) };
@@ -572,9 +636,16 @@ namespace Patches::FormCaching
             g_hk_ReadData = safetyhook::create_inline(ReadData.address(), TESFile_ReadData);
             logger::info("form caching: ReadData hook at 0x{:X}"sv, ReadData.address());
 
-            // v1.22.9: CompileFiles hooks REMOVED — caused crash (wrong RELOCATION_IDs)
-            // SE→AE ID mapping is not a fixed offset; guessed AE IDs were wrong.
-            // Instead, enhanced ClearData + InitFormData hooks dump full TDH state.
+            // v1.22.16: Hook AE 11596 (CompileFiles candidate) — diagnostic + post-return trigger
+            // v1.22.9: Previously crashed with wrong RELOCATION_IDs. AE 11596 was identified
+            // by the v1.22.11 scanner as the function containing AddCompileIndex call sites.
+            // Using 0 for SE ID (SE-only builds will skip this hook).
+            {
+                const REL::Relocation ae11596{ REL::ID(11596) };
+                g_hk_ae11596 = safetyhook::create_inline(ae11596.address(), HookedAE11596);
+                logger::info("form caching: AE 11596 hook at 0x{:X} (offset 0x{:X})"sv,
+                    ae11596.address(), ae11596.address() - REL::Module::get().base());
+            }
 
             // Log all hook addresses for verification
             logger::info("form caching: hook summary — GetForm=0x{:X} AddForm=0x{:X} OpenTES=0x{:X} AddCompileIdx=0x{:X} SeekNextForm=0x{:X} CloseTES=0x{:X}"sv,
