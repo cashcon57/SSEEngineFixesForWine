@@ -44,7 +44,7 @@ void MessageHandler(SKSE::MessagingInterface::Message* a_msg)
             if (Settings::Memory::bReplaceAllocator.GetValue())
                 Patches::WineMemoryManager::LogStats();
 
-            // v1.22.18+: Force form loading if the engine skipped it.
+            // v1.22.20: Force form loading if the engine skipped it.
             // Under Wine with 600+ plugins, CompileFiles is skipped, which
             // causes the entire form loading pipeline to be skipped too.
             // ManuallyCompileFiles (CloseTES hook) populates compiledFileCollection,
