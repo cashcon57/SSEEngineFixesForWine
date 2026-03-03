@@ -502,14 +502,13 @@ namespace Patches::FormCaching
                 AddCompileIndex.address(), SeekNextForm.address(), CloseTES.address());
 
             // ================================================================
-            // v1.22.11: Runtime code scanner — find callers of AddCompileIndex
-            // The binary is encrypted on disk (Steam DRM), so we scan the
-            // decrypted .text section in memory at runtime to find which
-            // function calls AddCompileIndex. This identifies "CompileFiles"
-            // (the engine function that assigns compile indices to all files).
-            // We then hook that function to detect + fix the 600-file skip.
+            // v1.22.11-12: Runtime code scanner (diagnostic only, no hook).
+            // v1.22.13: DISABLED — scanner loads Offset2ID (428K entries) and
+            // processes 23MB of .text, which may cause early termination.
+            // The monitor thread in editor_id_cache.h handles compilation
+            // fallback without needing the scanner.
             // ================================================================
-            ScanAndHookCompileCaller(AddCompileIndex.address());
+            // ScanAndHookCompileCaller(AddCompileIndex.address());
         }
 
         // ================================================================
