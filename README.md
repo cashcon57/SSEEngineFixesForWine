@@ -45,7 +45,7 @@ All **38 bug fixes** and **14 patches** from SSE Engine Fixes are preserved, plu
 - **Wine-compatible memory allocator** — replaces TBB with HeapAlloc/HeapFree via SafetyHook inline hooks on MemoryManager::Allocate/Deallocate/Reallocate. Uses a dedicated growable heap (HeapCreate) with 32-byte allocation headers for tracking.
 - **ScrapHeap expansion** — hooks GetThreadScrapHeap to expand per-thread reserve from 64MB to 512MB before first use
 - **Editor ID cache** — diagnostic + safe repopulation of editor IDs for Wine compatibility
-- **600-file compilation fix (v1.22.11–17)** — monitor-based detection and manual compilation fallback for the engine's file compilation limit under Wine (see below)
+- **600-file compilation fix (v1.22.11–18)** — monitor-based detection and manual compilation fallback for the engine's file compilation limit under Wine (see below)
 
 ## Included Patches
 
@@ -131,11 +131,26 @@ This is count-based, not file-specific — swapping which plugins are enabled at
 
 **Result:** compiledFileCollection is correctly populated (211 reg + 1589 ESL = 1800 files), loadingFiles=true on the main thread during the catalog scan.
 
-**Phase 2 — Form Loading (UNSOLVED):** Despite successful compilation, form loading never starts. OpenTES remains at 0, meaning the form loading function is never called. Key findings:
+**Phase 2 — Form Loading (IN PROGRESS, v1.22.18):** Despite successful compilation, form loading never starts on its own. The engine's code path already branched past form loading before ManuallyCompileFiles ran. We must invoke form loading ourselves at kDataLoaded. Key findings:
 
 - **AE 11596 is NOT the initial loading function** (v1.22.16): Hook installed but never entered. The initial data load uses a different code path.
 - **loadingFiles is a status flag, not a gate** (v1.22.15): Setting it to true on the main thread does not cause the form loading loop to start.
-- **The form loading function itself needs to be called** (v1.22.17): The .text scanner is being re-enabled to scan for OpenTES callers, which will identify the actual form loading function that needs to be invoked after manual compilation.
+- **v1.22.17 .text scanner identified two candidates** but had to be removed — its Offset2ID allocation (428K entries) caused a total startup hang (zero activity, TDH never created, 202% CPU for 47 min):
+  - **AE 13698** at offset 0x1B1D30: 54 AddFormToDataHandler call sites
+  - **AE 13753** at offset 0x1B96E0: 2 OpenTES call sites (loading orchestration)
+  - AE 13785 at offset 0x1BE460: 3 OpenTES calls (HotLoadPlugin — irrelevant)
+- **v1.22.18 tested both candidates via ForceLoadAllForms():**
+  - **AE 13753** (orchestration): Called as `void(TESDataHandler*)` — returned in 7ms producing 0 forms, 0 OpenTES calls. Likely wrong signature or checks an internal state flag that causes early return.
+  - **AE 13698** (form loading): Called as `void(TESDataHandler*)` — produced 78 AddFormToDataHandler calls but 0 OpenTES calls. All 78 forms were low-formID engine defaults (0x1F5, 0x1A, 0x1B, etc.). **This function creates built-in default forms, not file-loaded forms.**
+- **Neither AE function loads forms from plugin files.** The actual per-file form loading loop must be implemented manually.
+
+**Next step (v1.22.19):** Implement a custom form loading loop using CommonLib primitives:
+1. Iterate `compiledFileCollection.files` and `.smallFiles`
+2. For each file: `file->OpenTES()` → iterate records with `file->SeekNextForm(true)` → `file->GetFormType()` → `IFormFactory::GetFormFactoryByType(ft)->Create()` → `form->Load(file)` → `TESDataHandler::AddFormToDataHandler(form)`
+3. Handle FormID compilation via `TESForm::AddCompileIndex(&id, file)`
+4. Skip TES4/GRUP header records
+
+All required CommonLib wrappers verified available: `TESFile::OpenTES` (AE 13931), `SeekNextForm` (AE 13979), `GetFormType` (AE 13982), `ReadData` (AE 13991), `CloseTES` (AE 13933), `IFormFactory::GetFormFactoryByType` (global array at AE 400508), `TESForm::AddCompileIndex` (AE 14667).
 
 ### Important: SKSE Working Directory Fix
 
@@ -279,7 +294,7 @@ If step 2 is skipped (the 600-file bug), step 3 never runs — `OpenTES` stays a
 
 **Critical finding (v1.22.16):** AE 11596 (identified by the v1.22.11 scanner as containing AddCompileIndex call sites) is NEVER called during initial loading. The initial loading pipeline uses a **different code path** — possibly inlined code or indirect calls that the E8/E9 scanner doesn't detect.
 
-**Current status (v1.22.17):** ManuallyCompileFiles successfully populates compiledFileCollection (211 reg + 1589 ESL = 1800 files) and sets loadingFiles=true on the main thread during the catalog scan. However, the form loading loop (step 3) still never executes. The problem is not that loadingFiles isn't set — the form loading function itself is never called. v1.22.17 re-enables the .text scanner targeting OpenTES callers to identify the actual form loading function.
+**Current status (v1.22.18):** ManuallyCompileFiles successfully populates compiledFileCollection (211 reg + 1589 ESL = 1800 files) and sets loadingFiles=true on the main thread during the catalog scan. However, the form loading loop (step 3) never executes because the engine's code path already branched past it. The v1.22.17 .text scanner identified AE 13698 and AE 13753 as candidates, but testing in v1.22.18 revealed that AE 13698 only creates 78 built-in engine forms (not file-loaded) and AE 13753 returns without doing anything. **The actual form loading must be implemented as a custom loop using CommonLib's TESFile I/O + IFormFactory primitives** — this is the v1.22.19 task.
 
 ### TESDataHandler Key Offsets (AE 1.6.1170)
 
@@ -311,11 +326,30 @@ TESFile compile index fields: `compileIndex` (uint8_t at +0x478, 0xFF = uncompil
 | AddCompileIndex | 14509 | 14667 | 0x1E1640 |
 | TESForm::InitializeFormDataStructures | 14511 | 14669 | 0x1E17F0 |
 
+### AE 13698 and AE 13753: Not the File-Loading Functions (v1.22.18)
+
+The v1.22.17 .text scanner identified two promising functions by counting call sites to known loading primitives:
+
+- **AE 13698** (offset 0x1B1D30): 54 `AddFormToDataHandler` call sites — appeared to be the big form-type switch that loads all ~54 form types from files.
+- **AE 13753** (offset 0x1B96E0): 2 `OpenTES` call sites — appeared to be the orchestrator that opens files and calls the form reader.
+
+**Testing in v1.22.18 proved both wrong:**
+
+| Function | Signature Used | Result |
+|----------|---------------|--------|
+| AE 13753 | `void(TESDataHandler*)` | 0 forms, 0 OpenTES, returned in 7ms |
+| AE 13698 | `void(TESDataHandler*)` | 78 AddForm calls, 0 OpenTES — all low-formID engine defaults |
+
+AE 13698's 78 forms had formIDs like 0x1F5, 0x1A, 0x1B — these are hardcoded engine defaults created without reading any files. The 54 AddFormToDataHandler call sites correspond to 54 different default form type initializations, not per-file form reading. AE 13753 likely checks an internal state flag or requires additional parameters.
+
+**Lesson:** A high count of `AddFormToDataHandler` call sites does NOT mean the function reads forms from files — it may just create built-in default instances of many different form types.
+
 ### Wine-Specific Observations
 
 - **`kActive` flag is set BY compilation**: `TESFile::RecordFlag::kActive` (bit 3) is set during the `CompileFiles` process, not before. When `CompileFiles` is skipped (the 600-file bug), ALL files have `kActive = 0`. You CANNOT use `kActive` to determine which files should be compiled — parse `plugins.txt` instead.
 - **SeekNextForm fires during catalog scan** regardless of whether the full load succeeds. A high SeekNextForm count with zero AddCompileIndex/OpenTES/AddFormToDataHandler calls means the catalog scan ran but the compile phase was skipped.
 - **Wine CWD**: `wine --bottle "path/to/skse64_loader.exe"` does NOT set CWD to the game directory. SKSE's relative Address Library path fails. Use a .bat wrapper with `cd /d "%~dp0"`.
+- **Offset2ID allocation kills Wine startup** (v1.22.17→18): Loading the `REL::IDDatabase::Offset2ID` reverse-lookup table (428,461 entries, ~7MB) during SKSE plugin load causes a total startup hang under Wine — TESDataHandler is never created, zero activity, 202% CPU indefinitely. This happens reliably. The scanner was removed in v1.22.18 and startup immediately recovered. Suspect Wine's memory manager or allocation interlock is disrupted by the large sorted-vector allocation during early initialization.
 
 ## Diagnostic Version History
 
@@ -338,6 +372,7 @@ TESFile compile index fields: `compileIndex` (uint8_t at +0x478, 0xFF = uncompil
 | v1.22.15 | Main-thread compilation trigger via CloseTES hook (idempotent ManuallyCompileFiles, cached plugins.txt). Confirmed: loadingFiles=true on main thread still doesn't trigger form loading |
 | v1.22.16 | Hook AE 11596 (CompileFiles candidate) — confirmed NEVER called during initial loading. The engine uses a different code path. |
 | v1.22.17 | Multi-target .text scanner: scan for callers of OpenTES + AddFormToDataHandler + AddCompileIndex to identify the actual form loading function |
+| v1.22.18 | Removed .text scanner (caused zero-activity startup hang via Offset2ID 428K allocation). Removed FD stress test from monitor thread (killed thread at tick 10). Added ForceLoadAllForms() at kDataLoaded — tested AE 13753 (0 forms, wrong sig) and AE 13698 (78 engine defaults only, not file-loaded). Confirmed: neither function loads forms from plugin files. |
 
 ## Credits
 
