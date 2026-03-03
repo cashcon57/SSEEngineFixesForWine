@@ -122,7 +122,7 @@ skse64_loader.exe
 
 ### Corkscrew (macOS and Linux)
 
-[Corkscrew](https://github.com/corkscrewmodding/corkscrew) has built-in support for this fork and manages it automatically. **If you are using Corkscrew, you do not need to install or update this mod manually.**
+[Corkscrew](https://github.com/corkscrewmodding/corkscrew) is a native mod manager for Wine games on macOS and Linux — think Mod Organizer 2, built for CrossOver, Proton, and Lutris. It handles NexusMods Collections, Wabbajack modlists, FOMOD installers, plugin load order, conflict resolution, and game launching. It has built-in support for this fork and manages it automatically. **If you are using Corkscrew, you do not need to install or update this mod manually.**
 
 Before every game launch, Corkscrew automatically:
 
