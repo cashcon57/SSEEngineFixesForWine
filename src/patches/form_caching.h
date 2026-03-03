@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <map>
 #include <set>
 #include <shared_mutex>
 #include <sstream>
@@ -750,23 +751,26 @@ namespace Patches::FormCaching
         }
 
         // ================================================================
-        // v1.22.18: ForceLoadAllForms
+        // v1.22.19: ForceLoadAllForms
         //
         // Called at kDataLoaded when the form loading pipeline was skipped
         // (detected by zero AddFormToDataHandler calls). Under Wine with
         // 600+ plugins, CompileFiles is skipped entirely, which causes the
         // engine to skip form loading too.
         //
-        // ManuallyCompileFiles (v1.22.14) populates compiledFileCollection,
-        // but the engine's form loading code path was already skipped.
-        // This function directly invokes the engine's form loading functions:
+        // v1.22.18 found that AE 13753 (orchestrator, 2 OpenTES calls)
+        // returns without action, and AE 13698 only creates 78 engine
+        // defaults. Neither loads forms from plugin files.
         //
-        //   AE 13753 — Loading orchestration (2 OpenTES calls)
-        //              Likely opens files and calls the form reader.
-        //   AE 13698 — Form loading (54 AddFormToDataHandler calls)
-        //              Handles all ~54 form types via big switch.
+        // v1.22.19 strategy: INTELLIGENCE GATHERING
+        //   1. Hex dump AE 13753 machine code — find the early-exit check
+        //   2. Log all TDH state flags before calling
+        //   3. Set hasDesiredFiles=true and retry AE 13753
+        //   4. Diagnostic form iteration — open files, count record types
         //
-        // These AE IDs were identified by the v1.22.17 .text scanner.
+        // If we can identify AE 13753's early-exit condition from the hex
+        // dump, we can patch it in v1.22.20 and let the engine's own form
+        // loading run — avoiding reimplementation of the entire pipeline.
         // ================================================================
         inline void ForceLoadAllForms()
         {
@@ -787,94 +791,257 @@ namespace Patches::FormCaching
 
             auto regCount = tdh->compiledFileCollection.files.size();
             auto eslCount = tdh->compiledFileCollection.smallFiles.size();
-            logger::info("=== ForceLoadAllForms (v1.22.18) ==="sv);
+            logger::info("=== ForceLoadAllForms (v1.22.19) ==="sv);
             logger::info("  compiledFileCollection: {} reg + {} ESL = {} total",
                 regCount, eslCount, regCount + eslCount);
-            logger::info("  loadingFiles: {}", tdh->loadingFiles);
-            logger::info("  AddForm calls before: {}",
+
+            // ==========================================================
+            // DIAGNOSTIC 1: Dump ALL TESDataHandler flags
+            // One of these might be the early-exit condition for AE 13753
+            // ==========================================================
+            logger::info(">>> TDH flags snapshot <<<"sv);
+            logger::info("  masterSave={} blockSave={} saveLoadGame={} autoSaving={}",
+                tdh->masterSave, tdh->blockSave, tdh->saveLoadGame, tdh->autoSaving);
+            logger::info("  exportingPlugin={} clearingData={} hasDesiredFiles={} checkingModels={}",
+                tdh->exportingPlugin, tdh->clearingData, tdh->hasDesiredFiles, tdh->checkingModels);
+            logger::info("  loadingFiles={} dontRemoveIDs={} gameSettingsLoadState={}",
+                tdh->loadingFiles, tdh->dontRemoveIDs, tdh->gameSettingsLoadState);
+            logger::info("  nextID=0x{:08X} activeFile={}", tdh->nextID,
+                tdh->activeFile ? tdh->activeFile->fileName : "null");
+            logger::info("  files list size (walk):");
+            {
+                std::size_t fileCount = 0;
+                for (auto& file : tdh->files) {
+                    if (file) ++fileCount;
+                }
+                logger::info("    {} files in TDH files list", fileCount);
+            }
+            logger::info("  AddForm calls so far: {}",
                 g_addFormCalls.load(std::memory_order_relaxed));
 
-            // Ensure loadingFiles is true (form loading functions may check this)
+            // ==========================================================
+            // DIAGNOSTIC 2: Hex dump of AE 13753 machine code
+            // This is the KEY diagnostic — finding the early-exit check
+            // lets us patch it and use the engine's own form loading.
+            // ==========================================================
+            {
+                REL::Relocation<std::uintptr_t> fn13753{ REL::ID(13753) };
+                REL::Relocation<std::uintptr_t> fn13754{ REL::ID(13754) };  // ClearData — next function
+                auto addr = fn13753.address();
+                auto nextAddr = fn13754.address();
+                auto fnSize = nextAddr > addr ? nextAddr - addr : 0;
+                auto dumpSize = std::min<std::size_t>(fnSize > 0 ? fnSize : 1024, 512);
+
+                logger::info(">>> AE 13753 hex dump: addr=0x{:X} offset=0x{:X} fnSize~={} dumpSize={} <<<",
+                    addr, addr - REL::Module::get().base(), fnSize, dumpSize);
+
+                auto* bytes = reinterpret_cast<const std::uint8_t*>(addr);
+                for (std::size_t i = 0; i < dumpSize; i += 16) {
+                    std::string hex;
+                    std::string ascii;
+                    for (std::size_t j = 0; j < 16 && (i + j) < dumpSize; ++j) {
+                        auto b = bytes[i + j];
+                        char buf[4];
+                        std::snprintf(buf, sizeof(buf), "%02X ", b);
+                        hex += buf;
+                        ascii += (b >= 0x20 && b < 0x7F) ? static_cast<char>(b) : '.';
+                    }
+                    // Pad hex to 48 chars for alignment
+                    while (hex.size() < 48) hex += ' ';
+                    logger::info("  {:04X}: {}  {}", i, hex, ascii);
+                }
+            }
+
+            // Also dump AE 13698 prologue (first 128 bytes) for comparison
+            {
+                REL::Relocation<std::uintptr_t> fn13698{ REL::ID(13698) };
+                auto addr = fn13698.address();
+                logger::info(">>> AE 13698 hex dump: addr=0x{:X} offset=0x{:X} (first 128 bytes) <<<",
+                    addr, addr - REL::Module::get().base());
+
+                auto* bytes = reinterpret_cast<const std::uint8_t*>(addr);
+                for (std::size_t i = 0; i < 128; i += 16) {
+                    std::string hex;
+                    std::string ascii;
+                    for (std::size_t j = 0; j < 16 && (i + j) < 128; ++j) {
+                        auto b = bytes[i + j];
+                        char buf[4];
+                        std::snprintf(buf, sizeof(buf), "%02X ", b);
+                        hex += buf;
+                        ascii += (b >= 0x20 && b < 0x7F) ? static_cast<char>(b) : '.';
+                    }
+                    while (hex.size() < 48) hex += ' ';
+                    logger::info("  {:04X}: {}  {}", i, hex, ascii);
+                }
+            }
+
+            // ==========================================================
+            // EXPERIMENT 1: Set more flags and retry AE 13753
+            // hasDesiredFiles might be the missing gate.
+            // ==========================================================
+            logger::info(">>> Experiment 1: AE 13753 with hasDesiredFiles=true <<<"sv);
+
+            // Save original flags to restore later
+            bool origHasDesired = tdh->hasDesiredFiles;
+            bool origLoading = tdh->loadingFiles;
+            bool origClearing = tdh->clearingData;
+
             tdh->loadingFiles = true;
+            tdh->hasDesiredFiles = true;
+            tdh->clearingData = false;
 
-            // Log first few compiled files for verification
-            for (std::size_t i = 0; i < std::min<std::size_t>(5, regCount); ++i) {
-                auto* f = tdh->compiledFileCollection.files[i];
-                if (f) {
-                    logger::info("  reg[{}]: '{}' compIdx=0x{:02X}",
-                        i, f->fileName, f->compileIndex);
-                }
-            }
-            for (std::size_t i = 0; i < std::min<std::size_t>(3, eslCount); ++i) {
-                auto* f = tdh->compiledFileCollection.smallFiles[i];
-                if (f) {
-                    logger::info("  esl[{}]: '{}' compIdx=0x{:02X} smallIdx=0x{:04X}",
-                        i, f->fileName, f->compileIndex, f->smallFileCompileIndex);
-                }
-            }
-
-            // ----------------------------------------------------------
-            // Attempt 1: Call AE 13753 (loading orchestration function)
-            // This function has 2 OpenTES calls and is in the TESDataHandler
-            // range. It likely opens files, reads records, and creates forms.
-            // Signature assumed: void TESDataHandler::DoFormLoading()
-            // ----------------------------------------------------------
-            logger::info(">>> Attempt 1: Calling AE 13753 (orchestration) <<<");
+            auto addFormBefore = g_addFormCalls.load(std::memory_order_relaxed);
+            auto openTESBefore = g_openTESCalls.load(std::memory_order_relaxed);
 
             using OrchestratorFn = void(*)(RE::TESDataHandler*);
             REL::Relocation<OrchestratorFn> orchestrator{ REL::ID(13753) };
-            logger::info("  AE 13753 address: 0x{:X} (offset 0x{:X})",
-                orchestrator.address(),
-                orchestrator.address() - REL::Module::get().base());
-
             orchestrator(tdh);
 
             auto addFormAfter1 = g_addFormCalls.load(std::memory_order_relaxed);
             auto openTESAfter1 = g_openTESCalls.load(std::memory_order_relaxed);
-            logger::info("  After AE 13753: AddForm={}, OpenTES={}",
-                addFormAfter1, openTESAfter1);
+            logger::info("  After AE 13753: AddForm={} (+{}), OpenTES={} (+{})",
+                addFormAfter1, addFormAfter1 - addFormBefore,
+                openTESAfter1, openTESAfter1 - openTESBefore);
 
-            if (addFormAfter1 > 0) {
-                logger::info(">>> ForceLoadAllForms SUCCESS via AE 13753! {} forms loaded <<<",
-                    addFormAfter1);
-                logger::info("=== END ForceLoadAllForms ==="sv);
+            if (addFormAfter1 - addFormBefore > 78) {
+                // More than just engine defaults — real forms loaded!
+                logger::info(">>> SUCCESS! AE 13753 loaded {} forms with hasDesiredFiles=true <<<",
+                    addFormAfter1 - addFormBefore);
+                logger::info("=== END ForceLoadAllForms (v1.22.19) ==="sv);
                 return;
             }
 
-            // ----------------------------------------------------------
-            // Attempt 2: Call AE 13698 (the big form loading function)
-            // Has 54 AddFormToDataHandler call sites — one per form type.
-            // If AE 13753 didn't work (perhaps wrong signature or it
-            // checks some condition), try the inner form loader directly.
-            // Signature assumed: void TESDataHandler::LoadAllFormRecords()
-            // ----------------------------------------------------------
-            logger::info(">>> Attempt 2: Calling AE 13698 (form loading) <<<");
+            // ==========================================================
+            // EXPERIMENT 2: Diagnostic form iteration
+            // Open compiled files, iterate records with SeekNextForm,
+            // log record types and counts. Don't create forms yet —
+            // understand the data structure first.
+            // ==========================================================
+            logger::info(">>> Experiment 2: Diagnostic form iteration <<<"sv);
 
-            using FormLoaderFn = void(*)(RE::TESDataHandler*);
-            REL::Relocation<FormLoaderFn> formLoader{ REL::ID(13698) };
-            logger::info("  AE 13698 address: 0x{:X} (offset 0x{:X})",
-                formLoader.address(),
-                formLoader.address() - REL::Module::get().base());
+            auto& regFiles = tdh->compiledFileCollection.files;
+            auto& eslFiles = tdh->compiledFileCollection.smallFiles;
 
-            formLoader(tdh);
+            std::size_t totalRecords = 0;
+            std::size_t grupRecords = 0;
+            std::size_t tes4Records = 0;
+            std::size_t formRecords = 0;
+            std::size_t openFailures = 0;
+            std::map<std::uint32_t, std::size_t> typeCounts;
 
-            auto addFormAfter2 = g_addFormCalls.load(std::memory_order_relaxed);
-            auto openTESAfter2 = g_openTESCalls.load(std::memory_order_relaxed);
-            logger::info("  After AE 13698: AddForm={}, OpenTES={}",
-                addFormAfter2, openTESAfter2);
+            auto iterateFile = [&](RE::TESFile* file, std::size_t maxRecords) {
+                if (!file) return;
 
-            if (addFormAfter2 > addFormAfter1) {
-                logger::info(">>> ForceLoadAllForms SUCCESS via AE 13698! {} new forms <<<",
-                    addFormAfter2 - addFormAfter1);
-            } else {
-                logger::error(">>> ForceLoadAllForms FAILED: no forms loaded by either function <<<");
-                logger::error("  This likely means the functions have different signatures or");
-                logger::error("  require additional setup. Need to analyze disassembly.");
+                logger::info("  Opening: '{}' compIdx=0x{:02X} smallIdx=0x{:04X}",
+                    file->fileName, file->compileIndex, file->smallFileCompileIndex);
+
+                // Try kReadOnly (0) first
+                bool opened = file->OpenTES(RE::NiFile::OpenMode::kReadOnly, false);
+                if (!opened) {
+                    // Fallback: try mode 1 (what engine used during catalog)
+                    opened = file->OpenTES(static_cast<RE::NiFile::OpenMode>(1), false);
+                    if (opened) {
+                        logger::info("    Opened with mode=1 (mode=0 failed)");
+                    }
+                }
+                if (!opened) {
+                    logger::warn("    FAILED to open '{}' (both mode 0 and 1)", file->fileName);
+                    ++openFailures;
+                    return;
+                }
+
+                std::size_t fileRecords = 0;
+                while (file->SeekNextForm(true) && fileRecords < maxRecords) {
+                    ++fileRecords;
+                    ++totalRecords;
+
+                    auto typeCode = file->currentform.form;
+                    auto formID = file->currentform.formID;
+                    auto length = file->currentform.length;
+                    auto flags = file->currentform.flags;
+
+                    // Decode 4-char type code (little-endian in struct)
+                    char typeStr[5] = {
+                        static_cast<char>(typeCode & 0xFF),
+                        static_cast<char>((typeCode >> 8) & 0xFF),
+                        static_cast<char>((typeCode >> 16) & 0xFF),
+                        static_cast<char>((typeCode >> 24) & 0xFF),
+                        0
+                    };
+
+                    typeCounts[typeCode]++;
+
+                    constexpr std::uint32_t kGRUP = 0x50555247;  // "GRUP"
+                    constexpr std::uint32_t kTES4 = 0x34534554;  // "TES4"
+
+                    if (typeCode == kGRUP) {
+                        ++grupRecords;
+                    } else if (typeCode == kTES4) {
+                        ++tes4Records;
+                    } else {
+                        ++formRecords;
+
+                        // For non-GRUP/TES4 records, also check if IFormFactory
+                        // recognizes the type
+                        auto formType = file->GetFormType();
+                        auto* factory = RE::IFormFactory::GetFormFactoryByType(formType);
+
+                        // Log first 20 form records per file
+                        if (formRecords <= 20 || fileRecords <= 30) {
+                            logger::info("    [{}] '{}' formID=0x{:08X} len={} flags=0x{:08X} FormType={} factory={}",
+                                fileRecords, typeStr, formID, length, flags,
+                                static_cast<std::uint32_t>(formType),
+                                factory ? "yes" : "NO");
+                        }
+                    }
+                }
+
+                logger::info("    '{}': {} records (hit limit={})",
+                    file->fileName, fileRecords, fileRecords >= maxRecords);
+                file->CloseTES(true);
+            };
+
+            // Iterate first 5 regular files (200 records each)
+            std::size_t regToScan = std::min<std::size_t>(5, regFiles.size());
+            for (std::size_t i = 0; i < regToScan; ++i) {
+                iterateFile(regFiles[i], 200);
             }
 
-            logger::info("=== END ForceLoadAllForms ==="sv);
+            // Iterate first 3 ESL files (100 records each)
+            std::size_t eslToScan = std::min<std::size_t>(3, eslFiles.size());
+            for (std::size_t i = 0; i < eslToScan; ++i) {
+                iterateFile(eslFiles[i], 100);
+            }
+
+            logger::info(">>> Diagnostic form iteration summary <<<"sv);
+            logger::info("  Files scanned: {} reg + {} ESL, {} open failures",
+                regToScan, eslToScan, openFailures);
+            logger::info("  Total records: {} ({} GRUP, {} TES4, {} form)",
+                totalRecords, grupRecords, tes4Records, formRecords);
+
+            // Log type distribution (sorted by count)
+            std::vector<std::pair<std::uint32_t, std::size_t>> sortedTypes(
+                typeCounts.begin(), typeCounts.end());
+            std::sort(sortedTypes.begin(), sortedTypes.end(),
+                [](const auto& a, const auto& b) { return a.second > b.second; });
+
+            logger::info("  Record type distribution (top 30):");
+            std::size_t typeIdx = 0;
+            for (auto& [typeCode, count] : sortedTypes) {
+                if (typeIdx >= 30) break;
+                char typeStr[5] = {
+                    static_cast<char>(typeCode & 0xFF),
+                    static_cast<char>((typeCode >> 8) & 0xFF),
+                    static_cast<char>((typeCode >> 16) & 0xFF),
+                    static_cast<char>((typeCode >> 24) & 0xFF),
+                    0
+                };
+                logger::info("    '{}': {}", typeStr, count);
+                ++typeIdx;
+            }
+
+            logger::info("=== END ForceLoadAllForms (v1.22.19) ==="sv);
 #else
-            // SE: the 600-file skip may not be an issue, but log a note
             logger::info("ForceLoadAllForms: SE build — skipping (AE-only fix)"sv);
 #endif
         }
