@@ -499,18 +499,32 @@ namespace Patches::FormCaching
             if (pep->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION)
                 return EXCEPTION_CONTINUE_SEARCH;
 
+            // v1.22.29: Only handle faults within SkyrimSE.exe's code —
+            // do not interfere with crash logger, Wine internals, or other DLLs.
+            {
+                static auto imgBase = REL::Module::get().base();
+                static auto imgEnd = [&]() {
+                    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(imgBase);
+                    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(imgBase + dos->e_lfanew);
+                    return imgBase + nt->OptionalHeader.SizeOfImage;
+                }();
+                auto rip = pep->ContextRecord->Rip;
+                if (rip < imgBase || rip >= imgEnd)
+                    return EXCEPTION_CONTINUE_SEARCH;
+            }
+
             // Get the faulting address
             ULONG_PTR targetAddr = 0;
             if (pep->ExceptionRecord->NumberParameters >= 2)
                 targetAddr = pep->ExceptionRecord->ExceptionInformation[1];
 
-            // Form IDs are 32-bit values with the top byte being the master index.
-            // A form ID used as a 64-bit pointer will be in range [0x100, 0x10000000).
+            // Form IDs are 32-bit values: master index (0x00-0xFE) in top byte.
+            // Valid range: [0x100, 0xFF000000). Under Wine/64-bit, heap addresses
+            // are >> 0x100000000 (e.g., 0x248...), so the 32-bit range is safe.
             // The faulting address may be offset from the base register
-            // (e.g., [rax+0x28]), so we check the actual target AND all registers.
-            // Reject anything in legit pointer ranges (> 0x10000000) or in the
-            // null page (< 0x100) — those are real crashes.
-            if (targetAddr >= 0x10000000 || targetAddr < 0x100)
+            // (e.g., [rax+0x28]), so we also check all registers below.
+            // Reject null-page faults (< 0x100) and real pointers (>= 0xFF000000).
+            if (targetAddr >= 0xFF000000 || targetAddr < 0x100)
                 return EXCEPTION_CONTINUE_SEARCH;
 
             // Scan all general-purpose registers for a value that looks like a form ID.
@@ -542,8 +556,8 @@ namespace Patches::FormCaching
             for (int i = 0; i < 15; ++i) {
                 DWORD64 val = *regs[i];
 
-                // Must look like a form ID: [0x100, 0x10000000)
-                if (val < 0x100 || val >= 0x10000000)
+                // Must look like a form ID: [0x100, 0xFF000000)
+                if (val < 0x100 || val >= 0xFF000000)
                     continue;
 
                 // The target address should be at or near this register value
