@@ -2142,6 +2142,179 @@ namespace Patches::FormCaching
                 }
             }
 
+            // ── Patch C: +0x2ED88B — null check before test byte [rax+0x40] ──
+            // Original: F6 40 40 01 74 07 (6 bytes)
+            //   test byte [rax+0x40], 0x01
+            //   je +7  → +0x2ED898 (mov rax, [rax+0x128]; ret)
+            // If je NOT taken: xor eax,eax; add rsp,0x28; ret (return 0)
+            //
+            // Function returns NULL if bit 0 is set, or [rax+0x128] if not.
+            // When RAX is null/near-null (~0x7D00), the VEH redirect costs
+            // ~50μs per call. At 42K/sec this consumes >100% of a CPU core
+            // and freezes the game after New Game.
+            //
+            // Null behavior: return 0 (same as "flag set" path).
+            // Sentinel page reads are harmless (no VEH), no sentinel check needed.
+            {
+                auto* site = reinterpret_cast<std::uint8_t*>(base + 0x2ED88B);
+
+                logger::info("PatchHotSpotC: bytes at +0x2ED88B: "
+                    "{:02X} {:02X} {:02X} {:02X} {:02X} {:02X}",
+                    site[0], site[1], site[2], site[3], site[4], site[5]);
+
+                if (site[0] != 0xF6 || site[1] != 0x40 || site[2] != 0x40 ||
+                    site[3] != 0x01 || site[4] != 0x74 || site[5] != 0x07) {
+                    logger::error("PatchHotSpotC: unexpected bytes — NOT patching");
+                } else {
+                    // Return sites:
+                    //   "return 0"   path: +0x2ED891 (xor eax,eax; add rsp,0x28; ret)
+                    //   "get member" path: +0x2ED898 (mov rax,[rax+0x128]; add rsp,0x28; ret)
+                    auto returnZeroAddr = reinterpret_cast<std::uint64_t>(base + 0x2ED891);
+                    auto getMemberAddr  = reinterpret_cast<std::uint64_t>(base + 0x2ED898);
+
+                    auto* cave = static_cast<std::uint8_t*>(trampoline.allocate(48));
+                    int off = 0;
+
+                    // cmp rax, 0x10000 (catch null and near-null like 0x7D00)
+                    cave[off++] = 0x48; cave[off++] = 0x3D;
+                    cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x01; cave[off++] = 0x00;
+                    // jb .return_zero
+                    cave[off++] = 0x72;
+                    int jbRetZeroOff = off;
+                    cave[off++] = 0x00;
+
+                    // Original: test byte [rax+0x40], 0x01
+                    cave[off++] = 0xF6; cave[off++] = 0x40; cave[off++] = 0x40; cave[off++] = 0x01;
+                    // je .get_member (ZF=1 → bit not set → return member)
+                    cave[off++] = 0x74;
+                    int jeGetMemOff = off;
+                    cave[off++] = 0x00;
+
+                    // .return_zero: (bit IS set, or null → return 0)
+                    int retZeroStart = off;
+                    cave[jbRetZeroOff] = static_cast<std::uint8_t>(retZeroStart - (jbRetZeroOff + 1));
+                    // jmp [rip+0] → returnZeroAddr
+                    cave[off++] = 0xFF; cave[off++] = 0x25;
+                    cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00;
+                    std::memcpy(&cave[off], &returnZeroAddr, 8); off += 8;
+
+                    // .get_member:
+                    int getMemStart = off;
+                    cave[jeGetMemOff] = static_cast<std::uint8_t>(getMemStart - (jeGetMemOff + 1));
+                    // jmp [rip+0] → getMemberAddr
+                    cave[off++] = 0xFF; cave[off++] = 0x25;
+                    cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00;
+                    std::memcpy(&cave[off], &getMemberAddr, 8); off += 8;
+
+                    logger::info("PatchHotSpotC: cave {} bytes at 0x{:X}", off,
+                        reinterpret_cast<std::uintptr_t>(cave));
+
+                    // Patch: JMP rel32 (5 bytes) + NOP (1 byte)
+                    DWORD oldProt;
+                    VirtualProtect(site, 6, PAGE_EXECUTE_READWRITE, &oldProt);
+                    auto jmpTarget = reinterpret_cast<std::intptr_t>(cave);
+                    auto jmpFrom = reinterpret_cast<std::intptr_t>(site + 5);
+                    auto dist = jmpTarget - jmpFrom;
+                    if (dist > INT32_MAX || dist < INT32_MIN) {
+                        logger::error("PatchHotSpotC: JMP too far ({}) — NOT patching", dist);
+                        VirtualProtect(site, 6, oldProt, &oldProt);
+                    } else {
+                        auto rel32 = static_cast<std::int32_t>(dist);
+                        site[0] = 0xE9;
+                        std::memcpy(&site[1], &rel32, 4);
+                        site[5] = 0x90;
+                        VirtualProtect(site, 6, oldProt, &oldProt);
+                        FlushInstructionCache(GetCurrentProcess(), site, 6);
+                        logger::info("PatchHotSpotC: +0x2ED88B patched (rel32={})", rel32);
+                    }
+                }
+            }
+
+            // ── Patch D: +0x664A0B — null check before test byte [rbp+0x40] ──
+            // Original: F6 45 40 01 74 05 (6 bytes)
+            //   test byte [rbp+0x40], 0x01
+            //   je +5  → +0x664A16 (test rbx, rbx; ...)
+            // If je NOT taken: mov rsi, rbp; jmp +0x30 (use form)
+            //
+            // Main loop hot path — iterates forms and checks flag at +0x40.
+            // When RBP is null (~0x7D00), VEH at 42K/sec freezes the game.
+            //
+            // Null behavior: take the je path (skip form, go to +0x664A16).
+            // Sentinel page reads are harmless (no VEH), no sentinel check needed.
+            {
+                auto* site = reinterpret_cast<std::uint8_t*>(base + 0x664A0B);
+
+                logger::info("PatchHotSpotD: bytes at +0x664A0B: "
+                    "{:02X} {:02X} {:02X} {:02X} {:02X} {:02X}",
+                    site[0], site[1], site[2], site[3], site[4], site[5]);
+
+                if (site[0] != 0xF6 || site[1] != 0x45 || site[2] != 0x40 ||
+                    site[3] != 0x01 || site[4] != 0x74 || site[5] != 0x05) {
+                    logger::error("PatchHotSpotD: unexpected bytes — NOT patching");
+                } else {
+                    // Return sites:
+                    //   je NOT taken: +0x664A11 (mov rsi, rbp — use this form)
+                    //   je taken / null: +0x664A16 (test rbx, rbx — skip form)
+                    auto useFormAddr = reinterpret_cast<std::uint64_t>(base + 0x664A11);
+                    auto skipFormAddr = reinterpret_cast<std::uint64_t>(base + 0x664A16);
+
+                    auto* cave = static_cast<std::uint8_t*>(trampoline.allocate(48));
+                    int off = 0;
+
+                    // cmp rbp, 0x10000
+                    cave[off++] = 0x48; cave[off++] = 0x81; cave[off++] = 0xFD;
+                    cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x01; cave[off++] = 0x00;
+                    // jb .skip_form (null → take je path)
+                    cave[off++] = 0x72;
+                    int jbSkipOff = off;
+                    cave[off++] = 0x00;
+
+                    // Original: test byte [rbp+0x40], 0x01
+                    cave[off++] = 0xF6; cave[off++] = 0x45; cave[off++] = 0x40; cave[off++] = 0x01;
+                    // je .skip_form
+                    cave[off++] = 0x74;
+                    int jeSkipOff = off;
+                    cave[off++] = 0x00;
+
+                    // .use_form: (flag is set → use this form)
+                    // jmp [rip+0] → useFormAddr
+                    cave[off++] = 0xFF; cave[off++] = 0x25;
+                    cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00;
+                    std::memcpy(&cave[off], &useFormAddr, 8); off += 8;
+
+                    // .skip_form: (flag not set, or null → skip)
+                    int skipStart = off;
+                    cave[jbSkipOff] = static_cast<std::uint8_t>(skipStart - (jbSkipOff + 1));
+                    cave[jeSkipOff] = static_cast<std::uint8_t>(skipStart - (jeSkipOff + 1));
+                    // jmp [rip+0] → skipFormAddr
+                    cave[off++] = 0xFF; cave[off++] = 0x25;
+                    cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00;
+                    std::memcpy(&cave[off], &skipFormAddr, 8); off += 8;
+
+                    logger::info("PatchHotSpotD: cave {} bytes at 0x{:X}", off,
+                        reinterpret_cast<std::uintptr_t>(cave));
+
+                    // Patch: JMP rel32 (5 bytes) + NOP (1 byte)
+                    DWORD oldProt;
+                    VirtualProtect(site, 6, PAGE_EXECUTE_READWRITE, &oldProt);
+                    auto jmpTarget = reinterpret_cast<std::intptr_t>(cave);
+                    auto jmpFrom = reinterpret_cast<std::intptr_t>(site + 5);
+                    auto dist = jmpTarget - jmpFrom;
+                    if (dist > INT32_MAX || dist < INT32_MIN) {
+                        logger::error("PatchHotSpotD: JMP too far ({}) — NOT patching", dist);
+                        VirtualProtect(site, 6, oldProt, &oldProt);
+                    } else {
+                        auto rel32 = static_cast<std::int32_t>(dist);
+                        site[0] = 0xE9;
+                        std::memcpy(&site[1], &rel32, 4);
+                        site[5] = 0x90;
+                        VirtualProtect(site, 6, oldProt, &oldProt);
+                        FlushInstructionCache(GetCurrentProcess(), site, 6);
+                        logger::info("PatchHotSpotD: +0x664A0B patched (rel32={})", rel32);
+                    }
+                }
+            }
+
             logger::info("PatchHotSpotNullChecks: done");
 #endif
         }
