@@ -1006,7 +1006,46 @@ namespace Patches::FormCaching
                 }
             }
 
-            // Only log first 5 non-handled crashes
+            // ─────────────────────────────────────────────────────────────
+            // CASE 3: Catch-all — skip instruction + zero result register.
+            // Handles remaining AVs that fall through all other cases:
+            //  - Out-of-bounds array access (e.g., [R14+RAX*8] past image)
+            //  - Unmapped heap/stack addresses
+            //  - Any other unresolvable access
+            //
+            // We skip the faulting instruction and zero RAX (the most common
+            // result register). This is "last resort" recovery — imprecise
+            // but better than crashing. The engine may null-check downstream.
+            // ─────────────────────────────────────────────────────────────
+            {
+                auto instrLen = x86_instr_len(ripBytes);
+                if (instrLen > 0 && instrLen <= 15) {
+                    pep->ContextRecord->Rip += instrLen;
+                    pep->ContextRecord->Rax = 0;
+
+                    static std::atomic<std::uint64_t> s_catchAllCount{ 0 };
+                    auto count = s_catchAllCount.fetch_add(1, std::memory_order_relaxed);
+                    if (count < 200) {
+                        const char* logPath = "C:\\SSEEngineFixesForWine_crash.log";
+                        FILE* f2 = nullptr;
+                        fopen_s(&f2, logPath, "a");
+                        if (f2) {
+                            fprintf(f2, "CATCH-ALL #%d: RIP=+0x%llX +%dB target=0x%llX RAX=0x%llX\n",
+                                count + 1, rip - sImgBase, instrLen,
+                                (unsigned long long)targetAddr,
+                                (unsigned long long)pep->ContextRecord->Rax);
+                            fflush(f2);
+                            fclose(f2);
+                        }
+                    }
+                    // Safety valve: after 10000 catch-all skips, stop handling
+                    // to prevent infinite loops from starving the process
+                    if (count < 10000)
+                        return EXCEPTION_CONTINUE_EXECUTION;
+                }
+            }
+
+            // Only log first 20 non-handled crashes
             if (g_crashLogCount.fetch_add(1, std::memory_order_relaxed) >= 20)
                 return EXCEPTION_CONTINUE_SEARCH;
 
