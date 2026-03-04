@@ -673,21 +673,58 @@ namespace Patches::FormCaching
         // ================================================================
         inline std::atomic<bool> g_crashLoggerActive{ false };
         inline std::atomic<int> g_crashLogCount{ 0 };
+        inline std::atomic<int> g_nullSkipCount{ 0 };
 
         inline LONG CALLBACK CrashLoggerVEH(PEXCEPTION_POINTERS pep)
         {
             if (!g_crashLoggerActive.load(std::memory_order_relaxed))
                 return EXCEPTION_CONTINUE_SEARCH;
 
-            // Only log access violations and fatal exceptions
             auto code = pep->ExceptionRecord->ExceptionCode;
-            if (code != EXCEPTION_ACCESS_VIOLATION &&
-                code != EXCEPTION_STACK_OVERFLOW &&
-                code != EXCEPTION_INT_DIVIDE_BY_ZERO &&
-                code != 0xC0000374 /* heap corruption */)
+            if (code != EXCEPTION_ACCESS_VIOLATION)
                 return EXCEPTION_CONTINUE_SEARCH;
 
-            // Only log first 5 crashes to avoid filling disk
+            ULONG_PTR targetAddr = 0;
+            if (pep->ExceptionRecord->NumberParameters >= 2)
+                targetAddr = pep->ExceptionRecord->ExceptionInformation[1];
+
+            // v1.22.34: Handle null-pointer form dereferences BEFORE logging.
+            // The AI evaluation chain dereferences null form pointers at
+            // multiple engine sites. Skip the faulting instruction — the
+            // destination register stays 0 and downstream null checks handle it.
+            //
+            // Only handle faults within SkyrimSE.exe image range.
+            if (targetAddr < 0x10000) {
+                static auto sImgBase = REL::Module::get().base();
+                static auto sImgEnd = [&]() {
+                    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(sImgBase);
+                    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(sImgBase + dos->e_lfanew);
+                    return sImgBase + nt->OptionalHeader.SizeOfImage;
+                }();
+                auto rip = pep->ContextRecord->Rip;
+                if (rip >= sImgBase && rip < sImgEnd) {
+                    const auto* ripBytes = reinterpret_cast<const std::uint8_t*>(rip);
+                    auto instrLen = x86_instr_len(ripBytes);
+                    pep->ContextRecord->Rip += instrLen;
+                    auto count = g_nullSkipCount.fetch_add(1, std::memory_order_relaxed);
+                    // Log first few to crash log file for diagnostics
+                    if (count < 10) {
+                        const char* logPath = "C:\\SSEEngineFixesForWine_crash.log";
+                        FILE* f2 = nullptr;
+                        fopen_s(&f2, logPath, "a");
+                        if (f2) {
+                            fprintf(f2, "NULL-SKIP #%d: RIP=0x%llX (+0x%llX) +%dB target=0x%llX RAX=0x%llX\n",
+                                count + 1, rip, rip - sImgBase, instrLen,
+                                (unsigned long long)targetAddr, pep->ContextRecord->Rax);
+                            fflush(f2);
+                            fclose(f2);
+                        }
+                    }
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+            }
+
+            // Only log first 5 non-handled crashes
             if (g_crashLogCount.fetch_add(1, std::memory_order_relaxed) >= 5)
                 return EXCEPTION_CONTINUE_SEARCH;
 
