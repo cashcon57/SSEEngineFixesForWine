@@ -73,15 +73,24 @@ namespace Patches::FormCaching
         inline std::atomic<std::uint64_t> g_formFixupCount{ 0 };
         // v1.22.27: Count of forms that faulted during InitItem (SEH-caught)
         inline std::atomic<std::uint64_t> g_initFaultCount{ 0 };
-        // v1.22.34: Zero page — VirtualAlloc'd committed page of zeros, used
-        // as a substitute for null form pointers. When the engine dereferences
-        // a null form pointer, the VEH replaces it with g_zeroPage, so the
-        // engine reads zeros from every field (formType=0, formFlags=0, etc.)
-        // and takes "nothing here" branches naturally. 64KB to cover all
-        // TESForm field offsets including large vtable offsets (up to +0x4B8).
-        // PAGE_READONLY: Writes to zero page fault and are skipped, keeping
-        // the page pristine (all zeros) across all VEH invocations.
+        // v1.22.34: Sentinel form page — a fake TESForm that looks "deleted"
+        // to the engine. VEH redirects null form pointers here. The engine
+        // reads kDeleted from formFlags and skips processing entirely.
+        //
+        // Layout (PAGE_READONLY, 64KB):
+        //   [0x0000]: vtable ptr → g_stubVtable (array of "ret 0" stubs)
+        //   [0x0010]: formFlags = 0x20 (kDeleted)
+        //   [0x0014]: formID = 0
+        //   [0x001A]: formType = 0
+        //   [0x04B8]: stub function ptr (for direct function pointer fields)
+        //   All other bytes: 0
+        //
+        // A companion "stub function" page (PAGE_EXECUTE_READ) holds
+        // `xor eax, eax; ret` — all virtual/function pointer calls return 0.
+        // A "stub vtable" page (PAGE_READONLY) holds 512 pointers to the stub.
         inline void* g_zeroPage = nullptr;
+        inline void* g_stubFuncPage = nullptr;
+        inline void* g_stubVtable = nullptr;
         inline DWORD64 g_zeroPageBase = 0;
         inline DWORD64 g_zeroPageEnd = 0;
         inline std::atomic<std::uint64_t> g_zeroPageUseCount{ 0 };
@@ -416,9 +425,9 @@ namespace Patches::FormCaching
             bool hasRex = false;
             if ((*ip & 0xF0) == 0x40) { hasRex = true; ++ip; }
 
-            // Consume legacy prefixes (operand-size, address-size, REP, segment)
+            // Consume legacy prefixes (operand-size, address-size, REP, LOCK, segment)
             bool has66 = false;
-            while (*ip == 0x66 || *ip == 0xF2 || *ip == 0xF3 ||
+            while (*ip == 0x66 || *ip == 0xF0 || *ip == 0xF2 || *ip == 0xF3 ||
                    *ip == 0x2E || *ip == 0x3E || *ip == 0x26 ||
                    *ip == 0x36 || *ip == 0x64 || *ip == 0x65) {
                 if (*ip == 0x66) has66 = true;
@@ -2222,23 +2231,69 @@ namespace Patches::FormCaching
                 }
 
                 // v1.22.34: Allocate zero page for null-form substitution.
-                // 64KB of committed zeros — used by VEH to replace null form
-                // pointers so the engine reads zeros instead of crashing.
-                // Allocate as RW, zero-fill, then protect as READONLY.
-                // The VEH skips writes to this page (CASE W), keeping it
-                // pristine across all exception handling invocations.
+                // ── Sentinel form infrastructure ──
+                // 1. Stub function page (PAGE_EXECUTE_READ): "xor eax,eax; ret"
+                g_stubFuncPage = VirtualAlloc(nullptr, 0x1000,
+                    MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+                if (g_stubFuncPage) {
+                    auto* code = reinterpret_cast<std::uint8_t*>(g_stubFuncPage);
+                    code[0] = 0x31; code[1] = 0xC0; // xor eax, eax
+                    code[2] = 0xC3;                   // ret
+                    DWORD oldProt = 0;
+                    VirtualProtect(g_stubFuncPage, 0x1000, PAGE_EXECUTE_READ, &oldProt);
+                    logger::info("  Stub function at 0x{:X}",
+                        reinterpret_cast<std::uintptr_t>(g_stubFuncPage));
+                }
+
+                // 2. Stub vtable (PAGE_READONLY): 512 entries → stub function
+                g_stubVtable = VirtualAlloc(nullptr, 0x1000,
+                    MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+                if (g_stubVtable && g_stubFuncPage) {
+                    auto* vt = reinterpret_cast<DWORD64*>(g_stubVtable);
+                    auto stubAddr = reinterpret_cast<DWORD64>(g_stubFuncPage);
+                    for (int i = 0; i < 512; ++i)
+                        vt[i] = stubAddr;
+                    DWORD oldProt = 0;
+                    VirtualProtect(g_stubVtable, 0x1000, PAGE_READONLY, &oldProt);
+                    logger::info("  Stub vtable at 0x{:X} (512 entries)",
+                        reinterpret_cast<std::uintptr_t>(g_stubVtable));
+                }
+
+                // 3. Sentinel form page (PAGE_READONLY, 64KB):
+                //    Fake TESForm with kDeleted flag, valid vtable, stub pointers.
+                //    Engine reads kDeleted and skips; virtual calls → stub → ret 0.
                 g_zeroPage = VirtualAlloc(nullptr, 0x10000,
                     MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
                 if (g_zeroPage) {
                     memset(g_zeroPage, 0, 0x10000);
+                    auto* page = reinterpret_cast<std::uint8_t*>(g_zeroPage);
+
+                    // Vtable pointer at offset 0x0 → stub vtable
+                    if (g_stubVtable) {
+                        auto vtAddr = reinterpret_cast<DWORD64>(g_stubVtable);
+                        memcpy(page + 0x00, &vtAddr, 8);
+                    }
+
+                    // formFlags at offset 0x10 = kDeleted (0x20)
+                    auto flags = static_cast<std::uint32_t>(0x20);
+                    memcpy(page + 0x10, &flags, 4);
+
+                    // Direct function pointer fields that the engine dereferences:
+                    // offset 0x4B8 (seen at +0x2ED880: call [rax+0x4B8])
+                    if (g_stubFuncPage) {
+                        auto stubAddr = reinterpret_cast<DWORD64>(g_stubFuncPage);
+                        memcpy(page + 0x4B8, &stubAddr, 8);
+                    }
+
                     DWORD oldProt = 0;
                     VirtualProtect(g_zeroPage, 0x10000, PAGE_READONLY, &oldProt);
                     g_zeroPageBase = reinterpret_cast<DWORD64>(g_zeroPage);
                     g_zeroPageEnd = g_zeroPageBase + 0x10000;
-                    logger::info("  Allocated 64KB zero page at 0x{:X} (PAGE_READONLY)",
-                        g_zeroPageBase);
+                    logger::info("  Sentinel form page at 0x{:X} (PAGE_READONLY, kDeleted=0x20, vtable=0x{:X})",
+                        g_zeroPageBase,
+                        g_stubVtable ? reinterpret_cast<std::uintptr_t>(g_stubVtable) : 0);
                 } else {
-                    logger::error("  Failed to allocate zero page!");
+                    logger::error("  Failed to allocate sentinel form page!");
                 }
 
                 // Install persistent form-reference fixup VEH
