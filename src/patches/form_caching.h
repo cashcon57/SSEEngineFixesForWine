@@ -65,6 +65,13 @@ namespace Patches::FormCaching
         inline std::atomic<bool> g_forceLoadInProgress{ false };
         inline std::atomic<std::uint64_t> g_vehSkipCount{ 0 };
 
+        // v1.22.27: Form-reference fixup VEH — persistent after ForceLoadAllForms.
+        // Catches access violations where a register holds a raw form ID
+        // (< 0x10000000) instead of a resolved pointer, resolves it via
+        // TESForm_GetFormByNumericId, and continues execution.
+        inline std::atomic<bool> g_formFixupActive{ false };
+        inline std::atomic<std::uint64_t> g_formFixupCount{ 0 };
+
         // v1.22.10: Enhanced ClearData diagnostic — dumps files list state
         // when ClearData fires, to see what the engine knew about before compile
         inline void DumpFilesListState(RE::TESDataHandler* a_self, const char* context)
@@ -455,6 +462,115 @@ namespace Patches::FormCaching
 
             g_vehSkipCount.fetch_add(1, std::memory_order_relaxed);
             return EXCEPTION_CONTINUE_EXECUTION;
+        }
+
+        // ================================================================
+        // v1.22.27: Form-Reference Fixup VEH
+        //
+        // After ForceLoadAllForms, some forms still contain raw form IDs
+        // (32-bit values < 0x10000000) stored in 64-bit pointer fields.
+        // These were set during TESForm::Load() when the referenced form
+        // hadn't been loaded yet. On Windows, a post-load resolution
+        // pass fixes these, but our ForceLoadAllForms path skips it.
+        //
+        // This VEH catches access violations where the target address
+        // looks like a form ID (0x100 <= addr < 0x10000000), finds which
+        // register holds that value, resolves it via our sharded cache,
+        // and patches the register to the resolved pointer.
+        //
+        // Crash pattern: `test dword ptr [rax+0x28], 0x3FF`
+        //   RAX = 0x5000823 → form ID 0x05000823
+        //   target = RAX + 0x28 = 0x500084B
+        //
+        // This VEH stays installed permanently after ForceLoadAllForms.
+        // ================================================================
+        inline LONG CALLBACK FormReferenceFixupVEH(PEXCEPTION_POINTERS pep)
+        {
+            if (!g_formFixupActive.load(std::memory_order_relaxed))
+                return EXCEPTION_CONTINUE_SEARCH;
+
+            if (pep->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION)
+                return EXCEPTION_CONTINUE_SEARCH;
+
+            // Get the faulting address
+            ULONG_PTR targetAddr = 0;
+            if (pep->ExceptionRecord->NumberParameters >= 2)
+                targetAddr = pep->ExceptionRecord->ExceptionInformation[1];
+
+            // Form IDs are 32-bit values with the top byte being the master index.
+            // A form ID used as a 64-bit pointer will be in range [0x100, 0x10000000).
+            // The faulting address may be offset from the base register
+            // (e.g., [rax+0x28]), so we check the actual target AND all registers.
+            // Reject anything in legit pointer ranges (> 0x10000000) or in the
+            // null page (< 0x100) — those are real crashes.
+            if (targetAddr >= 0x10000000 || targetAddr < 0x100)
+                return EXCEPTION_CONTINUE_SEARCH;
+
+            // Scan all general-purpose registers for a value that looks like a form ID.
+            // The register holding the form ID will be the base of the memory access.
+            // x86-64 register order in CONTEXT: Rax, Rcx, Rdx, Rbx, Rsp, Rbp, Rsi, Rdi, R8-R15
+            DWORD64* regs[] = {
+                &pep->ContextRecord->Rax,
+                &pep->ContextRecord->Rcx,
+                &pep->ContextRecord->Rdx,
+                &pep->ContextRecord->Rbx,
+                // Skip Rsp — never holds a form ID
+                &pep->ContextRecord->Rbp,
+                &pep->ContextRecord->Rsi,
+                &pep->ContextRecord->Rdi,
+                &pep->ContextRecord->R8,
+                &pep->ContextRecord->R9,
+                &pep->ContextRecord->R10,
+                &pep->ContextRecord->R11,
+                &pep->ContextRecord->R12,
+                &pep->ContextRecord->R13,
+                &pep->ContextRecord->R14,
+                &pep->ContextRecord->R15,
+            };
+            const char* regNames[] = {
+                "RAX", "RCX", "RDX", "RBX", "RBP", "RSI", "RDI",
+                "R8", "R9", "R10", "R11", "R12", "R13", "R14", "R15",
+            };
+
+            for (int i = 0; i < 15; ++i) {
+                DWORD64 val = *regs[i];
+
+                // Must look like a form ID: [0x100, 0x10000000)
+                if (val < 0x100 || val >= 0x10000000)
+                    continue;
+
+                // The target address should be at or near this register value
+                // (within a reasonable struct offset, say +/- 0x1000)
+                auto diff = static_cast<std::int64_t>(targetAddr) - static_cast<std::int64_t>(val);
+                if (diff < -0x1000 || diff > 0x1000)
+                    continue;
+
+                // This register holds what looks like a form ID. Resolve it.
+                auto formId = static_cast<RE::FormID>(val);
+                auto* resolved = TESForm_GetFormByNumericId(formId);
+
+                if (resolved) {
+                    auto count = g_formFixupCount.fetch_add(1, std::memory_order_relaxed);
+                    if (count < 20) {
+                        logger::warn("FormFixupVEH: {}=0x{:X} (formID 0x{:08X}) → 0x{:X} at RIP=0x{:X}",
+                            regNames[i], val, formId,
+                            reinterpret_cast<std::uintptr_t>(resolved),
+                            pep->ContextRecord->Rip);
+                    } else if (count == 20) {
+                        logger::warn("FormFixupVEH: suppressing further log messages (20 logged, more occurring)");
+                    }
+                    *regs[i] = reinterpret_cast<DWORD64>(resolved);
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+
+                // Form not in our cache — can't fix. Let it crash so we know.
+                logger::error("FormFixupVEH: {}=0x{:X} (formID 0x{:08X}) NOT FOUND in cache at RIP=0x{:X}",
+                    regNames[i], val, formId, pep->ContextRecord->Rip);
+                return EXCEPTION_CONTINUE_SEARCH;
+            }
+
+            // No register held a form ID — this is a different kind of crash
+            return EXCEPTION_CONTINUE_SEARCH;
         }
 
         // Forward declarations (defined after CloseTES hook)
@@ -873,7 +989,7 @@ namespace Patches::FormCaching
                 return;
             }
 
-            logger::info("=== ForceLoadAllForms (v1.22.26) ==="sv);
+            logger::info("=== ForceLoadAllForms (v1.22.27) ==="sv);
 
             // Log TDH state before reset
             logger::info("  TDH: loadingFiles={} hasDesiredFiles={} saveLoadGame={} clearingData={}",
@@ -999,7 +1115,7 @@ namespace Patches::FormCaching
             g_forceLoadInProgress.store(true, std::memory_order_release);
             auto* vehHandle = AddVectoredExceptionHandler(1, ForceLoadVEH);
 
-            logger::info(">>> Calling AE 13753(TDH*, false) with VEH null guard (v1.22.26) <<<");
+            logger::info(">>> Calling AE 13753(TDH*, false) with VEH null guard (v1.22.27) <<<");
             loadForms(tdh, false);
 
             RemoveVectoredExceptionHandler(vehHandle);
@@ -1023,7 +1139,7 @@ namespace Patches::FormCaching
             auto addFormDelta = addFormAfter - addFormBefore;
             auto openTESDelta = openTESAfter - openTESBefore;
 
-            logger::info("=== ForceLoadAllForms (v1.22.26) RESULTS ==="sv);
+            logger::info("=== ForceLoadAllForms (v1.22.27) RESULTS ==="sv);
             logger::info("  AddFormToDataHandler: {} → {} (+{})", addFormBefore, addFormAfter, addFormDelta);
             logger::info("  OpenTES calls: {} → {} (+{})", openTESBefore, openTESAfter, openTESDelta);
             logger::info("  TDH: nextID=0x{:08X} activeFile={}",
@@ -1076,7 +1192,7 @@ namespace Patches::FormCaching
             }
 
             // ==========================================================
-            // v1.22.26: Form Reference Resolution (InitItemImpl)
+            // v1.22.27: Form Reference Resolution (InitItemImpl)
             //
             // After loading forms from files, the engine normally runs a
             // separate pass that calls InitItemImpl() on every form to
@@ -1085,17 +1201,22 @@ namespace Patches::FormCaching
             // references (NPC→AI package, actor→race, weapon→enchantment)
             // as raw form IDs instead of resolved pointers.
             //
-            // This causes crashes on New Game: the engine dereferences
-            // e.g. RAX=0x5000823 (form ID 0x05000823) as a pointer,
-            // reading address 0x500084B — access violation.
+            // v1.22.26 iterated TESDataHandler::formArrays (365K forms),
+            // but the full hash table has 1.07M forms — ~700K were missed.
+            // The crash at RAX=0x5000823 persisted because BGSProcedureFollow
+            // (sub-object of TESPackage) wasn't reached.
             //
-            // Fix: iterate all forms in TESDataHandler::formArrays and
-            // call InitItem() (virtual → InitItemImpl, vtable index 0x13)
-            // to resolve all cross-references. We set kInitingForms on
-            // BGSSaveLoadGame to match the engine's expected state.
+            // v1.22.27: Iterate the FULL global form hash table via
+            // TESForm::GetAllForms() using raw scanning (proven approach
+            // from editor_id_cache.h). This covers ALL 1.07M forms.
+            //
+            // Additionally, install a persistent VEH (FormReferenceFixupVEH)
+            // that catches any remaining unresolved form IDs at point of use
+            // during gameplay — a safety net for references that InitItemImpl
+            // alone cannot resolve (e.g., nested procedure trees).
             // ==========================================================
             if (addFormDelta > 100) {
-                logger::info("=== InitItemImpl Phase (v1.22.26) ==="sv);
+                logger::info("=== InitItemImpl Phase (v1.22.27 — full hash table) ==="sv);
 
                 auto* saveLoadGame = RE::BGSSaveLoadGame::GetSingleton();
                 if (saveLoadGame) {
@@ -1105,23 +1226,70 @@ namespace Patches::FormCaching
                 }
 
                 std::uint64_t initCount = 0;
-                std::uint64_t nullCount = 0;
+                std::uint64_t skipCount = 0;
                 auto initStart = std::chrono::high_resolution_clock::now();
 
-                for (std::uint32_t i = 0;
-                     i < std::to_underlying(RE::FormType::Max); ++i)
-                {
-                    auto formType = static_cast<RE::FormType>(i);
-                    auto& formArray = tdh->GetFormArray(formType);
+                // Scan the FULL global form hash table (BSTHashMap<FormID, TESForm*>)
+                // using raw pointer arithmetic — same approach proven in editor_id_cache.h
+                const auto& [formMap, formLock] = RE::TESForm::GetAllForms();
+                if (formMap) {
+                    auto* mapRaw = reinterpret_cast<const std::uint8_t*>(formMap);
+                    auto capacity = *reinterpret_cast<const std::uint32_t*>(mapRaw + 0x0C);
+                    auto sentinel = *reinterpret_cast<const std::uintptr_t*>(mapRaw + 0x18);
+                    auto entriesPtr = *reinterpret_cast<const std::uintptr_t*>(mapRaw + 0x28);
 
-                    for (auto* form : formArray) {
-                        if (!form) {
-                            ++nullCount;
-                            continue;
+                    logger::info("  Hash table: capacity={}, sentinel=0x{:X}, entries=0x{:X}",
+                        capacity, sentinel, entriesPtr);
+
+                    if (capacity > 0 && capacity <= 0x1000000 && entriesPtr >= 0x10000) {
+                        auto imgBase = REL::Module::get().base();
+                        const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(imgBase);
+                        const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(imgBase + dos->e_lfanew);
+                        auto imgEnd = imgBase + nt->OptionalHeader.SizeOfImage;
+
+                        auto* entryBase = reinterpret_cast<const std::uint8_t*>(entriesPtr);
+
+                        for (std::uint32_t i = 0; i < capacity; ++i) {
+                            auto* entry = entryBase + i * 24;
+
+                            // Validate entry page every 4096 entries
+                            if (i % 4096 == 0) {
+                                if (IsBadReadPtr(entry, static_cast<UINT_PTR>(
+                                    std::min(std::size_t((capacity - i) * 24), std::size_t(4096 * 24)))))
+                                    break;
+                            }
+
+                            auto formPtr = *reinterpret_cast<const std::uintptr_t*>(entry + 8);
+                            if (formPtr == 0 || formPtr == sentinel ||
+                                formPtr < 0x10000 || formPtr > 0x7FFFFFFFFFFF)
+                            {
+                                ++skipCount;
+                                continue;
+                            }
+
+                            // Validate vtable is within SkyrimSE.exe image
+                            auto* formObj = reinterpret_cast<const std::uint8_t*>(formPtr);
+                            if (IsBadReadPtr(formObj, 0x20)) {
+                                ++skipCount;
+                                continue;
+                            }
+                            auto vtable = *reinterpret_cast<const std::uintptr_t*>(formObj);
+                            if (vtable < imgBase || vtable >= imgEnd) {
+                                ++skipCount;
+                                continue;
+                            }
+
+                            // Valid form — call InitItem
+                            auto* form = reinterpret_cast<RE::TESForm*>(
+                                const_cast<std::uint8_t*>(formObj));
+                            form->InitItem();
+                            ++initCount;
                         }
-                        form->InitItem();
-                        ++initCount;
+                    } else {
+                        logger::error("  Hash table layout invalid — skipping InitItemImpl");
                     }
+                } else {
+                    logger::error("  TESForm::GetAllForms() returned null — skipping InitItemImpl");
                 }
 
                 auto initElapsed = std::chrono::high_resolution_clock::now() - initStart;
@@ -1133,12 +1301,22 @@ namespace Patches::FormCaching
                     logger::info("  Cleared kInitingForms flag");
                 }
 
-                logger::info("  InitItemImpl: {} forms initialized, {} null entries skipped, {}ms",
-                    initCount, nullCount, initMs);
-                logger::info("=== END InitItemImpl Phase (v1.22.26) ==="sv);
+                logger::info("  InitItemImpl: {} forms initialized, {} entries skipped, {}ms",
+                    initCount, skipCount, initMs);
+
+                // Install persistent form-reference fixup VEH.
+                // This stays active for the rest of the session to catch
+                // any form IDs that InitItemImpl couldn't resolve (e.g.,
+                // nested procedure trees, lazy-loaded cross-references).
+                g_formFixupCount.store(0, std::memory_order_relaxed);
+                g_formFixupActive.store(true, std::memory_order_release);
+                AddVectoredExceptionHandler(1, FormReferenceFixupVEH);
+                logger::info("  Installed persistent FormReferenceFixupVEH");
+
+                logger::info("=== END InitItemImpl Phase (v1.22.27) ==="sv);
             }
 
-            logger::info("=== END ForceLoadAllForms (v1.22.26) ==="sv);
+            logger::info("=== END ForceLoadAllForms (v1.22.27) ==="sv);
 #else
             logger::info("ForceLoadAllForms: SE build — skipping (AE-only fix)"sv);
 #endif
