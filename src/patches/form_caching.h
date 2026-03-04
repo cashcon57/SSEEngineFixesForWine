@@ -311,18 +311,13 @@ namespace Patches::FormCaching
 
             TreeLodReferenceCaching::detail::ClearCache();
 
-            // v1.22.49: Set zero page to PAGE_READWRITE BEFORE calling
-            // original ClearData. ClearData iterates all forms and writes
-            // formFlags on sentinel-redirected forms, triggering ~7K VEH
-            // exceptions/sec with PAGE_READONLY. Setting writable first
-            // eliminates the flood entirely.
-            if (g_zeroPage && !g_zpWritable.load(std::memory_order_relaxed)) {
-                DWORD oldProt = 0;
-                VirtualProtect(g_zeroPage, 0x10000, PAGE_READWRITE, &oldProt);
-                g_zpWritable.store(true, std::memory_order_relaxed);
-                logger::info(">>> Pre-ClearData: zero page set to PAGE_READWRITE");
-            }
-
+            // v1.22.50: Do NOT set PAGE_READWRITE during ClearData.
+            // ClearData calls virtual functions on forms (destructors, cleanup).
+            // With PAGE_READWRITE, the vtable on the sentinel page gets
+            // corrupted by engine writes, and virtual calls enter infinite loops.
+            // The write-skip flood (~7K/s) under PAGE_READONLY is preferable
+            // to a hang. NOTE: manual "New Game" from UI does NOT call
+            // ClearData — only resetGame=true (auto_newgame) triggers this path.
             g_hk_ClearData.call(a_self);
 
             // Dump state after ClearData too
