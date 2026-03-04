@@ -73,6 +73,11 @@ namespace Patches::FormCaching
         inline std::atomic<std::uint64_t> g_formFixupCount{ 0 };
         // v1.22.27: Count of forms that faulted during InitItem (SEH-caught)
         inline std::atomic<std::uint64_t> g_initFaultCount{ 0 };
+        // v1.22.29: Sentinel form — zeroed block used when a form ID can't
+        // be resolved. The engine reads zeros from it (flags=0, no vtable
+        // calls) instead of crashing on the unresolved form ID.
+        alignas(64) inline std::uint8_t g_sentinelForm[0x400] = {};
+        inline std::atomic<std::uint64_t> g_sentinelUseCount{ 0 };
 
         // v1.22.10: Enhanced ClearData diagnostic — dumps files list state
         // when ClearData fires, to see what the engine knew about before compile
@@ -565,10 +570,17 @@ namespace Patches::FormCaching
                     return EXCEPTION_CONTINUE_EXECUTION;
                 }
 
-                // Form not in our cache — can't fix. Let it crash so we know.
-                logger::error("FormFixupVEH: {}=0x{:X} (formID 0x{:08X}) NOT FOUND in cache at RIP=0x{:X}",
-                    regNames[i], val, formId, pep->ContextRecord->Rip);
-                return EXCEPTION_CONTINUE_SEARCH;
+                // v1.22.29: Form not in cache — use sentinel (zeroed memory)
+                // instead of crashing. The engine reads flags=0 and moves on.
+                auto sentCount = g_sentinelUseCount.fetch_add(1, std::memory_order_relaxed);
+                if (sentCount < 20) {
+                    logger::warn("FormFixupVEH: {}=0x{:X} (formID 0x{:08X}) NOT FOUND → sentinel at RIP=0x{:X}",
+                        regNames[i], val, formId, pep->ContextRecord->Rip);
+                } else if (sentCount == 20) {
+                    logger::warn("FormFixupVEH: suppressing sentinel log messages (20 logged)");
+                }
+                *regs[i] = reinterpret_cast<DWORD64>(&g_sentinelForm[0]);
+                return EXCEPTION_CONTINUE_EXECUTION;
             }
 
             // No register held a form ID — this is a different kind of crash
