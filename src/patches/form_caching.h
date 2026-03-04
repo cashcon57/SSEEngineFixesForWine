@@ -2587,10 +2587,8 @@ namespace Patches::FormCaching
 
                 // ==========================================================
                 // Auto-New-Game for automated testing
-                // If C:\auto_newgame.flag exists, send Enter key after a
-                // short delay to start a new game from the main menu.
-                // Runs inside the game process so keybd_event is guaranteed
-                // to reach the Skyrim window.
+                // If C:\auto_newgame.flag exists, find the game window and
+                // send Enter key via PostMessage after a short delay.
                 // ==========================================================
                 {
                     FILE* flagFile = nullptr;
@@ -2602,14 +2600,35 @@ namespace Patches::FormCaching
                             Sleep(5000);
                             FILE* f = nullptr;
                             fopen_s(&f, "C:\\SSEEngineFixesForWine_crash.log", "a");
+
+                            // Find game window
+                            HWND hwnd = FindWindowA("Skyrim Special Edition", nullptr);
+                            if (!hwnd) hwnd = FindWindowA(nullptr, "Skyrim Special Edition");
                             if (f) {
-                                fprintf(f, "AUTO-NEWGAME: sending Down+Enter to select New Game\n");
+                                fprintf(f, "AUTO-NEWGAME: hwnd=%p, sending Enter via PostMessage\n", (void*)hwnd);
+                                fflush(f);
+                            }
+
+                            if (hwnd) {
+                                // Ensure window is foreground
+                                SetForegroundWindow(hwnd);
+                                SetFocus(hwnd);
+                                Sleep(200);
+                                // Send Enter via PostMessage (more reliable than keybd_event under Wine)
+                                PostMessageA(hwnd, 0x0100, 0x0D, 0x001C0001);  // WM_KEYDOWN, VK_RETURN
+                                Sleep(50);
+                                PostMessageA(hwnd, 0x0101, 0x0D, 0xC01C0001);  // WM_KEYUP, VK_RETURN
+                            } else {
+                                // Fallback: keybd_event
+                                keybd_event(0x0D, 0, 0, 0);
+                                Sleep(50);
+                                keybd_event(0x0D, 0, 0x0002, 0);  // KEYEVENTF_KEYUP
+                            }
+
+                            if (f) {
+                                fprintf(f, "AUTO-NEWGAME: key sent, waiting for game response...\n");
                                 fflush(f); fclose(f);
                             }
-                            // Press Enter to select New Game (first menu item)
-                            keybd_event(0x0D, 0, 0, 0);            // VK_RETURN = 0x0D
-                            Sleep(50);
-                            keybd_event(0x0D, 0, KEYEVENTF_KEYUP, 0);
                         }).detach();
                     }
                 }
