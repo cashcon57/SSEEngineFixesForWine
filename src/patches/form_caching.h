@@ -2603,13 +2603,18 @@ namespace Patches::FormCaching
                             FILE* f = nullptr;
                             fopen_s(&f, "C:\\SSEEngineFixesForWine_crash.log", "a");
                             if (f) {
-                                fprintf(f, "AUTO-NEWGAME: sending Enter key\n");
+                                fprintf(f, "AUTO-NEWGAME: sending Down+Enter to select New Game\n");
                                 fflush(f); fclose(f);
                             }
-                            // Send Enter key down + up
-                            keybd_event(VK_RETURN, 0, 0, 0);
+                            // Navigate: Down arrow (skip Continue → New Game)
+                            keybd_event(0x28, 0, 0, 0);            // VK_DOWN = 0x28
                             Sleep(50);
-                            keybd_event(VK_RETURN, 0, KEYEVENTF_KEYUP, 0);
+                            keybd_event(0x28, 0, KEYEVENTF_KEYUP, 0);
+                            Sleep(300);
+                            // Press Enter to select New Game
+                            keybd_event(0x0D, 0, 0, 0);            // VK_RETURN = 0x0D
+                            Sleep(50);
+                            keybd_event(0x0D, 0, KEYEVENTF_KEYUP, 0);
                         }).detach();
                     }
                 }
