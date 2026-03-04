@@ -306,6 +306,18 @@ namespace Patches::FormCaching
 
             // Dump state after ClearData too
             DumpFilesListState(a_self, "POST-ClearData");
+
+            // v1.22.42: After ClearData, recompile all plugins.
+            // During New Game (resetGame=true), ClearData clears compile
+            // indices. Under Wine, the engine's CompileFiles is skipped
+            // (the original 600-file bug), so without recompilation the
+            // engine can't load forms and hangs on the loading screen.
+            // Also reset AddForm counter so ForceLoadAllForms triggers
+            // again if kDataLoaded fires during the reload.
+            logger::info(">>> Post-ClearData: recompiling plugins for Wine reload");
+            g_addFormCalls.store(0, std::memory_order_relaxed);
+            ManuallyCompileFiles();
+            logger::info(">>> Post-ClearData: recompilation done");
         }
 
         inline SafetyHookInline g_hk_InitializeFormDataStructures;
