@@ -2596,58 +2596,80 @@ namespace Patches::FormCaching
                     fopen_s(&flagFile, "C:\\auto_newgame.flag", "r");
                     if (flagFile) {
                         fclose(flagFile);
-                        logger::info("  auto_newgame.flag found — will auto-start New Game in 5s");
+                        logger::info("  auto_newgame.flag found — polling for Main Menu (up to 180s)");
                         std::thread([]() {
-                            Sleep(5000);
                             FILE* f = nullptr;
                             fopen_s(&f, "C:\\SSEEngineFixesForWine_crash.log", "a");
 
+                            // Poll every 2s for up to 180s until Main Menu opens
+                            bool found = false;
+                            for (int attempt = 0; attempt < 90; ++attempt) {
+                                Sleep(2000);
+                                auto* ui = RE::UI::GetSingleton();
+                                if (ui && ui->IsMenuOpen("Main Menu")) {
+                                    if (f) {
+                                        fprintf(f, "AUTO-NEWGAME: Main Menu detected after %ds\n",
+                                            (attempt + 1) * 2);
+                                        fflush(f);
+                                    }
+                                    // Wait 2s for menu to fully initialize
+                                    Sleep(2000);
+                                    found = true;
+                                    break;
+                                }
+                                if (attempt % 15 == 0 && f) {
+                                    fprintf(f, "AUTO-NEWGAME: waiting for Main Menu (%ds)...\n",
+                                        (attempt + 1) * 2);
+                                    fflush(f);
+                                }
+                            }
+
+                            if (!found) {
+                                if (f) {
+                                    fprintf(f, "AUTO-NEWGAME: timeout — Main Menu never opened\n");
+                                    fflush(f); fclose(f);
+                                }
+                                return;
+                            }
+
                             auto* ui = RE::UI::GetSingleton();
-                            bool menuOpen = ui && ui->IsMenuOpen("Main Menu");
+                            auto mainMenu = ui ? ui->GetMenu("Main Menu") : nullptr;
+                            auto* movie = mainMenu ? mainMenu->uiMovie.get() : nullptr;
                             if (f) {
-                                fprintf(f, "AUTO-NEWGAME: UI=%p menuOpen=%d\n",
-                                    (void*)ui, (int)menuOpen);
+                                fprintf(f, "AUTO-NEWGAME: menu=%p movie=%p\n",
+                                    (void*)(mainMenu ? mainMenu.get() : nullptr), (void*)movie);
                                 fflush(f);
                             }
 
-                            if (menuOpen) {
-                                auto mainMenu = ui->GetMenu("Main Menu");
-                                auto* movie = mainMenu ? mainMenu->uiMovie.get() : nullptr;
+                            if (movie) {
+                                // Inject Enter key down event into Scaleform
+                                RE::GFxKeyEvent keyDown(
+                                    RE::GFxEvent::EventType::kKeyDown,
+                                    RE::GFxKey::kReturn,     // keyCode
+                                    13,                       // asciiCode (Enter)
+                                    13,                       // wCharCode
+                                    RE::GFxSpecialKeysState() // no modifiers
+                                );
+                                movie->HandleEvent(keyDown);
+
+                                Sleep(50);
+
+                                // Inject Enter key up event
+                                RE::GFxKeyEvent keyUp(
+                                    RE::GFxEvent::EventType::kKeyUp,
+                                    RE::GFxKey::kReturn,
+                                    13, 13,
+                                    RE::GFxSpecialKeysState()
+                                );
+                                movie->HandleEvent(keyUp);
+
                                 if (f) {
-                                    fprintf(f, "AUTO-NEWGAME: menu=%p movie=%p\n",
-                                        (void*)mainMenu.get(), (void*)movie);
+                                    fprintf(f, "AUTO-NEWGAME: GFx Enter injected into Main Menu\n");
                                     fflush(f);
-                                }
-                                if (movie) {
-                                    // Inject Enter key down event into Scaleform
-                                    RE::GFxKeyEvent keyDown(
-                                        RE::GFxEvent::EventType::kKeyDown,
-                                        RE::GFxKey::kReturn,     // keyCode
-                                        13,                       // asciiCode (Enter)
-                                        13,                       // wCharCode
-                                        RE::GFxSpecialKeysState() // no modifiers
-                                    );
-                                    movie->HandleEvent(keyDown);
-
-                                    Sleep(50);
-
-                                    // Inject Enter key up event
-                                    RE::GFxKeyEvent keyUp(
-                                        RE::GFxEvent::EventType::kKeyUp,
-                                        RE::GFxKey::kReturn,
-                                        13, 13,
-                                        RE::GFxSpecialKeysState()
-                                    );
-                                    movie->HandleEvent(keyUp);
-
-                                    if (f) {
-                                        fprintf(f, "AUTO-NEWGAME: GFx Enter injected into Main Menu\n");
-                                        fflush(f);
-                                    }
                                 }
                             } else {
                                 if (f) {
-                                    fprintf(f, "AUTO-NEWGAME: Main Menu not open, skipping\n");
+                                    fprintf(f, "AUTO-NEWGAME: no movie — can't inject\n");
                                     fflush(f);
                                 }
                             }
