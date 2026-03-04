@@ -616,7 +616,7 @@ namespace Patches::FormCaching
                     return EXCEPTION_CONTINUE_EXECUTION;
                 }
 
-                // v1.22.33: Form not in cache — let the crash happen cleanly.
+                // v1.22.34: Form not in cache — let the crash happen cleanly.
                 // Previous approaches (sentinel, instruction skip, zero+ZF)
                 // all caused cascading failures downstream. A clean crash
                 // at the original site gives better diagnostic information.
@@ -1058,7 +1058,7 @@ namespace Patches::FormCaching
         // loop at +0x11C then runs, loading all forms natively.
         // ================================================================
         // ================================================================
-        // v1.22.33: Binary patch at AE 29846+0x95 — targeted crash fix
+        // v1.22.34: Binary patch at AE 29846+0x95 — targeted crash fix
         // with form ID resolution.
         //
         // The instruction `test dword ptr [rax+0x28], 0x3FF` crashes when
@@ -1070,7 +1070,7 @@ namespace Patches::FormCaching
         //   3. If resolved: replace RAX, execute original TEST
         //   4. If not resolved: xor eax,eax + ZF=1, skip
         //
-        // v1.22.33: Now resolves form IDs instead of just zeroing RAX.
+        // v1.22.34: Now resolves form IDs instead of just zeroing RAX.
         // This prevents cascading null-pointer failures downstream.
         // ================================================================
         inline void PatchFormPointerValidation()
@@ -1456,7 +1456,7 @@ namespace Patches::FormCaching
             }
 
             // ==========================================================
-            // v1.22.33: Hex dump AE 13753 validation loop for future analysis.
+            // v1.22.34: Hex dump AE 13753 validation loop for future analysis.
             // The per-file validation at +0xE0 to +0x120 determines which
             // files get loaded. Dumping bytes helps reverse-engineer the
             // skip logic that blocks 1787 files under Wine.
@@ -1479,7 +1479,7 @@ namespace Patches::FormCaching
             }
 
             // ==========================================================
-            // v1.22.33: Multi-pass form loading.
+            // v1.22.34: Multi-pass form loading.
             //
             // After the first AE 13753 call, 1787 files are skipped
             // (compileIndex still 0xFF). The per-file validation function
@@ -1567,11 +1567,11 @@ namespace Patches::FormCaching
             // After loading forms, call InitItemImpl() on every form to
             // resolve stored form IDs into live pointers.
             //
-            // v1.22.33: Multi-pass InitItem — retry faulted forms after
+            // v1.22.34: Multi-pass InitItem — retry faulted forms after
             // the first pass, since more references may be resolvable.
             // ==========================================================
             if (addFormDelta > 100) {
-                logger::info("=== InitItemImpl Phase (v1.22.33 — multi-pass) ==="sv);
+                logger::info("=== InitItemImpl Phase (v1.22.34 — multi-pass) ==="sv);
 
                 auto* saveLoadGame = RE::BGSSaveLoadGame::GetSingleton();
                 if (saveLoadGame) {
@@ -1664,7 +1664,7 @@ namespace Patches::FormCaching
                 logger::info("  InitItem pass 1: {} initialized, {} faulted, {}ms",
                     initCount, faultedForms.size(), pass1Ms);
 
-                // v1.22.33: Retry faulted forms (up to 3 retry passes).
+                // v1.22.34: Retry faulted forms (up to 3 retry passes).
                 // After pass 1 resolves many references, previously-faulting
                 // forms may now succeed because their dependencies are resolved.
                 for (int retryPass = 2; retryPass <= 4 && !faultedForms.empty(); ++retryPass) {
@@ -1702,19 +1702,59 @@ namespace Patches::FormCaching
                 logger::info("  InitItemImpl total: {} initialized, {} permanently faulted, {}ms",
                     initCount, faultedForms.size(), totalMs);
 
+                // ==========================================================
+                // v1.22.34: Mark permanently faulted forms as kDeleted.
+                //
+                // The 179 faulted ActorCharacter forms have null internal
+                // pointers (race, base NPC, etc) that cause null-dereference
+                // cascades at MULTIPLE engine sites during New Game (AI
+                // package evaluation, etc). Patching individual crash sites
+                // is whack-a-mole — fixing one just moves the crash.
+                //
+                // Setting kDeleted (formFlags bit 0x20) tells the engine to
+                // skip these forms in ALL processing: AI, rendering, physics,
+                // cell attachment, save serialization, etc. The characters
+                // simply won't spawn, which is far better than crashing.
+                //
+                // We also set kDisabled (0x800) as belt-and-suspenders — some
+                // engine paths check kDisabled but not kDeleted.
+                // ==========================================================
+                if (!faultedForms.empty()) {
+                    constexpr std::uint32_t kDeleted  = 0x20;
+                    constexpr std::uint32_t kDisabled = 0x800;
+                    std::size_t flaggedCount = 0;
+
+                    for (auto* form : faultedForms) {
+                        if (!form) continue;
+                        auto oldFlags = form->formFlags;
+                        form->formFlags |= kDeleted | kDisabled;
+                        ++flaggedCount;
+
+                        if (flaggedCount <= 10) {
+                            logger::warn("  kDeleted+kDisabled: form 0x{:08X} type={} flags 0x{:08X} → 0x{:08X}",
+                                form->GetFormID(),
+                                std::to_underlying(form->GetFormType()),
+                                oldFlags,
+                                form->formFlags);
+                        }
+                    }
+
+                    logger::info("  Flagged {} permanently faulted forms as kDeleted+kDisabled", flaggedCount);
+                }
+
                 // Install persistent form-reference fixup VEH
                 g_formFixupCount.store(0, std::memory_order_relaxed);
                 g_formFixupActive.store(true, std::memory_order_release);
                 AddVectoredExceptionHandler(1, FormReferenceFixupVEH);
                 logger::info("  Installed persistent FormReferenceFixupVEH");
 
-                // v1.22.33: Binary patch at 29846+0x95 with form resolution.
+                // v1.22.34: Binary patch at 29846+0x95 with form resolution.
                 PatchFormPointerValidation();
 
-                logger::info("=== END InitItemImpl Phase (v1.22.33) ==="sv);
+                logger::info("=== END InitItemImpl Phase (v1.22.34) ==="sv);
             }
 
-            logger::info("=== END ForceLoadAllForms (v1.22.33) ==="sv);
+            logger::info("=== END ForceLoadAllForms (v1.22.34) ==="sv);
 #else
             logger::info("ForceLoadAllForms: SE build — skipping (AE-only fix)"sv);
 #endif
