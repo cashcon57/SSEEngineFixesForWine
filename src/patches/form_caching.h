@@ -97,6 +97,10 @@ namespace Patches::FormCaching
         inline std::atomic<std::uint64_t> g_zeroPageUseCount{ 0 };
         inline std::atomic<std::uint64_t> g_zeroPageWriteSkips{ 0 };
         inline std::atomic<std::uint64_t> g_catchAllCount{ 0 };
+        // v1.22.49: Track whether zero page is currently PAGE_READWRITE.
+        // Set true when we switch to writable (first FORM-ZEROPAGE or pre-ClearData),
+        // cleared when ForceLoadAllForms restores PAGE_READONLY.
+        inline std::atomic<bool> g_zpWritable{false};
         // v1.22.46: Main thread handle for watchdog RIP sampling
         inline HANDLE g_mainThreadHandle = nullptr;
         inline DWORD g_mainThreadId = 0;
@@ -307,23 +311,22 @@ namespace Patches::FormCaching
 
             TreeLodReferenceCaching::detail::ClearCache();
 
+            // v1.22.49: Set zero page to PAGE_READWRITE BEFORE calling
+            // original ClearData. ClearData iterates all forms and writes
+            // formFlags on sentinel-redirected forms, triggering ~7K VEH
+            // exceptions/sec with PAGE_READONLY. Setting writable first
+            // eliminates the flood entirely.
+            if (g_zeroPage && !g_zpWritable.load(std::memory_order_relaxed)) {
+                DWORD oldProt = 0;
+                VirtualProtect(g_zeroPage, 0x10000, PAGE_READWRITE, &oldProt);
+                g_zpWritable.store(true, std::memory_order_relaxed);
+                logger::info(">>> Pre-ClearData: zero page set to PAGE_READWRITE");
+            }
+
             g_hk_ClearData.call(a_self);
 
             // Dump state after ClearData too
             DumpFilesListState(a_self, "POST-ClearData");
-
-            // v1.22.48: Set zero page to PAGE_READWRITE during reload.
-            // ClearData → reload reprocesses all forms, writing formFlags
-            // on sentinel-redirected forms thousands of times. With
-            // PAGE_READONLY, each write triggers a VEH exception (~8K/10s),
-            // making loading 10x slower. PAGE_READWRITE lets writes through
-            // silently. We flip back to PAGE_READONLY in ForceLoadAllForms
-            // (after reload) to prevent vtable corruption during gameplay.
-            if (g_zeroPage) {
-                DWORD oldProt = 0;
-                VirtualProtect(g_zeroPage, 0x10000, PAGE_READWRITE, &oldProt);
-                logger::info(">>> Post-ClearData: zero page set to PAGE_READWRITE for fast reload");
-            }
 
             // v1.22.42: After ClearData, recompile all plugins.
             // During New Game (resetGame=true), ClearData clears compile
@@ -1110,6 +1113,18 @@ namespace Patches::FormCaching
                         DWORD64 zp = reinterpret_cast<DWORD64>(g_zeroPage);
                         auto offset = static_cast<std::int64_t>(targetAddr) - static_cast<std::int64_t>(val);
                         *regs[i] = zp; // Point to zero page
+
+                        // v1.22.49: Switch to PAGE_READWRITE on first redirect.
+                        // The engine will write to the sentinel form (formFlags
+                        // etc.) thousands of times during loading. With READONLY,
+                        // each write triggers a VEH exception. We switch to
+                        // writable here (after the early DLL writes at t<10s
+                        // have been safely write-skipped with READONLY).
+                        if (!g_zpWritable.load(std::memory_order_relaxed)) {
+                            DWORD oldProt = 0;
+                            VirtualProtect(g_zeroPage, 0x10000, PAGE_READWRITE, &oldProt);
+                            g_zpWritable.store(true, std::memory_order_relaxed);
+                        }
 
                         auto count = g_formIdSkipCount.fetch_add(1, std::memory_order_relaxed);
                         if (count < 50) {
@@ -2862,22 +2877,31 @@ namespace Patches::FormCaching
                 logger::info("=== END InitItemImpl Phase (v1.22.36) ==="sv);
             }
 
-            // v1.22.48: Restore PAGE_READONLY on the sentinel page.
-            // During ClearData/reload, we set it to PAGE_READWRITE so the
-            // engine can write formFlags without VEH overhead. Now that
-            // loading is done, lock it down to prevent vtable corruption
-            // during gameplay. Also restore the vtable pointer in case the
-            // engine overwrote offset 0x00 during reload.
+            // v1.22.49: Restore PAGE_READONLY on the sentinel page.
+            // During loading (initial + reload), we set PAGE_READWRITE to
+            // avoid the ~7K/s VEH write-skip flood. Now that loading is
+            // done, restore critical fields and lock it down to prevent
+            // vtable corruption during gameplay.
             if (g_zeroPage) {
                 // Restore critical fields: vtable and kDeleted flag
                 auto* zpBytes = reinterpret_cast<std::uint8_t*>(g_zeroPage);
                 auto stubVtable = reinterpret_cast<DWORD64>(g_stubVtable);
                 std::memcpy(&zpBytes[0x0000], &stubVtable, 8); // vtable
-                zpBytes[0x0010] = 0x20; // formFlags = kDeleted
+                // Restore formFlags = kDeleted (full 4 bytes to clear any
+                // engine writes that occurred while page was writable)
+                auto flags = static_cast<std::uint32_t>(0x20);
+                std::memcpy(&zpBytes[0x0010], &flags, 4);
+
+                // Also restore the stub function pointer at offset 0x4B8
+                if (g_stubFuncPage) {
+                    auto stubAddr = reinterpret_cast<DWORD64>(g_stubFuncPage);
+                    std::memcpy(&zpBytes[0x04B8], &stubAddr, 8);
+                }
 
                 DWORD oldProt = 0;
                 VirtualProtect(g_zeroPage, 0x10000, PAGE_READONLY, &oldProt);
-                logger::info("  Sentinel page restored to PAGE_READONLY (vtable refreshed)");
+                g_zpWritable.store(false, std::memory_order_relaxed);
+                logger::info("  Sentinel page restored to PAGE_READONLY (vtable+flags+stubs refreshed)");
             }
 
             logger::info("=== END ForceLoadAllForms (v1.22.36) ==="sv);
