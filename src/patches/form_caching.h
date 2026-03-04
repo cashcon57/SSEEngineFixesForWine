@@ -2632,44 +2632,19 @@ namespace Patches::FormCaching
                                 return;
                             }
 
-                            auto* ui = RE::UI::GetSingleton();
-                            auto mainMenu = ui ? ui->GetMenu("Main Menu") : nullptr;
-                            auto* movie = mainMenu ? mainMenu->uiMovie.get() : nullptr;
-                            if (f) {
-                                fprintf(f, "AUTO-NEWGAME: menu=%p movie=%p\n",
-                                    (void*)(mainMenu ? mainMenu.get() : nullptr), (void*)movie);
-                                fflush(f);
-                            }
-
-                            if (movie) {
-                                // Inject Enter key down event into Scaleform
-                                RE::GFxKeyEvent keyDown(
-                                    RE::GFxEvent::EventType::kKeyDown,
-                                    RE::GFxKey::kReturn,     // keyCode
-                                    13,                       // asciiCode (Enter)
-                                    13,                       // wCharCode
-                                    RE::GFxSpecialKeysState() // no modifiers
-                                );
-                                movie->HandleEvent(keyDown);
-
-                                Sleep(50);
-
-                                // Inject Enter key up event
-                                RE::GFxKeyEvent keyUp(
-                                    RE::GFxEvent::EventType::kKeyUp,
-                                    RE::GFxKey::kReturn,
-                                    13, 13,
-                                    RE::GFxSpecialKeysState()
-                                );
-                                movie->HandleEvent(keyUp);
-
+                            // Bypass UI entirely — set engine reset flags directly
+                            auto* main = RE::Main::GetSingleton();
+                            if (main) {
+                                main->resetGame = true;
+                                main->fullReset = true;
                                 if (f) {
-                                    fprintf(f, "AUTO-NEWGAME: GFx Enter injected into Main Menu\n");
+                                    fprintf(f, "AUTO-NEWGAME: set resetGame=true fullReset=true on Main@%p\n",
+                                        (void*)main);
                                     fflush(f);
                                 }
                             } else {
                                 if (f) {
-                                    fprintf(f, "AUTO-NEWGAME: no movie — can't inject\n");
+                                    fprintf(f, "AUTO-NEWGAME: RE::Main::GetSingleton() returned null\n");
                                     fflush(f);
                                 }
                             }
