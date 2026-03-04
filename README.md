@@ -30,6 +30,10 @@ Provides the same 38 bug fixes and 14 patches as the original, rewritten to work
   - [RELOCATION_ID SE→AE Is Not a Fixed Offset](#relocation_id-seae-is-not-a-fixed-offset)
   - [Runtime Code Scanning Technique](#runtime-code-scanning-technique)
   - [Wine-Specific Behaviors](#wine-specific-behaviors)
+  - [Post-Load Crash Fix Infrastructure](#post-load-crash-fix-infrastructure)
+  - [The 179 Faulted ActorCharacter Forms](#the-179-faulted-actorcharacter-forms)
+  - [Form-ID-as-Pointer Bug Under Wine](#form-id-as-pointer-bug-under-wine)
+  - [Vectored Exception Handler Architecture](#vectored-exception-handler-architecture)
 - [Who Else This Helps](#who-else-this-helps)
 - [Diagnostic Version History](#diagnostic-version-history)
 - [Credits](#credits)
@@ -530,6 +534,121 @@ Behaviors confirmed under Wine/CrossOver/Proton that differ from native Windows:
 | **MessageBox behind fullscreen window** | Win32 `MessageBoxA/W` calls from within a fullscreen DirectX window render behind it under CrossOver/Proton. The dialog exists and waits, but is invisible and unclickable. |
 | **`_setmaxstdio` behaves correctly** | Wine's `ucrtbase` implements `_setmaxstdio` and the game CRT handles 2000+ open files after calling it. No Wine-specific limit beyond this has been observed. |
 | **`kActive` flag requires CompileFiles** | `TESFile::RecordFlag::kActive` is set by CompileFiles, not on file construction. Don't use it to determine plugin enabled status — parse `plugins.txt` instead. |
+| **Form-ID-as-pointer fields** | Wine's loading path skips post-load reference resolution passes, leaving raw 32-bit form IDs in 64-bit pointer fields. The engine crashes when dereferencing these (addresses in 0–256MB range). Requires VEH or code-cave interception. See [Form-ID-as-Pointer Bug](#form-id-as-pointer-bug-under-wine). |
+| **InitItem faults on ESL actors** | 179 ActorCharacter forms from ESL-flagged mods fault during `InitItem()` due to unresolved internal references (null race, null base NPC). These must be flagged kDeleted to prevent AI evaluation crashes. See [The 179 Faulted ActorCharacter Forms](#the-179-faulted-actorcharacter-forms). |
+| **SKSE plugin load order matters** | Wine's `readdir()` on macOS APFS returns entries sorted alphabetically. SKSE enumerates `*.dll` in the Plugins directory using `readdir()`. To ensure this mod's `kDataLoaded` handler runs before other plugins, the DLL is named `0_SSEEngineFixesForWine.dll` (sorts first). |
+
+---
+
+### Post-Load Crash Fix Infrastructure
+
+After forms are loaded and the game reaches main menu, starting a New Game triggers a cascade of crashes in the engine's AI evaluation chain. These are caused by two distinct classes of bug, both Wine-specific:
+
+1. **Faulted forms with null internal pointers** — 179 ActorCharacter forms (type 0x3E) fail during `TESForm::InitItem()` due to null race/base NPC references. When the engine later processes these forms (AI packages, spawn, etc.), it dereferences null pointers.
+
+2. **Form IDs stored in pointer-sized fields** — Wine's form loading path leaves raw 32-bit form IDs in 64-bit pointer fields that should contain resolved `TESForm*` pointers. When the engine dereferences these "pointers," it accesses addresses in the 0–256MB range (the numeric value of the form ID), which are not valid heap addresses.
+
+The fix is a multi-layered approach: flag faulted forms as deleted (preventing the engine from processing them), install a code cave at known crash sites for form-ID-as-pointer resolution, and a consolidated Vectored Exception Handler (VEH) that catches remaining null-pointer and form-ID crashes at runtime.
+
+---
+
+### The 179 Faulted ActorCharacter Forms
+
+After `ForceLoadAllForms` loads ~1,069,819 forms into the hash table, each form's `InitItem()` virtual function (vtable slot 0x13) is called to initialize internal references (race, base NPC, attached scripts, etc.).
+
+For 179 forms — all of type 62 (`TESObjectREFR` subclass `Character`, vtable `0x1418A5558`) — `InitItem` faults with a structured exception. These forms were loaded from ESL-flagged plugin files (form IDs in the `0xFExxxxxx` range) and contain internal pointer fields that reference forms which either weren't loaded or weren't resolved during the Wine-specific loading path.
+
+**SEH-isolated InitItem:**
+
+```cpp
+inline bool SafeInitItem(RE::TESForm* form) noexcept {
+    __try {
+        form->InitItem();  // vtable[0x13]
+        return true;
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+```
+
+**Multi-pass retry:** After the first pass, faulted forms are retried in a second pass (in case dependencies loaded out of order). All 179 forms fault again — the issue is permanent, not ordering-dependent.
+
+**kDeleted flagging:** After retry exhaustion, each faulted form gets `formFlags |= kDeleted (0x20) | kDisabled (0x800)`. The engine checks `kDeleted` before processing forms in AI evaluation, rendering, physics, and most gameplay systems. This prevents the engine from attempting to use forms with null internal pointers.
+
+```
+InitItemImpl total: 1,069,640 initialized, 179 permanently faulted
+Flagged 179 permanently faulted forms as kDeleted+kDisabled
+```
+
+**Why this happens:** On native Windows, `CompileFiles` + the standard loading loop resolves all internal form references before `InitItem`. Under Wine, our `ManuallyCompileFiles` + `ForceLoadAllForms` path may load forms in a different order or skip reference resolution passes that the standard path performs. The 179 faulted forms are collateral — they're real game forms (placed actors from mods) that can't initialize because their dependencies weren't resolved.
+
+---
+
+### Form-ID-as-Pointer Bug Under Wine
+
+Skyrim stores references between forms as pointer-sized fields in memory. During form loading, these fields are temporarily set to the **form ID** (a 32-bit integer) of the referenced form, with the expectation that a post-load resolution pass will replace each form ID with the actual `TESForm*` pointer.
+
+Under Wine with the `ForceLoadAllForms` path, some of these resolution passes are skipped. The result: 64-bit pointer fields contain 32-bit form IDs zero-extended to 64 bits. When the engine dereferences these "pointers," the CPU reads memory at addresses like `0x0524D5B5` (a valid form ID value but an invalid heap address).
+
+**Crash pattern:**
+
+```
+SkyrimSE.exe+0x49CAF2: lock inc dword ptr [rax+0x28]
+  RAX = 0x000000000524D5B5  ← form ID, not a pointer!
+  Target = 0x524D5DD         ← RAX + 0x28
+```
+
+The value `0x0524D5B5` is form ID with compile index 5 (ccasvsse001-almsivi.esm), local ID 0x24D5B5. This form may not exist in the hash table (Creation Club ESM with missing form records), causing resolution to fail.
+
+**Detection heuristic:** In a 64-bit process, heap pointers are >> 0x1'0000'0000 (e.g., `0x21A...`). Any pointer-sized value < 0xFF000000 that's being dereferenced is almost certainly a form ID, not a pointer. The offset from the target address to the register value (e.g., `0x524D5DD - 0x524D5B5 = 0x28`) corresponds to a known struct field offset.
+
+**Binary patch (code cave at AE 29846+0x95):** The most common crash site (`test dword ptr [rax+0x28], 0x3FF`) is patched at load time with a code cave that:
+1. Checks if the high 32 bits of RAX are zero
+2. If so, calls `GetFormByNumericId(RAX)` to resolve the form ID
+3. If resolved, replaces RAX with the real pointer
+4. If not resolved, zeros RAX
+
+Other crash sites are handled by the VEH (see below).
+
+---
+
+### Vectored Exception Handler Architecture
+
+A consolidated Vectored Exception Handler handles crashes that escape the code cave and kDeleted flagging:
+
+```
+CrashLoggerVEH (priority 1, registered last → called first)
+├── CASE 1: Null pointer (targetAddr < 0x10000)
+│   ├── CMP/TEST instruction → skip + clear ZF ("not equal")
+│   ├── CALL indirect → skip + zero RAX (null return)
+│   └── Other → skip only
+├── CASE 2: Form-ID-as-pointer (targetAddr < 0xFF000000)
+│   ├── Scan all GPRs for values in [0x100, 0xFF000000)
+│   │   near targetAddr (within ±0x1000)
+│   ├── If form found in hash table → replace register, retry instruction
+│   └── If form NOT found → skip instruction + zero bad register
+└── CASE 3: Unknown crash → log registers + stack + RIP bytes
+```
+
+**VEH priority ordering:** Windows VEH with priority 1 calls the most recently registered handler first. `CrashLoggerVEH` is registered after `FormReferenceFixupVEH`, so it fires first and handles all three cases before `FormReferenceFixupVEH` ever sees them.
+
+**Instruction classification:** `classifyInstruction()` decodes x86 prefixes (REX, LOCK, 66h) and the opcode to determine whether the faulting instruction is a CMP/TEST (flag-setting), CALL indirect (return-value-producing), or other. This determines the correct side effects when skipping:
+
+| Instruction Type | Skip Side Effect | Rationale |
+|-----------------|------------------|-----------|
+| `cmp byte ptr [rax+0x1A], 0x2B` | Clear ZF, set CF | "Not NPC" → engine skips NPC-specific processing |
+| `call [rax+0x4B8]` | Zero RAX | Null return from vtable call; callers often null-check |
+| `lock inc [rax+0x28]` | (none needed) | Refcount increment; next instruction overwrites RAX |
+
+**Observed crash sequence (New Game with GTS 3710 plugins):**
+
+```
+1. +0x32D146: cmp byte ptr [rax+0x1A], 0x2B  — RAX=0 (null form ptr)     ×4
+2. +0x2ED880: call [rax+0x4B8]               — RAX=0 (null vtable)       ×3
+3. +0x49CAF2: lock inc dword ptr [rax+0x28]  — RAX=0x524D5B5 (form ID)   ×1
+```
+
+Without the VEH, the game crashes at step 1. With null-skip only, it crashes at step 3. With the full consolidated VEH (null-skip + form-ID resolution/skip), the crash is handled and execution continues.
 
 ---
 
@@ -628,6 +747,13 @@ The versionlib hash format documented in [Address Library: versionlib Binary For
 | v1.22.23 | Added `suppress_address_library_dialog` — hooks `MessageBoxA/W` in `user32.dll` to auto-dismiss SKSE Address Library warning dialog that renders invisibly behind CrossOver fullscreen |
 | v1.22.24 | Suppress SKSE Address Library warning dialog for AE builds. Confirmed with Gate to Sovngarde (1720+ plugins, 3710 total compiled files, 1,069,819 forms): main menu in 117s. |
 | v1.22.25 | Replace `HeapAlloc`/`HeapFree` with [mimalloc](https://github.com/microsoft/mimalloc) in `bReplaceAllocator`. Eliminates the global serialized heap lock; per-thread caches reduce allocation contention during concurrent form loading. Expected 10–30% faster load times for large modlists vs HeapAlloc. |
+| v1.22.26 | Editor ID cache: Wine-safe population at `kDataLoaded` using existing engine editor-ID map (380,238 entries). Diagnostic phase: brute-force form lookup sweeps, NativeLookup via game function, TDH validation. |
+| v1.22.27 | SEH-isolated `InitItem` — wraps each form's `InitItem()` in `__try/__except` to catch null-race/null-NPC crashes. Multi-pass retry for faulted forms. FormReferenceFixupVEH: catches form-ID-as-pointer access violations, scans all GPRs for form ID values, resolves via `GetFormByNumericId`. |
+| v1.22.28 | ForceLoadAllForms multi-pass: after initial load (1923 of 3710 files), re-compile skipped files and call AE 13753 again. Pass 2 processed all 1787 files but added 0 new forms (they're override/patch files with no independent records). |
+| v1.22.29–31 | VEH experiments: sentinel form objects, instruction skip with zero+ZF, function-level bailout. All caused cascading failures — the AI evaluation chain is deeply nested and skipping individual instructions or inserting sentinels corrupts downstream state. |
+| v1.22.32 | PatchFormPointerValidation: binary code cave at AE 29846+0x95 (`test dword ptr [rax+0x28], 0x3FF`). If RAX looks like a form ID (high 32 bits = 0), calls `GetFormByNumericId` to resolve. If resolved, uses real pointer; if not, zeros RAX. 136-byte code cave at dynamically allocated page. |
+| v1.22.33 | Identified 179 permanently faulted ActorCharacter forms (type 62). All from ESL-flagged mods. `InitItem` retry has no effect — the fault is permanent, not ordering-dependent. Crash sites at +0x32D146 (`cmp byte ptr [rax+0x1A], 0x2B`), +0x2ED880 (`call [rax+0x4B8]`), +0x49CAF2 (`lock inc [rax+0x28]`). |
+| v1.22.34 | **kDeleted flagging** of 179 faulted forms (`formFlags \|= 0x20 \| 0x800`). **CrashLoggerVEH** with file-based crash diagnostics (`C:\SSEEngineFixesForWine_crash.log`). **Consolidated VEH**: null-pointer skip with instruction classification (CMP→clear ZF, CALL→zero RAX), form-ID-as-pointer resolution/skip, register zeroing for unresolvable form IDs. |
 
 ---
 
