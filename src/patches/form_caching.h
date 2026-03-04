@@ -786,19 +786,25 @@ namespace Patches::FormCaching
             const auto* ripBytes = reinterpret_cast<const std::uint8_t*>(rip);
 
             // ─────────────────────────────────────────────────────────────
-            // CASE 1: Null pointer dereference (targetAddr < 0x10000)
+            // CASE 1: Invalid pointer dereference — zero page substitution
+            //
+            // Covers TWO scenarios:
+            //  a) Null pointer: targetAddr < 0x10000 (register is near 0)
+            //  b) Garbage pointer: targetAddr > 0x7FFFFFFFFFFF (above
+            //     user-mode VA space on Windows x64, e.g. 0xFFFFFFFF00000008)
+            //
+            // These arise because the engine reads zero from the zero page,
+            // then combines it with other registers (OR, shift, etc.)
+            // producing invalid kernel-space addresses.
             //
             // Instead of skipping instructions (which corrupts control flow),
-            // replace the null register with g_zeroPage and RETRY the
+            // replace the bad register with g_zeroPage and RETRY the
             // instruction. The engine reads zeros from every field and
-            // takes "nothing here" branches naturally — no flag corruption,
-            // no whack-a-mole instruction skipping.
-            //
-            // We find which register caused the null dereference by
-            // checking if reg + small_offset == targetAddr for each GPR.
+            // takes "nothing here" branches naturally.
             // ─────────────────────────────────────────────────────────────
-            if (targetAddr < 0x10000 && g_zeroPage) {
-                // Find the null register that caused this dereference
+            bool isNullAccess = (targetAddr < 0x10000);
+            bool isHighInvalid = (targetAddr > 0x00007FFFFFFFFFFFULL);
+            if ((isNullAccess || isHighInvalid) && g_zeroPage) {
                 DWORD64 zp = reinterpret_cast<DWORD64>(g_zeroPage);
                 DWORD64* gprs[] = {
                     &pep->ContextRecord->Rax,
@@ -820,38 +826,55 @@ namespace Patches::FormCaching
                 };
 
                 bool patched = false;
-                for (int i = 0; i < 15; ++i) {
-                    DWORD64 val = *gprs[i];
-                    // Check if this null register + small offset == targetAddr
-                    if (val < 0x100 && targetAddr >= val &&
-                        targetAddr - val < 0x10000) {
-                        *gprs[i] = zp + val; // Redirect to zero page at same offset base
-                        patched = true;
-                        break;
+                if (isNullAccess) {
+                    // Null pointer: find register near zero
+                    for (int i = 0; i < 15; ++i) {
+                        DWORD64 val = *gprs[i];
+                        if (val < 0x100 && targetAddr >= val &&
+                            targetAddr - val < 0x10000) {
+                            *gprs[i] = zp + val;
+                            patched = true;
+                            break;
+                        }
+                    }
+                } else {
+                    // High-invalid: find register with invalid high bits
+                    // that when offset-adjusted matches targetAddr
+                    for (int i = 0; i < 15; ++i) {
+                        DWORD64 val = *gprs[i];
+                        if (val <= 0x00007FFFFFFFFFFFULL)
+                            continue; // Valid user-mode address, skip
+                        auto diff = static_cast<std::int64_t>(targetAddr) -
+                                    static_cast<std::int64_t>(val);
+                        if (diff >= -0x10000 && diff <= 0x10000) {
+                            *gprs[i] = zp; // Replace with zero page base
+                            patched = true;
+                            break;
+                        }
                     }
                 }
 
                 if (!patched) {
-                    // Fallback: if we can't find the null register,
-                    // just set RAX to zero page (most common case)
+                    // Fallback: set RAX to zero page (most common target)
                     pep->ContextRecord->Rax = zp;
                     patched = true;
                 }
 
                 auto count = g_zeroPageUseCount.fetch_add(1, std::memory_order_relaxed);
-                if (count < 50) {
+                if (count < 200) {
                     const char* logPath = "C:\\SSEEngineFixesForWine_crash.log";
                     FILE* f2 = nullptr;
                     fopen_s(&f2, logPath, "a");
                     if (f2) {
-                        fprintf(f2, "ZERO-PAGE #%d: RIP=+0x%llX target=0x%llX → zeroPage=0x%llX\n",
+                        fprintf(f2, "ZERO-PAGE #%d: RIP=+0x%llX target=0x%llX %s → zeroPage=0x%llX\n",
                             count + 1, rip - sImgBase,
-                            (unsigned long long)targetAddr, (unsigned long long)zp);
+                            (unsigned long long)targetAddr,
+                            isNullAccess ? "null" : "high-invalid",
+                            (unsigned long long)zp);
                         fflush(f2);
                         fclose(f2);
                     }
                 }
-                // Retry the instruction — it now reads from the zero page
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
 
@@ -943,7 +966,7 @@ namespace Patches::FormCaching
             }
 
             // Only log first 5 non-handled crashes
-            if (g_crashLogCount.fetch_add(1, std::memory_order_relaxed) >= 5)
+            if (g_crashLogCount.fetch_add(1, std::memory_order_relaxed) >= 20)
                 return EXCEPTION_CONTINUE_SEARCH;
 
             // Write to C:\ root (guaranteed known Wine path)
