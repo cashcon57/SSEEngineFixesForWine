@@ -2587,8 +2587,9 @@ namespace Patches::FormCaching
 
                 // ==========================================================
                 // Auto-New-Game for automated testing
-                // If C:\auto_newgame.flag exists, find the game window and
-                // send Enter key via PostMessage after a short delay.
+                // If C:\auto_newgame.flag exists, use SendInput (the most
+                // reliable Win32 input API) to send Enter to start New Game.
+                // Also try multiple methods as fallbacks.
                 // ==========================================================
                 {
                     FILE* flagFile = nullptr;
@@ -2605,28 +2606,45 @@ namespace Patches::FormCaching
                             HWND hwnd = FindWindowA("Skyrim Special Edition", nullptr);
                             if (!hwnd) hwnd = FindWindowA(nullptr, "Skyrim Special Edition");
                             if (f) {
-                                fprintf(f, "AUTO-NEWGAME: hwnd=%p, sending Enter via PostMessage\n", (void*)hwnd);
+                                fprintf(f, "AUTO-NEWGAME: hwnd=%p\n", (void*)hwnd);
                                 fflush(f);
                             }
 
                             if (hwnd) {
-                                // Ensure window is foreground
                                 SetForegroundWindow(hwnd);
                                 SetFocus(hwnd);
-                                Sleep(200);
-                                // Send Enter via PostMessage (more reliable than keybd_event under Wine)
-                                PostMessageA(hwnd, 0x0100, 0x0D, 0x001C0001);  // WM_KEYDOWN, VK_RETURN
-                                Sleep(50);
-                                PostMessageA(hwnd, 0x0101, 0x0D, 0xC01C0001);  // WM_KEYUP, VK_RETURN
-                            } else {
-                                // Fallback: keybd_event
-                                keybd_event(0x0D, 0, 0, 0);
-                                Sleep(50);
-                                keybd_event(0x0D, 0, 0x0002, 0);  // KEYEVENTF_KEYUP
+                                Sleep(500);
                             }
 
+                            // Method 1: SendInput (most reliable for games)
+                            INPUT inputs[2] = {};
+                            inputs[0].type = INPUT_KEYBOARD;
+                            inputs[0].ki.wVk = 0x0D;  // VK_RETURN
+                            inputs[0].ki.wScan = 0x1C; // Enter scan code
+                            inputs[1].type = INPUT_KEYBOARD;
+                            inputs[1].ki.wVk = 0x0D;
+                            inputs[1].ki.wScan = 0x1C;
+                            inputs[1].ki.dwFlags = 0x0002; // KEYEVENTF_KEYUP
+                            UINT sent = SendInput(2, inputs, sizeof(INPUT));
                             if (f) {
-                                fprintf(f, "AUTO-NEWGAME: key sent, waiting for game response...\n");
+                                fprintf(f, "AUTO-NEWGAME: SendInput sent %u events\n", sent);
+                                fflush(f);
+                            }
+
+                            // Method 2: Also try PostMessage with WM_CHAR (Enter = 0x0D)
+                            if (hwnd) {
+                                Sleep(200);
+                                PostMessageA(hwnd, 0x0102, 0x0D, 0); // WM_CHAR, Enter
+                            }
+
+                            // Method 3: Also try keybd_event as last resort
+                            Sleep(200);
+                            keybd_event(0x0D, 0x1C, 0, 0);
+                            Sleep(50);
+                            keybd_event(0x0D, 0x1C, 0x0002, 0);
+
+                            if (f) {
+                                fprintf(f, "AUTO-NEWGAME: all input methods tried\n");
                                 fflush(f); fclose(f);
                             }
                         }).detach();
