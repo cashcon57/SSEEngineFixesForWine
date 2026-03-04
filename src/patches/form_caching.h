@@ -650,7 +650,11 @@ namespace Patches::FormCaching
         inline LONG WINAPI CrashLoggerFilter(PEXCEPTION_POINTERS pep)
         {
             // Write crash info directly to file (bypass spdlog for reliability)
-            auto logPath = std::string(getenv("USERPROFILE") ? getenv("USERPROFILE") : "C:\\");
+            char* userProfile = nullptr;
+            std::size_t envLen = 0;
+            _dupenv_s(&userProfile, &envLen, "USERPROFILE");
+            auto logPath = std::string(userProfile ? userProfile : "C:\\");
+            free(userProfile);
             logPath += "\\My Documents\\My Games\\Skyrim Special Edition\\SKSE\\SSEEngineFixesForWine_crash.log";
 
             FILE* f = nullptr;
