@@ -79,8 +79,13 @@ namespace Patches::FormCaching
         // engine reads zeros from every field (formType=0, formFlags=0, etc.)
         // and takes "nothing here" branches naturally. 64KB to cover all
         // TESForm field offsets including large vtable offsets (up to +0x4B8).
+        // PAGE_READONLY: Writes to zero page fault and are skipped, keeping
+        // the page pristine (all zeros) across all VEH invocations.
         inline void* g_zeroPage = nullptr;
+        inline DWORD64 g_zeroPageBase = 0;
+        inline DWORD64 g_zeroPageEnd = 0;
         inline std::atomic<std::uint64_t> g_zeroPageUseCount{ 0 };
+        inline std::atomic<std::uint64_t> g_zeroPageWriteSkips{ 0 };
         // Legacy sentinel (kept for FormReferenceFixupVEH compatibility)
         alignas(64) inline std::uint8_t g_sentinelForm[0x400] = {};
         inline std::atomic<std::uint64_t> g_sentinelUseCount{ 0 };
@@ -737,8 +742,44 @@ namespace Patches::FormCaching
                 return EXCEPTION_CONTINUE_SEARCH;
 
             ULONG_PTR targetAddr = 0;
-            if (pep->ExceptionRecord->NumberParameters >= 2)
+            ULONG_PTR accessType = 0; // 0=read, 1=write, 8=DEP
+            if (pep->ExceptionRecord->NumberParameters >= 2) {
+                accessType = pep->ExceptionRecord->ExceptionInformation[0];
                 targetAddr = pep->ExceptionRecord->ExceptionInformation[1];
+            }
+
+            // ─────────────────────────────────────────────────────────────
+            // CASE W: Write to zero page — skip the instruction.
+            // The zero page is PAGE_READONLY. When the engine tries to
+            // write to a "form" that's actually our zero page, we skip
+            // the write instruction to keep the page pristine (all zeros).
+            // This prevents cross-contamination between VEH invocations.
+            // ─────────────────────────────────────────────────────────────
+            if (accessType == 1 && g_zeroPage &&
+                targetAddr >= g_zeroPageBase &&
+                targetAddr < g_zeroPageEnd) {
+                auto rip2 = pep->ContextRecord->Rip;
+                const auto* ripBytes2 = reinterpret_cast<const std::uint8_t*>(rip2);
+                if (!IsBadReadPtr(ripBytes2, 16)) {
+                    auto instrLen = x86_instr_len(ripBytes2);
+                    pep->ContextRecord->Rip += instrLen;
+
+                    auto count = g_zeroPageWriteSkips.fetch_add(1, std::memory_order_relaxed);
+                    if (count < 200) {
+                        const char* logPath = "C:\\SSEEngineFixesForWine_crash.log";
+                        FILE* f2 = nullptr;
+                        fopen_s(&f2, logPath, "a");
+                        if (f2) {
+                            fprintf(f2, "ZERO-WRITE-SKIP #%d: RIP=+0x%llX target=0x%llX +%dB\n",
+                                count + 1, rip2 - REL::Module::get().base(),
+                                (unsigned long long)targetAddr, instrLen);
+                            fflush(f2);
+                            fclose(f2);
+                        }
+                    }
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+            }
 
             // Compute SkyrimSE.exe image bounds (cached)
             static auto sImgBase = REL::Module::get().base();
@@ -2141,12 +2182,19 @@ namespace Patches::FormCaching
                 // v1.22.34: Allocate zero page for null-form substitution.
                 // 64KB of committed zeros — used by VEH to replace null form
                 // pointers so the engine reads zeros instead of crashing.
+                // Allocate as RW, zero-fill, then protect as READONLY.
+                // The VEH skips writes to this page (CASE W), keeping it
+                // pristine across all exception handling invocations.
                 g_zeroPage = VirtualAlloc(nullptr, 0x10000,
                     MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
                 if (g_zeroPage) {
                     memset(g_zeroPage, 0, 0x10000);
-                    logger::info("  Allocated 64KB zero page at 0x{:X}",
-                        reinterpret_cast<std::uintptr_t>(g_zeroPage));
+                    DWORD oldProt = 0;
+                    VirtualProtect(g_zeroPage, 0x10000, PAGE_READONLY, &oldProt);
+                    g_zeroPageBase = reinterpret_cast<DWORD64>(g_zeroPage);
+                    g_zeroPageEnd = g_zeroPageBase + 0x10000;
+                    logger::info("  Allocated 64KB zero page at 0x{:X} (PAGE_READONLY)",
+                        g_zeroPageBase);
                 } else {
                     logger::error("  Failed to allocate zero page!");
                 }
