@@ -73,9 +73,15 @@ namespace Patches::FormCaching
         inline std::atomic<std::uint64_t> g_formFixupCount{ 0 };
         // v1.22.27: Count of forms that faulted during InitItem (SEH-caught)
         inline std::atomic<std::uint64_t> g_initFaultCount{ 0 };
-        // v1.22.29: Sentinel form — zeroed block used when a form ID can't
-        // be resolved. The engine reads zeros from it (flags=0, no vtable
-        // calls) instead of crashing on the unresolved form ID.
+        // v1.22.34: Zero page — VirtualAlloc'd committed page of zeros, used
+        // as a substitute for null form pointers. When the engine dereferences
+        // a null form pointer, the VEH replaces it with g_zeroPage, so the
+        // engine reads zeros from every field (formType=0, formFlags=0, etc.)
+        // and takes "nothing here" branches naturally. 64KB to cover all
+        // TESForm field offsets including large vtable offsets (up to +0x4B8).
+        inline void* g_zeroPage = nullptr;
+        inline std::atomic<std::uint64_t> g_zeroPageUseCount{ 0 };
+        // Legacy sentinel (kept for FormReferenceFixupVEH compatibility)
         alignas(64) inline std::uint8_t g_sentinelForm[0x400] = {};
         inline std::atomic<std::uint64_t> g_sentinelUseCount{ 0 };
 
@@ -743,6 +749,36 @@ namespace Patches::FormCaching
             }();
             auto rip = pep->ContextRecord->Rip;
 
+            // ─────────────────────────────────────────────────────────────
+            // CASE 0: Null code execution (RIP < 0x10000)
+            // Happens when CALL jumped to a null function pointer (e.g.,
+            // vtable read from zero page returned 0). The CALL already
+            // pushed the return address onto the stack.
+            // Pop the return address, set RAX=0 (null return), continue.
+            // ─────────────────────────────────────────────────────────────
+            if (rip < 0x10000) {
+                auto* rspPtr = reinterpret_cast<DWORD64*>(pep->ContextRecord->Rsp);
+                if (!IsBadReadPtr(rspPtr, 8)) {
+                    pep->ContextRecord->Rip = *rspPtr;
+                    pep->ContextRecord->Rsp += 8;
+                    pep->ContextRecord->Rax = 0;
+
+                    auto count = g_nullSkipCount.fetch_add(1, std::memory_order_relaxed);
+                    if (count < 50) {
+                        const char* logPath = "C:\\SSEEngineFixesForWine_crash.log";
+                        FILE* f2 = nullptr;
+                        fopen_s(&f2, logPath, "a");
+                        if (f2) {
+                            fprintf(f2, "NULL-CALL-RET #%d: RIP=0x%llX returning to 0x%llX\n",
+                                count + 1, rip, *rspPtr);
+                            fflush(f2);
+                            fclose(f2);
+                        }
+                    }
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+            }
+
             // Only handle faults within SkyrimSE.exe image range
             if (rip < sImgBase || rip >= sImgEnd)
                 return EXCEPTION_CONTINUE_SEARCH;
@@ -751,42 +787,71 @@ namespace Patches::FormCaching
 
             // ─────────────────────────────────────────────────────────────
             // CASE 1: Null pointer dereference (targetAddr < 0x10000)
-            // The AI evaluation chain dereferences null form pointers at
-            // multiple engine sites. Skip the faulting instruction with
-            // proper side effects:
-            //   - CMP/TEST: clear ZF → "not equal" → skip type-specific processing
-            //   - CALL indirect: zero RAX → null return value
-            //   - Other: skip only
+            //
+            // Instead of skipping instructions (which corrupts control flow),
+            // replace the null register with g_zeroPage and RETRY the
+            // instruction. The engine reads zeros from every field and
+            // takes "nothing here" branches naturally — no flag corruption,
+            // no whack-a-mole instruction skipping.
+            //
+            // We find which register caused the null dereference by
+            // checking if reg + small_offset == targetAddr for each GPR.
             // ─────────────────────────────────────────────────────────────
-            if (targetAddr < 0x10000) {
-                auto instrLen = x86_instr_len(ripBytes);
-                auto instrClass = classifyInstruction(ripBytes);
+            if (targetAddr < 0x10000 && g_zeroPage) {
+                // Find the null register that caused this dereference
+                DWORD64 zp = reinterpret_cast<DWORD64>(g_zeroPage);
+                DWORD64* gprs[] = {
+                    &pep->ContextRecord->Rax,
+                    &pep->ContextRecord->Rcx,
+                    &pep->ContextRecord->Rdx,
+                    &pep->ContextRecord->Rbx,
+                    // Skip RSP
+                    &pep->ContextRecord->Rbp,
+                    &pep->ContextRecord->Rsi,
+                    &pep->ContextRecord->Rdi,
+                    &pep->ContextRecord->R8,
+                    &pep->ContextRecord->R9,
+                    &pep->ContextRecord->R10,
+                    &pep->ContextRecord->R11,
+                    &pep->ContextRecord->R12,
+                    &pep->ContextRecord->R13,
+                    &pep->ContextRecord->R14,
+                    &pep->ContextRecord->R15,
+                };
 
-                pep->ContextRecord->Rip += instrLen;
-
-                if (instrClass == 'C') {
-                    // Clear ZF (bit 6) → "not equal" result
-                    // Set CF (bit 0) → "less than" for unsigned comparisons
-                    pep->ContextRecord->EFlags &= ~0x40ULL;
-                    pep->ContextRecord->EFlags |= 0x01ULL;
-                } else if (instrClass == 'F') {
-                    // CALL skipped: set null return value
-                    pep->ContextRecord->Rax = 0;
+                bool patched = false;
+                for (int i = 0; i < 15; ++i) {
+                    DWORD64 val = *gprs[i];
+                    // Check if this null register + small offset == targetAddr
+                    if (val < 0x100 && targetAddr >= val &&
+                        targetAddr - val < 0x10000) {
+                        *gprs[i] = zp + val; // Redirect to zero page at same offset base
+                        patched = true;
+                        break;
+                    }
                 }
 
-                auto count = g_nullSkipCount.fetch_add(1, std::memory_order_relaxed);
+                if (!patched) {
+                    // Fallback: if we can't find the null register,
+                    // just set RAX to zero page (most common case)
+                    pep->ContextRecord->Rax = zp;
+                    patched = true;
+                }
+
+                auto count = g_zeroPageUseCount.fetch_add(1, std::memory_order_relaxed);
                 if (count < 50) {
                     const char* logPath = "C:\\SSEEngineFixesForWine_crash.log";
                     FILE* f2 = nullptr;
                     fopen_s(&f2, logPath, "a");
                     if (f2) {
-                        fprintf(f2, "NULL-SKIP #%d: RIP=+0x%llX +%dB type=%c target=0x%llX RAX=0x%llX\n",
-                            count + 1, rip - sImgBase, instrLen, instrClass,
-                            (unsigned long long)targetAddr, pep->ContextRecord->Rax);
+                        fprintf(f2, "ZERO-PAGE #%d: RIP=+0x%llX target=0x%llX → zeroPage=0x%llX\n",
+                            count + 1, rip - sImgBase,
+                            (unsigned long long)targetAddr, (unsigned long long)zp);
                         fflush(f2);
                         fclose(f2);
                     }
                 }
+                // Retry the instruction — it now reads from the zero page
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
 
@@ -848,35 +913,32 @@ namespace Patches::FormCaching
                         return EXCEPTION_CONTINUE_EXECUTION;
                     }
 
-                    // Form not found in hash table — skip instruction.
-                    // Better than crashing: the engine may null-check downstream.
-                    auto instrLen = x86_instr_len(ripBytes);
-                    auto instrClass = classifyInstruction(ripBytes);
-                    pep->ContextRecord->Rip += instrLen;
+                    // Form not found in hash table — replace register with
+                    // zero page pointer so the engine reads zeros from all
+                    // fields and takes natural "nothing" branches.
+                    // This avoids instruction skipping which corrupts control flow.
+                    if (g_zeroPage) {
+                        DWORD64 zp = reinterpret_cast<DWORD64>(g_zeroPage);
+                        auto offset = static_cast<std::int64_t>(targetAddr) - static_cast<std::int64_t>(val);
+                        *regs[i] = zp; // Point to zero page
 
-                    if (instrClass == 'C') {
-                        pep->ContextRecord->EFlags &= ~0x40ULL;
-                        pep->ContextRecord->EFlags |= 0x01ULL;
-                    } else if (instrClass == 'F') {
-                        pep->ContextRecord->Rax = 0;
-                    }
-                    // Zero the register that held the bad form ID to prevent
-                    // downstream code from using it as a pointer again
-                    *regs[i] = 0;
-
-                    auto count = g_formIdSkipCount.fetch_add(1, std::memory_order_relaxed);
-                    if (count < 50) {
-                        const char* logPath = "C:\\SSEEngineFixesForWine_crash.log";
-                        FILE* f2 = nullptr;
-                        fopen_s(&f2, logPath, "a");
-                        if (f2) {
-                            fprintf(f2, "FORM-SKIP #%d: RIP=+0x%llX +%dB type=%c formID=0x%08X NOT FOUND\n",
-                                count + 1, rip - sImgBase, instrLen, instrClass, formId);
-                            fflush(f2);
-                            fclose(f2);
+                        auto count = g_formIdSkipCount.fetch_add(1, std::memory_order_relaxed);
+                        if (count < 50) {
+                            const char* logPath = "C:\\SSEEngineFixesForWine_crash.log";
+                            FILE* f2 = nullptr;
+                            fopen_s(&f2, logPath, "a");
+                            if (f2) {
+                                fprintf(f2, "FORM-ZEROPAGE #%d: RIP=+0x%llX formID=0x%08X NOT FOUND → zeroPage=0x%llX\n",
+                                    count + 1, rip - sImgBase, formId, (unsigned long long)zp);
+                                fflush(f2);
+                                fclose(f2);
+                            }
                         }
+                        return EXCEPTION_CONTINUE_EXECUTION; // Retry with zero page
                     }
-                    return EXCEPTION_CONTINUE_EXECUTION;
+
+                    // No zero page available — fall through to crash log
+                    break;
                 }
             }
 
@@ -2051,6 +2113,19 @@ namespace Patches::FormCaching
                     }
 
                     logger::info("  Flagged {} permanently faulted forms as kDeleted+kDisabled", flaggedCount);
+                }
+
+                // v1.22.34: Allocate zero page for null-form substitution.
+                // 64KB of committed zeros — used by VEH to replace null form
+                // pointers so the engine reads zeros instead of crashing.
+                g_zeroPage = VirtualAlloc(nullptr, 0x10000,
+                    MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+                if (g_zeroPage) {
+                    memset(g_zeroPage, 0, 0x10000);
+                    logger::info("  Allocated 64KB zero page at 0x{:X}",
+                        reinterpret_cast<std::uintptr_t>(g_zeroPage));
+                } else {
+                    logger::error("  Failed to allocate zero page!");
                 }
 
                 // Install persistent form-reference fixup VEH
