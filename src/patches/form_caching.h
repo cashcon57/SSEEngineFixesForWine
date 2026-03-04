@@ -97,6 +97,9 @@ namespace Patches::FormCaching
         inline std::atomic<std::uint64_t> g_zeroPageUseCount{ 0 };
         inline std::atomic<std::uint64_t> g_zeroPageWriteSkips{ 0 };
         inline std::atomic<std::uint64_t> g_catchAllCount{ 0 };
+        // v1.22.46: Main thread handle for watchdog RIP sampling
+        inline HANDLE g_mainThreadHandle = nullptr;
+        inline DWORD g_mainThreadId = 0;
         // Legacy sentinel (kept for FormReferenceFixupVEH compatibility)
         alignas(64) inline std::uint8_t g_sentinelForm[0x400] = {};
         inline std::atomic<std::uint64_t> g_sentinelUseCount{ 0 };
@@ -2649,33 +2652,110 @@ namespace Patches::FormCaching
                 g_crashLoggerActive.store(true, std::memory_order_release);
                 logger::info("  Installed CrashLoggerVEH (first-chance, writes to Data/SKSE/Plugins/)");
 
-                // v1.22.36: Watchdog thread — logs VEH counters every 10 seconds
-                // and refreshes sentinel form critical fields (vtable, kDeleted).
+                // v1.22.46: Capture main thread handle for RIP sampling
+                g_mainThreadId = GetCurrentThreadId();
+                g_mainThreadHandle = OpenThread(
+                    THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
+                    FALSE, g_mainThreadId);
+                if (g_mainThreadHandle) {
+                    logger::info("  Captured main thread handle (tid={})", g_mainThreadId);
+                } else {
+                    logger::warn("  Failed to capture main thread handle (err={})", GetLastError());
+                }
+
+                // v1.22.36: Watchdog thread — logs VEH counters every 10 seconds.
+                // v1.22.46: Also samples main thread RIP when counters are stable
+                // (freeze detection — helps pinpoint infinite loops).
                 std::thread([]() {
                     int tick = 0;
+                    std::uint64_t prevZp = 0, prevWs = 0, prevCa = 0;
+                    int prevFi = 0;
+                    int stableTicks = 0;     // how many ticks counters unchanged
+                    bool ripSampling = false; // once triggered, sample every tick
+
+                    auto imgBase = REL::Module::get().base();
+
                     while (true) {
                         Sleep(10000);
                         tick++;
 
-                        // v1.22.43: Sentinel page is PAGE_READONLY now, so no
-                        // vtable refresh needed — writes are blocked by VEH.
+                        auto curZp = g_zeroPageUseCount.load(std::memory_order_relaxed);
+                        auto curWs = g_zeroPageWriteSkips.load(std::memory_order_relaxed);
+                        auto curFi = g_formIdSkipCount.load(std::memory_order_relaxed);
+                        auto curCa = g_catchAllCount.load(std::memory_order_relaxed);
+
+                        // Detect stable counters (potential freeze)
+                        if (curZp == prevZp && curWs == prevWs &&
+                            curFi == prevFi && curCa == prevCa &&
+                            (curZp + curWs + curFi + curCa) > 0) {
+                            stableTicks++;
+                        } else {
+                            stableTicks = 0;
+                        }
+                        prevZp = curZp; prevWs = curWs;
+                        prevFi = curFi; prevCa = curCa;
+
+                        // Start RIP sampling after 3 stable ticks (30s of no VEH activity
+                        // after at least one event — indicates the game may be frozen)
+                        if (stableTicks >= 3 && !ripSampling) {
+                            ripSampling = true;
+                        }
 
                         FILE* f = nullptr;
                         fopen_s(&f, "C:\\SSEEngineFixesForWine_crash.log", "a");
                         if (f) {
-                            fprintf(f, "WATCHDOG #%d (t=%ds): zp=%llu ws=%llu nc=%d fi=%d ca=%llu\n",
+                            fprintf(f, "WATCHDOG #%d (t=%ds): zp=%llu ws=%llu nc=%d fi=%d ca=%llu",
                                 tick, tick * 10,
-                                g_zeroPageUseCount.load(std::memory_order_relaxed),
-                                g_zeroPageWriteSkips.load(std::memory_order_relaxed),
+                                curZp, curWs,
                                 g_nullSkipCount.load(std::memory_order_relaxed),
-                                g_formIdSkipCount.load(std::memory_order_relaxed),
-                                g_catchAllCount.load(std::memory_order_relaxed));
+                                curFi, curCa);
+
+                            // v1.22.46: Sample main thread RIP when frozen
+                            if (ripSampling && g_mainThreadHandle) {
+                                DWORD suspCount = SuspendThread(g_mainThreadHandle);
+                                if (suspCount != (DWORD)-1) {
+                                    CONTEXT ctx = {};
+                                    ctx.ContextFlags = CONTEXT_CONTROL;
+                                    if (GetThreadContext(g_mainThreadHandle, &ctx)) {
+                                        DWORD64 rip = ctx.Rip;
+                                        DWORD64 rsp = ctx.Rsp;
+                                        // Log RIP as offset from image base if in SkyrimSE.exe
+                                        if (rip >= (DWORD64)imgBase && rip < (DWORD64)imgBase + 0x4000000) {
+                                            fprintf(f, " RIP=+0x%llX RSP=0x%llX",
+                                                (unsigned long long)(rip - imgBase),
+                                                (unsigned long long)rsp);
+                                        } else {
+                                            fprintf(f, " RIP=0x%llX RSP=0x%llX",
+                                                (unsigned long long)rip,
+                                                (unsigned long long)rsp);
+                                        }
+
+                                        // Also read a few stack frames for context
+                                        auto* rspPtr = reinterpret_cast<DWORD64*>(rsp);
+                                        if (!IsBadReadPtr(rspPtr, 64)) {
+                                            fprintf(f, " STK=[");
+                                            for (int i = 0; i < 8; ++i) {
+                                                DWORD64 val = rspPtr[i];
+                                                if (val >= (DWORD64)imgBase &&
+                                                    val < (DWORD64)imgBase + 0x4000000) {
+                                                    fprintf(f, "+0x%llX ",
+                                                        (unsigned long long)(val - imgBase));
+                                                }
+                                            }
+                                            fprintf(f, "]");
+                                        }
+                                    }
+                                    ResumeThread(g_mainThreadHandle);
+                                }
+                            }
+
+                            fprintf(f, "\n");
                             fflush(f);
                             fclose(f);
                         }
                     }
                 }).detach();
-                logger::info("  Started watchdog thread (10s interval)");
+                logger::info("  Started watchdog thread (10s interval, RIP sampling enabled)");
 
                 // ==========================================================
                 // Auto-New-Game for automated testing
