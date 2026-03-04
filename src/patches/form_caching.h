@@ -861,8 +861,45 @@ namespace Patches::FormCaching
                 }
             }
 
-            // Log (but don't handle) faults outside SkyrimSE.exe image
+            // Faults outside SkyrimSE.exe image
             if (rip < sImgBase || rip >= sImgEnd) {
+                // v1.22.43: If RIP is an invalid address (high kernel-space
+                // or very low), the engine jumped here via a corrupted vtable
+                // in the zero page. The CALL already pushed a return address.
+                // Pop it and return 0, same as CASE 0 for null calls.
+                bool isInvalidCodeAddr = (rip > 0x00007FFFFFFFFFFFULL) || (rip < 0x10000);
+                if (isInvalidCodeAddr) {
+                    auto* rspPtr = reinterpret_cast<DWORD64*>(pep->ContextRecord->Rsp);
+                    if (!IsBadReadPtr(rspPtr, 8)) {
+                        DWORD64 retAddr = *rspPtr;
+                        pep->ContextRecord->Rip = retAddr;
+                        pep->ContextRecord->Rsp += 8;
+                        pep->ContextRecord->Rax = 0;
+
+                        // Also repair zero page vtable for next access
+                        if (g_zeroPage && g_stubVtable) {
+                            auto vtAddr = reinterpret_cast<DWORD64>(g_stubVtable);
+                            memcpy(g_zeroPage, &vtAddr, 8);
+                        }
+
+                        static std::atomic<int> s_extFixCount{ 0 };
+                        auto cnt2 = s_extFixCount.fetch_add(1, std::memory_order_relaxed);
+                        if (cnt2 < 50) {
+                            const char* logPath = "C:\\SSEEngineFixesForWine_crash.log";
+                            FILE* f = nullptr;
+                            fopen_s(&f, logPath, "a");
+                            if (f) {
+                                fprintf(f, "EXT-CALL-RET #%d: RIP=0x%llX → returning to 0x%llX RAX=0\n",
+                                    cnt2 + 1, rip, retAddr);
+                                fflush(f);
+                                fclose(f);
+                            }
+                        }
+                        return EXCEPTION_CONTINUE_EXECUTION;
+                    }
+                }
+
+                // Faults in other DLLs (Wine, etc.) — can't handle
                 static std::atomic<int> s_extCount{ 0 };
                 auto cnt = s_extCount.fetch_add(1, std::memory_order_relaxed);
                 if (cnt < 10) {
@@ -956,6 +993,28 @@ namespace Patches::FormCaching
                     // Fallback: set RAX to zero page (most common target)
                     pep->ContextRecord->Rax = zp;
                     patched = true;
+                }
+
+                // v1.22.43: Auto-repair zero page sentinel after each
+                // substitution. Because the page is PAGE_READWRITE, the
+                // engine can (and does) write over offset 0x00 (vtable
+                // pointer), 0x10 (formFlags), etc. Restore critical
+                // fields now so the NEXT instruction that reads from the
+                // zero page gets valid sentinel data instead of garbage.
+                {
+                    auto* page = reinterpret_cast<std::uint8_t*>(g_zeroPage);
+                    if (g_stubVtable) {
+                        auto vtAddr = reinterpret_cast<DWORD64>(g_stubVtable);
+                        memcpy(page + 0x00, &vtAddr, 8);
+                    }
+                    // formFlags: kDeleted(0x20) | kDisabled(0x800)
+                    auto flags = static_cast<std::uint32_t>(0x820);
+                    memcpy(page + 0x10, &flags, 4);
+                    // vtable call target at +0x4B8 (used by call [rax+0x4B8])
+                    if (g_stubFuncPage) {
+                        auto stubAddr = reinterpret_cast<DWORD64>(g_stubFuncPage);
+                        memcpy(page + 0x4B8, &stubAddr, 8);
+                    }
                 }
 
                 auto count = g_zeroPageUseCount.fetch_add(1, std::memory_order_relaxed);
