@@ -792,9 +792,9 @@ namespace Patches::FormCaching
 
             // ─────────────────────────────────────────────────────────────
             // CASE W: Write to zero page — skip the instruction.
-            // v1.22.41: Sentinel page is now PAGE_READWRITE, so most
-            // writes succeed without VEH. This handler is kept as a
-            // safety net in case protection is ever changed back.
+            // v1.22.43: Sentinel page is PAGE_READONLY to prevent vtable
+            // corruption. All write attempts are caught here and silently
+            // skipped, preserving the sentinel's vtable/flags/stubs.
             // ─────────────────────────────────────────────────────────────
             if (accessType == 1 && g_zeroPage &&
                 targetAddr >= g_zeroPageBase &&
@@ -876,11 +876,7 @@ namespace Patches::FormCaching
                         pep->ContextRecord->Rsp += 8;
                         pep->ContextRecord->Rax = 0;
 
-                        // Also repair zero page vtable for next access
-                        if (g_zeroPage && g_stubVtable) {
-                            auto vtAddr = reinterpret_cast<DWORD64>(g_stubVtable);
-                            memcpy(g_zeroPage, &vtAddr, 8);
-                        }
+                        // v1.22.43: No vtable repair needed — page is PAGE_READONLY
 
                         static std::atomic<int> s_extFixCount{ 0 };
                         auto cnt2 = s_extFixCount.fetch_add(1, std::memory_order_relaxed);
@@ -995,27 +991,8 @@ namespace Patches::FormCaching
                     patched = true;
                 }
 
-                // v1.22.43: Auto-repair zero page sentinel after each
-                // substitution. Because the page is PAGE_READWRITE, the
-                // engine can (and does) write over offset 0x00 (vtable
-                // pointer), 0x10 (formFlags), etc. Restore critical
-                // fields now so the NEXT instruction that reads from the
-                // zero page gets valid sentinel data instead of garbage.
-                {
-                    auto* page = reinterpret_cast<std::uint8_t*>(g_zeroPage);
-                    if (g_stubVtable) {
-                        auto vtAddr = reinterpret_cast<DWORD64>(g_stubVtable);
-                        memcpy(page + 0x00, &vtAddr, 8);
-                    }
-                    // formFlags: kDeleted(0x20) | kDisabled(0x800)
-                    auto flags = static_cast<std::uint32_t>(0x820);
-                    memcpy(page + 0x10, &flags, 4);
-                    // vtable call target at +0x4B8 (used by call [rax+0x4B8])
-                    if (g_stubFuncPage) {
-                        auto stubAddr = reinterpret_cast<DWORD64>(g_stubFuncPage);
-                        memcpy(page + 0x4B8, &stubAddr, 8);
-                    }
-                }
+                // v1.22.43: No auto-repair needed — page is PAGE_READONLY,
+                // so the sentinel data (vtable, flags, stubs) is immutable.
 
                 auto count = g_zeroPageUseCount.fetch_add(1, std::memory_order_relaxed);
                 if (count < 200) {
@@ -2603,14 +2580,18 @@ namespace Patches::FormCaching
                         memcpy(page + 0x4B8, &stubAddr, 8);
                     }
 
-                    // Keep PAGE_READWRITE — letting the engine write freely to the
-                    // sentinel avoids 275K+ VEH exceptions per New Game load.
-                    // The sentinel absorbs garbage writes; reads return whatever was
-                    // last written, but kDeleted flag causes the engine to skip the
-                    // form in most processing paths anyway.
+                    // v1.22.43: PAGE_READONLY — the VEH write-skip handler
+                    // (CASE W) silently drops write attempts. This prevents the
+                    // engine from corrupting the vtable pointer, formFlags, and
+                    // stub function pointers. The previous PAGE_READWRITE approach
+                    // (v1.22.41) let the engine overwrite the vtable at offset 0x00,
+                    // causing cascading crashes through corrupted vtable calls.
+                    DWORD oldProt2 = 0;
+                    VirtualProtect(g_zeroPage, 0x10000, PAGE_READONLY, &oldProt2);
+
                     g_zeroPageBase = reinterpret_cast<DWORD64>(g_zeroPage);
                     g_zeroPageEnd = g_zeroPageBase + 0x10000;
-                    logger::info("  Sentinel form page at 0x{:X} (PAGE_READWRITE, kDeleted=0x20, vtable=0x{:X})",
+                    logger::info("  Sentinel form page at 0x{:X} (PAGE_READONLY, kDeleted=0x20, vtable=0x{:X})",
                         g_zeroPageBase,
                         g_stubVtable ? reinterpret_cast<std::uintptr_t>(g_stubVtable) : 0);
                 } else {
@@ -2644,25 +2625,8 @@ namespace Patches::FormCaching
                         Sleep(10000);
                         tick++;
 
-                        // v1.22.41: Refresh sentinel form critical fields.
-                        // With PAGE_READWRITE, the engine may overwrite the vtable,
-                        // kDeleted flag, or stub pointers. Restore them every tick.
-                        if (g_zeroPage) {
-                            auto* page = reinterpret_cast<std::uint8_t*>(g_zeroPage);
-                            // Vtable pointer at offset 0x0
-                            if (g_stubVtable) {
-                                auto vtAddr = reinterpret_cast<DWORD64>(g_stubVtable);
-                                memcpy(page + 0x00, &vtAddr, 8);
-                            }
-                            // formFlags at offset 0x10 = kDeleted|kDisabled
-                            auto flags = static_cast<std::uint32_t>(0x820);
-                            memcpy(page + 0x10, &flags, 4);
-                            // Stub function at offset 0x4B8
-                            if (g_stubFuncPage) {
-                                auto stubAddr = reinterpret_cast<DWORD64>(g_stubFuncPage);
-                                memcpy(page + 0x4B8, &stubAddr, 8);
-                            }
-                        }
+                        // v1.22.43: Sentinel page is PAGE_READONLY now, so no
+                        // vtable refresh needed — writes are blocked by VEH.
 
                         FILE* f = nullptr;
                         fopen_s(&f, "C:\\SSEEngineFixesForWine_crash.log", "a");
