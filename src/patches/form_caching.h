@@ -1146,25 +1146,44 @@ namespace Patches::FormCaching
                     &pep->ContextRecord->R15,
                 };
 
-                // Find register closest to targetAddr (within reasonable offset)
+                // v1.22.47: Two-phase redirect strategy.
+                // Phase 1: Find register within 1MB of target (single-register addressing).
+                // Phase 2: Find largest pointer-like register (multi-register addressing
+                //          like [r14 + rax*8] where base ptr is far from target).
+                // Never fall back to skip+zero — always redirect + retry.
                 bool patched = false;
+
+                // Phase 1: Register close to target (handles [reg+offset] patterns)
                 for (int i = 0; i < 15; ++i) {
                     DWORD64 val = *gprs[i];
-                    if (val == 0 || val == zp) continue; // Skip zero/already-patched
+                    if (val == 0 || val == zp) continue;
                     auto diff = static_cast<std::int64_t>(targetAddr) -
                                 static_cast<std::int64_t>(val);
-                    if (diff >= 0 && diff < 0x100000) { // Within 1MB offset
-                        *gprs[i] = zp; // Redirect to zero page
+                    if (diff >= 0 && diff < 0x100000) { // Within 1MB
+                        *gprs[i] = zp;
                         patched = true;
                         break;
                     }
                 }
+
+                // Phase 2: Redirect largest pointer-like register
+                // (handles [base + index*scale] where base is unmapped)
                 if (!patched) {
-                    // Fallback: skip instruction + zero RAX (old behavior)
-                    auto instrLen = x86_instr_len(ripBytes);
-                    if (instrLen > 0 && instrLen <= 15) {
-                        pep->ContextRecord->Rip += instrLen;
-                        pep->ContextRecord->Rax = 0;
+                    int bestIdx = -1;
+                    DWORD64 bestVal = 0;
+                    for (int i = 0; i < 15; ++i) {
+                        DWORD64 val = *gprs[i];
+                        // Must look like a pointer: > 64KB, not zero page,
+                        // not in SkyrimSE.exe image, and <= target address
+                        if (val > 0x10000 && val != zp &&
+                            val <= targetAddr && val > bestVal) {
+                            bestVal = val;
+                            bestIdx = i;
+                        }
+                    }
+                    if (bestIdx >= 0) {
+                        *gprs[bestIdx] = zp;
+                        patched = true;
                     }
                 }
 
@@ -1174,11 +1193,12 @@ namespace Patches::FormCaching
                     FILE* f2 = nullptr;
                     fopen_s(&f2, logPath, "a");
                     if (f2) {
-                        fprintf(f2, "CATCH-ALL #%d: RIP=+0x%llX target=0x%llX patched=%s RAX=0x%llX\n",
+                        fprintf(f2, "CATCH-ALL #%d: RIP=+0x%llX target=0x%llX patched=%s RAX=0x%llX R14=0x%llX\n",
                             count + 1, rip - sImgBase,
                             (unsigned long long)targetAddr,
-                            patched ? "redirect" : "skip",
-                            (unsigned long long)pep->ContextRecord->Rax);
+                            patched ? "redirect" : "FAILED",
+                            (unsigned long long)pep->ContextRecord->Rax,
+                            (unsigned long long)pep->ContextRecord->R14);
                         // Byte dump: first time per unique RIP
                         static DWORD64 s_dumpedRips[32] = {};
                         static int s_dumpCount = 0;
@@ -2695,9 +2715,9 @@ namespace Patches::FormCaching
                         prevZp = curZp; prevWs = curWs;
                         prevFi = curFi; prevCa = curCa;
 
-                        // Start RIP sampling after 3 stable ticks (30s of no VEH activity
-                        // after at least one event — indicates the game may be frozen)
-                        if (stableTicks >= 3 && !ripSampling) {
+                        // v1.22.47: Start RIP sampling after 1 stable tick (10s)
+                        // instead of 3 — catches freezes faster.
+                        if (stableTicks >= 1 && !ripSampling) {
                             ripSampling = true;
                         }
 
