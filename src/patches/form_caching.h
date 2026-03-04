@@ -74,7 +74,7 @@ namespace Patches::FormCaching
         inline std::atomic<std::uint64_t> g_formFixupCount{ 0 };
         // v1.22.27: Count of forms that faulted during InitItem (SEH-caught)
         inline std::atomic<std::uint64_t> g_initFaultCount{ 0 };
-        // v1.22.35: Sentinel form page — a fake TESForm that looks "deleted"
+        // v1.22.36: Sentinel form page — a fake TESForm that looks "deleted"
         // to the engine. VEH redirects null form pointers here. The engine
         // reads kDeleted from formFlags and skips processing entirely.
         //
@@ -572,7 +572,7 @@ namespace Patches::FormCaching
             if (pep->ExceptionRecord->NumberParameters >= 2)
                 targetAddr = pep->ExceptionRecord->ExceptionInformation[1];
 
-            // v1.22.35: Handle null-pointer form dereferences.
+            // v1.22.36: Handle null-pointer form dereferences.
             // After kDeleted flagging + code cave, the engine still hits
             // null form pointers (RAX=0) in the AI evaluation chain.
             // Pattern: `cmp byte ptr [rax+0x1A], 0x2B` where rax=0.
@@ -665,7 +665,7 @@ namespace Patches::FormCaching
                     return EXCEPTION_CONTINUE_EXECUTION;
                 }
 
-                // v1.22.35: Form not in cache — let the crash happen cleanly.
+                // v1.22.36: Form not in cache — let the crash happen cleanly.
                 // Previous approaches (sentinel, instruction skip, zero+ZF)
                 // all caused cascading failures downstream. A clean crash
                 // at the original site gives better diagnostic information.
@@ -684,7 +684,7 @@ namespace Patches::FormCaching
         }
 
         // ================================================================
-        // v1.22.35: First-chance crash logger VEH.
+        // v1.22.36: First-chance crash logger VEH.
         //
         // Catches access violations and writes diagnostic info
         // (crash address, exception code, registers, module offset)
@@ -749,8 +749,25 @@ namespace Patches::FormCaching
                 return EXCEPTION_CONTINUE_SEARCH;
 
             auto code = pep->ExceptionRecord->ExceptionCode;
-            if (code != EXCEPTION_ACCESS_VIOLATION)
+
+            // Log non-AV exceptions (stack overflow, illegal instruction, etc.)
+            if (code != EXCEPTION_ACCESS_VIOLATION) {
+                static std::atomic<int> s_nonAvCount{ 0 };
+                auto cnt = s_nonAvCount.fetch_add(1, std::memory_order_relaxed);
+                if (cnt < 5) {
+                    FILE* f = nullptr;
+                    fopen_s(&f, "C:\\SSEEngineFixesForWine_crash.log", "a");
+                    if (f) {
+                        auto imgBase = REL::Module::get().base();
+                        auto rip2 = pep->ContextRecord->Rip;
+                        fprintf(f, "NON-AV EXCEPTION #%d: code=0x%08lX RIP=0x%llX (+0x%llX)\n",
+                            cnt + 1, code, rip2, rip2 - imgBase);
+                        fflush(f);
+                        fclose(f);
+                    }
+                }
                 return EXCEPTION_CONTINUE_SEARCH;
+            }
 
             ULONG_PTR targetAddr = 0;
             ULONG_PTR accessType = 0; // 0=read, 1=write, 8=DEP
@@ -831,9 +848,25 @@ namespace Patches::FormCaching
                 }
             }
 
-            // Only handle faults within SkyrimSE.exe image range
-            if (rip < sImgBase || rip >= sImgEnd)
+            // Log (but don't handle) faults outside SkyrimSE.exe image
+            if (rip < sImgBase || rip >= sImgEnd) {
+                static std::atomic<int> s_extCount{ 0 };
+                auto cnt = s_extCount.fetch_add(1, std::memory_order_relaxed);
+                if (cnt < 10) {
+                    const char* logPath = "C:\\SSEEngineFixesForWine_crash.log";
+                    FILE* f = nullptr;
+                    fopen_s(&f, logPath, "a");
+                    if (f) {
+                        fprintf(f, "EXT-CRASH #%d: RIP=0x%llX (outside SkyrimSE.exe 0x%llX-0x%llX) target=0x%llX RAX=0x%llX\n",
+                            cnt + 1, rip, sImgBase, sImgEnd,
+                            (unsigned long long)targetAddr,
+                            (unsigned long long)pep->ContextRecord->Rax);
+                        fflush(f);
+                        fclose(f);
+                    }
+                }
                 return EXCEPTION_CONTINUE_SEARCH;
+            }
 
             const auto* ripBytes = reinterpret_cast<const std::uint8_t*>(rip);
 
@@ -1098,7 +1131,7 @@ namespace Patches::FormCaching
                     auto offset = rip - sImgBase;
                     bool inModule = true; // We already verified RIP is in SkyrimSE.exe
 
-                    fprintf(f, "\n=== SSEEngineFixesForWine CRASH LOG (v1.22.35) ===\n");
+                    fprintf(f, "\n=== SSEEngineFixesForWine CRASH LOG (v1.22.36) ===\n");
                     fprintf(f, "Exception: 0x%08lX at RIP=0x%llX (SkyrimSE.exe+0x%llX)\n",
                         code, rip, offset);
                     fprintf(f, "Target address: 0x%llX\n", (unsigned long long)targetAddr);
@@ -1573,7 +1606,7 @@ namespace Patches::FormCaching
         // loop at +0x11C then runs, loading all forms natively.
         // ================================================================
         // ================================================================
-        // v1.22.35: Binary patch at AE 29846+0x95 — targeted crash fix
+        // v1.22.36: Binary patch at AE 29846+0x95 — targeted crash fix
         // with form ID resolution.
         //
         // The instruction `test dword ptr [rax+0x28], 0x3FF` crashes when
@@ -1585,7 +1618,7 @@ namespace Patches::FormCaching
         //   3. If resolved: replace RAX, execute original TEST
         //   4. If not resolved: xor eax,eax + ZF=1, skip
         //
-        // v1.22.35: Now resolves form IDs instead of just zeroing RAX.
+        // v1.22.36: Now resolves form IDs instead of just zeroing RAX.
         // This prevents cascading null-pointer failures downstream.
         // ================================================================
         inline void PatchFormPointerValidation()
@@ -1761,7 +1794,7 @@ namespace Patches::FormCaching
 #endif
         }
 
-        // v1.22.35: Binary patches at hot VEH addresses with inline null checks.
+        // v1.22.36: Binary patches at hot VEH addresses with inline null checks.
         // Eliminates VEH overhead for the most-hit crash sites by checking for
         // null/sentinel form pointers before the faulting instruction.
         inline void PatchHotSpotNullChecks()
@@ -2154,7 +2187,7 @@ namespace Patches::FormCaching
             }
 
             // ==========================================================
-            // v1.22.35: Hex dump AE 13753 validation loop for future analysis.
+            // v1.22.36: Hex dump AE 13753 validation loop for future analysis.
             // The per-file validation at +0xE0 to +0x120 determines which
             // files get loaded. Dumping bytes helps reverse-engineer the
             // skip logic that blocks 1787 files under Wine.
@@ -2177,7 +2210,7 @@ namespace Patches::FormCaching
             }
 
             // ==========================================================
-            // v1.22.35: Multi-pass form loading.
+            // v1.22.36: Multi-pass form loading.
             //
             // After the first AE 13753 call, 1787 files are skipped
             // (compileIndex still 0xFF). The per-file validation function
@@ -2265,11 +2298,11 @@ namespace Patches::FormCaching
             // After loading forms, call InitItemImpl() on every form to
             // resolve stored form IDs into live pointers.
             //
-            // v1.22.35: Multi-pass InitItem — retry faulted forms after
+            // v1.22.36: Multi-pass InitItem — retry faulted forms after
             // the first pass, since more references may be resolvable.
             // ==========================================================
             if (addFormDelta > 100) {
-                logger::info("=== InitItemImpl Phase (v1.22.35 — multi-pass) ==="sv);
+                logger::info("=== InitItemImpl Phase (v1.22.36 — multi-pass) ==="sv);
 
                 auto* saveLoadGame = RE::BGSSaveLoadGame::GetSingleton();
                 if (saveLoadGame) {
@@ -2362,7 +2395,7 @@ namespace Patches::FormCaching
                 logger::info("  InitItem pass 1: {} initialized, {} faulted, {}ms",
                     initCount, faultedForms.size(), pass1Ms);
 
-                // v1.22.35: Retry faulted forms (up to 3 retry passes).
+                // v1.22.36: Retry faulted forms (up to 3 retry passes).
                 // After pass 1 resolves many references, previously-faulting
                 // forms may now succeed because their dependencies are resolved.
                 for (int retryPass = 2; retryPass <= 4 && !faultedForms.empty(); ++retryPass) {
@@ -2401,7 +2434,7 @@ namespace Patches::FormCaching
                     initCount, faultedForms.size(), totalMs);
 
                 // ==========================================================
-                // v1.22.35: Mark permanently faulted forms as kDeleted.
+                // v1.22.36: Mark permanently faulted forms as kDeleted.
                 //
                 // The 179 faulted ActorCharacter forms have null internal
                 // pointers (race, base NPC, etc) that cause null-dereference
@@ -2440,7 +2473,7 @@ namespace Patches::FormCaching
                     logger::info("  Flagged {} permanently faulted forms as kDeleted+kDisabled", flaggedCount);
                 }
 
-                // v1.22.35: Allocate zero page for null-form substitution.
+                // v1.22.36: Allocate zero page for null-form substitution.
                 // ── Sentinel form infrastructure ──
                 // 1. Stub function page (PAGE_EXECUTE_READ): "xor eax,eax; ret"
                 g_stubFuncPage = VirtualAlloc(nullptr, 0x1000,
@@ -2515,20 +2548,20 @@ namespace Patches::FormCaching
                 AddVectoredExceptionHandler(1, FormReferenceFixupVEH);
                 logger::info("  Installed persistent FormReferenceFixupVEH");
 
-                // v1.22.35: Binary patch at 29846+0x95 with form resolution.
+                // v1.22.36: Binary patch at 29846+0x95 with form resolution.
                 PatchFormPointerValidation();
 
-                // v1.22.35: Binary patches at hot VEH addresses with null checks.
+                // v1.22.36: Binary patches at hot VEH addresses with null checks.
                 PatchHotSpotNullChecks();
 
-                // v1.22.35: Install first-chance crash logger VEH.
+                // v1.22.36: Install first-chance crash logger VEH.
                 // This logs crash info to Data/SKSE/Plugins/ for guaranteed
                 // capture even when spdlog hasn't flushed.
                 AddVectoredExceptionHandler(1, CrashLoggerVEH);
                 g_crashLoggerActive.store(true, std::memory_order_release);
                 logger::info("  Installed CrashLoggerVEH (first-chance, writes to Data/SKSE/Plugins/)");
 
-                // v1.22.35: Watchdog thread — logs VEH counters every 10 seconds
+                // v1.22.36: Watchdog thread — logs VEH counters every 10 seconds
                 // to diagnose freezes (infinite loop vs slow processing).
                 std::thread([]() {
                     int tick = 0;
@@ -2552,10 +2585,10 @@ namespace Patches::FormCaching
                 }).detach();
                 logger::info("  Started watchdog thread (10s interval)");
 
-                logger::info("=== END InitItemImpl Phase (v1.22.35) ==="sv);
+                logger::info("=== END InitItemImpl Phase (v1.22.36) ==="sv);
             }
 
-            logger::info("=== END ForceLoadAllForms (v1.22.35) ==="sv);
+            logger::info("=== END ForceLoadAllForms (v1.22.36) ==="sv);
 #else
             logger::info("ForceLoadAllForms: SE build — skipping (AE-only fix)"sv);
 #endif
