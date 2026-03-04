@@ -312,6 +312,19 @@ namespace Patches::FormCaching
             // Dump state after ClearData too
             DumpFilesListState(a_self, "POST-ClearData");
 
+            // v1.22.48: Set zero page to PAGE_READWRITE during reload.
+            // ClearData → reload reprocesses all forms, writing formFlags
+            // on sentinel-redirected forms thousands of times. With
+            // PAGE_READONLY, each write triggers a VEH exception (~8K/10s),
+            // making loading 10x slower. PAGE_READWRITE lets writes through
+            // silently. We flip back to PAGE_READONLY in ForceLoadAllForms
+            // (after reload) to prevent vtable corruption during gameplay.
+            if (g_zeroPage) {
+                DWORD oldProt = 0;
+                VirtualProtect(g_zeroPage, 0x10000, PAGE_READWRITE, &oldProt);
+                logger::info(">>> Post-ClearData: zero page set to PAGE_READWRITE for fast reload");
+            }
+
             // v1.22.42: After ClearData, recompile all plugins.
             // During New Game (resetGame=true), ClearData clears compile
             // indices. Under Wine, the engine's CompileFiles is skipped
@@ -2847,6 +2860,24 @@ namespace Patches::FormCaching
                 }
 
                 logger::info("=== END InitItemImpl Phase (v1.22.36) ==="sv);
+            }
+
+            // v1.22.48: Restore PAGE_READONLY on the sentinel page.
+            // During ClearData/reload, we set it to PAGE_READWRITE so the
+            // engine can write formFlags without VEH overhead. Now that
+            // loading is done, lock it down to prevent vtable corruption
+            // during gameplay. Also restore the vtable pointer in case the
+            // engine overwrote offset 0x00 during reload.
+            if (g_zeroPage) {
+                // Restore critical fields: vtable and kDeleted flag
+                auto* zpBytes = reinterpret_cast<std::uint8_t*>(g_zeroPage);
+                auto stubVtable = reinterpret_cast<DWORD64>(g_stubVtable);
+                std::memcpy(&zpBytes[0x0000], &stubVtable, 8); // vtable
+                zpBytes[0x0010] = 0x20; // formFlags = kDeleted
+
+                DWORD oldProt = 0;
+                VirtualProtect(g_zeroPage, 0x10000, PAGE_READONLY, &oldProt);
+                logger::info("  Sentinel page restored to PAGE_READONLY (vtable refreshed)");
             }
 
             logger::info("=== END ForceLoadAllForms (v1.22.36) ==="sv);
