@@ -285,6 +285,8 @@ namespace Patches::FormCaching
 
         inline SafetyHookInline g_hk_ClearData;
 
+        inline void ManuallyCompileFiles();  // forward decl for ClearData hook
+
         // the game does not lock the form table on these clears so we won't either
         // maybe fix later if it causes issues
         inline void TESDataHandler_ClearData(RE::TESDataHandler* a_self)
