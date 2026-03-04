@@ -674,6 +674,52 @@ namespace Patches::FormCaching
         inline std::atomic<bool> g_crashLoggerActive{ false };
         inline std::atomic<int> g_crashLogCount{ 0 };
         inline std::atomic<int> g_nullSkipCount{ 0 };
+        inline std::atomic<int> g_formIdSkipCount{ 0 };
+
+        // Classify an x86 instruction at `ip` for VEH skip handling.
+        // Returns: 'C' = CMP/TEST, 'F' = CALL indirect, 'O' = other
+        inline char classifyInstruction(const std::uint8_t* ip)
+        {
+            // Skip prefixes (REX 40-4F, LOCK F0, 66, F2, F3, segment)
+            while ((*ip >= 0x40 && *ip <= 0x4F) || *ip == 0xF0 ||
+                   *ip == 0x66 || *ip == 0xF2 || *ip == 0xF3 ||
+                   *ip == 0x2E || *ip == 0x3E || *ip == 0x26 ||
+                   *ip == 0x36 || *ip == 0x64 || *ip == 0x65) {
+                ++ip;
+            }
+
+            auto op = *ip;
+
+            // CMP/TEST group: 38-3D, 80-83 /7(CMP), F6-F7 /0(TEST), 84-85
+            if (op >= 0x38 && op <= 0x3D) return 'C';
+            if (op == 0x84 || op == 0x85) return 'C';
+            if (op == 0x80 || op == 0x82 || op == 0x83) {
+                auto reg = (ip[1] >> 3) & 0x7;
+                if (reg == 7) return 'C'; // /7 = CMP
+            }
+            if (op == 0x81) {
+                auto reg = (ip[1] >> 3) & 0x7;
+                if (reg == 7) return 'C'; // /7 = CMP
+            }
+            if (op == 0xF6 || op == 0xF7) {
+                auto reg = (ip[1] >> 3) & 0x7;
+                if (reg == 0) return 'C'; // /0 = TEST
+            }
+            // Two-byte: 0F BA /4(BT), 0F A3(BT), etc — also comparisons
+            if (op == 0x0F) {
+                auto op2 = ip[1];
+                if (op2 == 0xBA || op2 == 0xA3 || op2 == 0xAB ||
+                    op2 == 0xB3 || op2 == 0xBB) return 'C';
+            }
+
+            // CALL indirect: FF /2
+            if (op == 0xFF) {
+                auto reg = (ip[1] >> 3) & 0x7;
+                if (reg == 2) return 'F'; // /2 = CALL
+            }
+
+            return 'O';
+        }
 
         inline LONG CALLBACK CrashLoggerVEH(PEXCEPTION_POINTERS pep)
         {
@@ -688,34 +734,144 @@ namespace Patches::FormCaching
             if (pep->ExceptionRecord->NumberParameters >= 2)
                 targetAddr = pep->ExceptionRecord->ExceptionInformation[1];
 
-            // v1.22.34: Handle null-pointer form dereferences BEFORE logging.
+            // Compute SkyrimSE.exe image bounds (cached)
+            static auto sImgBase = REL::Module::get().base();
+            static auto sImgEnd = [&]() {
+                const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(sImgBase);
+                const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(sImgBase + dos->e_lfanew);
+                return sImgBase + nt->OptionalHeader.SizeOfImage;
+            }();
+            auto rip = pep->ContextRecord->Rip;
+
+            // Only handle faults within SkyrimSE.exe image range
+            if (rip < sImgBase || rip >= sImgEnd)
+                return EXCEPTION_CONTINUE_SEARCH;
+
+            const auto* ripBytes = reinterpret_cast<const std::uint8_t*>(rip);
+
+            // ─────────────────────────────────────────────────────────────
+            // CASE 1: Null pointer dereference (targetAddr < 0x10000)
             // The AI evaluation chain dereferences null form pointers at
-            // multiple engine sites. Skip the faulting instruction — the
-            // destination register stays 0 and downstream null checks handle it.
-            //
-            // Only handle faults within SkyrimSE.exe image range.
+            // multiple engine sites. Skip the faulting instruction with
+            // proper side effects:
+            //   - CMP/TEST: clear ZF → "not equal" → skip type-specific processing
+            //   - CALL indirect: zero RAX → null return value
+            //   - Other: skip only
+            // ─────────────────────────────────────────────────────────────
             if (targetAddr < 0x10000) {
-                static auto sImgBase = REL::Module::get().base();
-                static auto sImgEnd = [&]() {
-                    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(sImgBase);
-                    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(sImgBase + dos->e_lfanew);
-                    return sImgBase + nt->OptionalHeader.SizeOfImage;
-                }();
-                auto rip = pep->ContextRecord->Rip;
-                if (rip >= sImgBase && rip < sImgEnd) {
-                    const auto* ripBytes = reinterpret_cast<const std::uint8_t*>(rip);
+                auto instrLen = x86_instr_len(ripBytes);
+                auto instrClass = classifyInstruction(ripBytes);
+
+                pep->ContextRecord->Rip += instrLen;
+
+                if (instrClass == 'C') {
+                    // Clear ZF (bit 6) → "not equal" result
+                    // Set CF (bit 0) → "less than" for unsigned comparisons
+                    pep->ContextRecord->EFlags &= ~0x40ULL;
+                    pep->ContextRecord->EFlags |= 0x01ULL;
+                } else if (instrClass == 'F') {
+                    // CALL skipped: set null return value
+                    pep->ContextRecord->Rax = 0;
+                }
+
+                auto count = g_nullSkipCount.fetch_add(1, std::memory_order_relaxed);
+                if (count < 50) {
+                    const char* logPath = "C:\\SSEEngineFixesForWine_crash.log";
+                    FILE* f2 = nullptr;
+                    fopen_s(&f2, logPath, "a");
+                    if (f2) {
+                        fprintf(f2, "NULL-SKIP #%d: RIP=+0x%llX +%dB type=%c target=0x%llX RAX=0x%llX\n",
+                            count + 1, rip - sImgBase, instrLen, instrClass,
+                            (unsigned long long)targetAddr, pep->ContextRecord->Rax);
+                        fflush(f2);
+                        fclose(f2);
+                    }
+                }
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+
+            // ─────────────────────────────────────────────────────────────
+            // CASE 2: Form-ID-as-pointer dereference (targetAddr < 0xFF000000)
+            // Wine leaves raw form IDs (32-bit values) in 64-bit pointer fields.
+            // Scan registers for a value that looks like a form ID and is close
+            // to the target address. Try to resolve via GetFormByNumericId.
+            // If resolved: patch register, retry instruction.
+            // If NOT resolved: skip instruction (form doesn't exist).
+            // ─────────────────────────────────────────────────────────────
+            if (targetAddr < 0xFF000000ULL) {
+                DWORD64* regs[] = {
+                    &pep->ContextRecord->Rax,
+                    &pep->ContextRecord->Rcx,
+                    &pep->ContextRecord->Rdx,
+                    &pep->ContextRecord->Rbx,
+                    &pep->ContextRecord->Rbp,
+                    &pep->ContextRecord->Rsi,
+                    &pep->ContextRecord->Rdi,
+                    &pep->ContextRecord->R8,
+                    &pep->ContextRecord->R9,
+                    &pep->ContextRecord->R10,
+                    &pep->ContextRecord->R11,
+                    &pep->ContextRecord->R12,
+                    &pep->ContextRecord->R13,
+                    &pep->ContextRecord->R14,
+                    &pep->ContextRecord->R15,
+                };
+
+                for (int i = 0; i < 15; ++i) {
+                    DWORD64 val = *regs[i];
+                    if (val < 0x100 || val >= 0xFF000000ULL)
+                        continue;
+                    auto diff = static_cast<std::int64_t>(targetAddr) - static_cast<std::int64_t>(val);
+                    if (diff < -0x1000 || diff > 0x1000)
+                        continue;
+
+                    // Found a register that looks like a form ID
+                    auto formId = static_cast<RE::FormID>(val);
+                    auto* resolved = TESForm_GetFormByNumericId(formId);
+
+                    if (resolved) {
+                        // Resolved! Replace register with real pointer, retry instruction
+                        *regs[i] = reinterpret_cast<DWORD64>(resolved);
+                        auto count = g_formIdSkipCount.fetch_add(1, std::memory_order_relaxed);
+                        if (count < 20) {
+                            const char* logPath = "C:\\SSEEngineFixesForWine_crash.log";
+                            FILE* f2 = nullptr;
+                            fopen_s(&f2, logPath, "a");
+                            if (f2) {
+                                fprintf(f2, "FORM-RESOLVE #%d: RIP=+0x%llX formID=0x%08X → 0x%llX\n",
+                                    count + 1, rip - sImgBase, formId,
+                                    reinterpret_cast<unsigned long long>(resolved));
+                                fflush(f2);
+                                fclose(f2);
+                            }
+                        }
+                        return EXCEPTION_CONTINUE_EXECUTION;
+                    }
+
+                    // Form not found in hash table — skip instruction.
+                    // Better than crashing: the engine may null-check downstream.
                     auto instrLen = x86_instr_len(ripBytes);
+                    auto instrClass = classifyInstruction(ripBytes);
                     pep->ContextRecord->Rip += instrLen;
-                    auto count = g_nullSkipCount.fetch_add(1, std::memory_order_relaxed);
-                    // Log first few to crash log file for diagnostics
-                    if (count < 10) {
+
+                    if (instrClass == 'C') {
+                        pep->ContextRecord->EFlags &= ~0x40ULL;
+                        pep->ContextRecord->EFlags |= 0x01ULL;
+                    } else if (instrClass == 'F') {
+                        pep->ContextRecord->Rax = 0;
+                    }
+                    // Zero the register that held the bad form ID to prevent
+                    // downstream code from using it as a pointer again
+                    *regs[i] = 0;
+
+                    auto count = g_formIdSkipCount.fetch_add(1, std::memory_order_relaxed);
+                    if (count < 50) {
                         const char* logPath = "C:\\SSEEngineFixesForWine_crash.log";
                         FILE* f2 = nullptr;
                         fopen_s(&f2, logPath, "a");
                         if (f2) {
-                            fprintf(f2, "NULL-SKIP #%d: RIP=0x%llX (+0x%llX) +%dB target=0x%llX RAX=0x%llX\n",
-                                count + 1, rip, rip - sImgBase, instrLen,
-                                (unsigned long long)targetAddr, pep->ContextRecord->Rax);
+                            fprintf(f2, "FORM-SKIP #%d: RIP=+0x%llX +%dB type=%c formID=0x%08X NOT FOUND\n",
+                                count + 1, rip - sImgBase, instrLen, instrClass, formId);
                             fflush(f2);
                             fclose(f2);
                         }
@@ -729,68 +885,58 @@ namespace Patches::FormCaching
                 return EXCEPTION_CONTINUE_SEARCH;
 
             // Write to C:\ root (guaranteed known Wine path)
-            const char* logPath = "C:\\SSEEngineFixesForWine_crash.log";
+            {
+                const char* logPath = "C:\\SSEEngineFixesForWine_crash.log";
+                FILE* f = nullptr;
+                fopen_s(&f, logPath, "a");
+                if (f) {
+                    // rip, targetAddr, sImgBase already computed above
+                    auto offset = rip - sImgBase;
+                    bool inModule = true; // We already verified RIP is in SkyrimSE.exe
 
-            FILE* f = nullptr;
-            fopen_s(&f, logPath, "a");
-            if (f) {
-                auto code = pep->ExceptionRecord->ExceptionCode;
-                auto rip = pep->ContextRecord->Rip;
+                    fprintf(f, "\n=== SSEEngineFixesForWine CRASH LOG (v1.22.34) ===\n");
+                    fprintf(f, "Exception: 0x%08lX at RIP=0x%llX (SkyrimSE.exe+0x%llX)\n",
+                        code, rip, offset);
+                    fprintf(f, "Target address: 0x%llX\n", (unsigned long long)targetAddr);
+                    fprintf(f, "Registers:\n");
+                    fprintf(f, "  RAX=0x%016llX  RBX=0x%016llX  RCX=0x%016llX  RDX=0x%016llX\n",
+                        pep->ContextRecord->Rax, pep->ContextRecord->Rbx,
+                        pep->ContextRecord->Rcx, pep->ContextRecord->Rdx);
+                    fprintf(f, "  RSI=0x%016llX  RDI=0x%016llX  RBP=0x%016llX  RSP=0x%016llX\n",
+                        pep->ContextRecord->Rsi, pep->ContextRecord->Rdi,
+                        pep->ContextRecord->Rbp, pep->ContextRecord->Rsp);
+                    fprintf(f, "  R8 =0x%016llX  R9 =0x%016llX  R10=0x%016llX  R11=0x%016llX\n",
+                        pep->ContextRecord->R8, pep->ContextRecord->R9,
+                        pep->ContextRecord->R10, pep->ContextRecord->R11);
+                    fprintf(f, "  R12=0x%016llX  R13=0x%016llX  R14=0x%016llX  R15=0x%016llX\n",
+                        pep->ContextRecord->R12, pep->ContextRecord->R13,
+                        pep->ContextRecord->R14, pep->ContextRecord->R15);
 
-                // Compute module-relative offset
-                static auto imgBase = REL::Module::get().base();
-                auto offset = rip - imgBase;
-                bool inModule = (rip >= imgBase && rip < imgBase + 0x10000000);
-
-                ULONG_PTR targetAddr = 0;
-                if (pep->ExceptionRecord->NumberParameters >= 2)
-                    targetAddr = pep->ExceptionRecord->ExceptionInformation[1];
-
-                fprintf(f, "\n=== SSEEngineFixesForWine CRASH LOG (v1.22.34) ===\n");
-                fprintf(f, "Exception: 0x%08lX at RIP=0x%llX", code, rip);
-                if (inModule)
-                    fprintf(f, " (SkyrimSE.exe+0x%llX)", offset);
-                fprintf(f, "\n");
-                fprintf(f, "Target address: 0x%llX\n", (unsigned long long)targetAddr);
-                fprintf(f, "Registers:\n");
-                fprintf(f, "  RAX=0x%016llX  RBX=0x%016llX  RCX=0x%016llX  RDX=0x%016llX\n",
-                    pep->ContextRecord->Rax, pep->ContextRecord->Rbx,
-                    pep->ContextRecord->Rcx, pep->ContextRecord->Rdx);
-                fprintf(f, "  RSI=0x%016llX  RDI=0x%016llX  RBP=0x%016llX  RSP=0x%016llX\n",
-                    pep->ContextRecord->Rsi, pep->ContextRecord->Rdi,
-                    pep->ContextRecord->Rbp, pep->ContextRecord->Rsp);
-                fprintf(f, "  R8 =0x%016llX  R9 =0x%016llX  R10=0x%016llX  R11=0x%016llX\n",
-                    pep->ContextRecord->R8, pep->ContextRecord->R9,
-                    pep->ContextRecord->R10, pep->ContextRecord->R11);
-                fprintf(f, "  R12=0x%016llX  R13=0x%016llX  R14=0x%016llX  R15=0x%016llX\n",
-                    pep->ContextRecord->R12, pep->ContextRecord->R13,
-                    pep->ContextRecord->R14, pep->ContextRecord->R15);
-
-                // Dump bytes at RIP for disassembly
-                fprintf(f, "Bytes at RIP:");
-                auto* ripBytes = reinterpret_cast<const std::uint8_t*>(rip);
-                if (!IsBadReadPtr(ripBytes, 16)) {
-                    for (int i = 0; i < 16; ++i)
-                        fprintf(f, " %02X", ripBytes[i]);
-                } else {
-                    fprintf(f, " <unreadable>");
-                }
-                fprintf(f, "\n");
-
-                // Stack dump (16 entries)
-                fprintf(f, "Stack (RSP):");
-                auto* rspPtr = reinterpret_cast<const DWORD64*>(pep->ContextRecord->Rsp);
-                if (!IsBadReadPtr(rspPtr, 128)) {
+                    // Dump bytes at RIP for disassembly
+                    fprintf(f, "Bytes at RIP:");
+                    if (!IsBadReadPtr(ripBytes, 16)) {
+                        for (int i = 0; i < 16; ++i)
+                            fprintf(f, " %02X", ripBytes[i]);
+                    } else {
+                        fprintf(f, " <unreadable>");
+                    }
                     fprintf(f, "\n");
-                    for (int i = 0; i < 16; ++i)
-                        fprintf(f, "  [RSP+0x%02X] = 0x%016llX\n", i * 8, rspPtr[i]);
-                } else {
-                    fprintf(f, " <unreadable>\n");
-                }
 
-                fprintf(f, "=== END CRASH LOG ===\n");
-                fflush(f);
-                fclose(f);
+                    // Stack dump (16 entries)
+                    fprintf(f, "Stack (RSP):");
+                    auto* rspPtr = reinterpret_cast<const DWORD64*>(pep->ContextRecord->Rsp);
+                    if (!IsBadReadPtr(rspPtr, 128)) {
+                        fprintf(f, "\n");
+                        for (int i = 0; i < 16; ++i)
+                            fprintf(f, "  [RSP+0x%02X] = 0x%016llX\n", i * 8, rspPtr[i]);
+                    } else {
+                        fprintf(f, " <unreadable>\n");
+                    }
+
+                    fprintf(f, "=== END CRASH LOG ===\n");
+                    fflush(f);
+                    fclose(f);
+                }
             }
 
             // Also try to flush spdlog
