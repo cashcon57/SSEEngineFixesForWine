@@ -2606,12 +2606,7 @@ namespace Patches::FormCaching
                                 fprintf(f, "AUTO-NEWGAME: sending Down+Enter to select New Game\n");
                                 fflush(f); fclose(f);
                             }
-                            // Navigate: Down arrow (skip Continue → New Game)
-                            keybd_event(0x28, 0, 0, 0);            // VK_DOWN = 0x28
-                            Sleep(50);
-                            keybd_event(0x28, 0, KEYEVENTF_KEYUP, 0);
-                            Sleep(300);
-                            // Press Enter to select New Game
+                            // Press Enter to select New Game (first menu item)
                             keybd_event(0x0D, 0, 0, 0);            // VK_RETURN = 0x0D
                             Sleep(50);
                             keybd_event(0x0D, 0, KEYEVENTF_KEYUP, 0);
