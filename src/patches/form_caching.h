@@ -664,18 +664,11 @@ namespace Patches::FormCaching
             if (g_crashLogCount.fetch_add(1, std::memory_order_relaxed) >= 5)
                 return EXCEPTION_CONTINUE_SEARCH;
 
-            // Write to game directory (known Wine path via REL::Module)
-            auto imgBase = REL::Module::get().base();
-            auto exePath = REL::Module::get().filename();
-            auto logPath = std::string(exePath.data(), exePath.size());
-            // Replace SkyrimSE.exe with crash log name
-            auto lastSlash = logPath.rfind('\\');
-            if (lastSlash != std::string::npos)
-                logPath = logPath.substr(0, lastSlash);
-            logPath += "\\Data\\SKSE\\Plugins\\SSEEngineFixesForWine_crash.log";
+            // Write to C:\ root (guaranteed known Wine path)
+            const char* logPath = "C:\\SSEEngineFixesForWine_crash.log";
 
             FILE* f = nullptr;
-            fopen_s(&f, logPath.c_str(), "a");
+            fopen_s(&f, logPath, "a");
             if (f) {
                 auto code = pep->ExceptionRecord->ExceptionCode;
                 auto rip = pep->ContextRecord->Rip;
