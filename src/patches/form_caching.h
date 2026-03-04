@@ -2585,6 +2585,35 @@ namespace Patches::FormCaching
                 }).detach();
                 logger::info("  Started watchdog thread (10s interval)");
 
+                // ==========================================================
+                // Auto-New-Game for automated testing
+                // If C:\auto_newgame.flag exists, send Enter key after a
+                // short delay to start a new game from the main menu.
+                // Runs inside the game process so keybd_event is guaranteed
+                // to reach the Skyrim window.
+                // ==========================================================
+                {
+                    FILE* flagFile = nullptr;
+                    fopen_s(&flagFile, "C:\\auto_newgame.flag", "r");
+                    if (flagFile) {
+                        fclose(flagFile);
+                        logger::info("  auto_newgame.flag found — will auto-start New Game in 5s");
+                        std::thread([]() {
+                            Sleep(5000);
+                            FILE* f = nullptr;
+                            fopen_s(&f, "C:\\SSEEngineFixesForWine_crash.log", "a");
+                            if (f) {
+                                fprintf(f, "AUTO-NEWGAME: sending Enter key\n");
+                                fflush(f); fclose(f);
+                            }
+                            // Send Enter key down + up
+                            keybd_event(VK_RETURN, 0, 0, 0);
+                            Sleep(50);
+                            keybd_event(VK_RETURN, 0, KEYEVENTF_KEYUP, 0);
+                        }).detach();
+                    }
+                }
+
                 logger::info("=== END InitItemImpl Phase (v1.22.36) ==="sv);
             }
 
