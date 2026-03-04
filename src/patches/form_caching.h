@@ -584,16 +584,26 @@ namespace Patches::FormCaching
                     return EXCEPTION_CONTINUE_EXECUTION;
                 }
 
-                // v1.22.29: Form not in cache — use sentinel (zeroed memory)
-                // instead of crashing. The engine reads flags=0 and moves on.
+                // v1.22.31: Form not in cache — skip the faulting instruction.
+                // Zero the register and advance RIP. Set ZF=1 in EFLAGS so
+                // any conditional branch after a TEST/CMP takes the "no match"
+                // / "zero" path, which is the safe/skip path.
+                // The sentinel approach (v1.22.29) caused cascading failures
+                // because downstream code read invalid data from the sentinel.
                 auto sentCount = g_sentinelUseCount.fetch_add(1, std::memory_order_relaxed);
                 if (sentCount < 20) {
-                    logger::warn("FormFixupVEH: {}=0x{:X} (formID 0x{:08X}) NOT FOUND → sentinel at RIP=0x{:X}",
+                    logger::warn("FormFixupVEH: {}=0x{:X} (formID 0x{:08X}) NOT FOUND → skip at RIP=0x{:X}",
                         regNames[i], val, formId, pep->ContextRecord->Rip);
                 } else if (sentCount == 20) {
-                    logger::warn("FormFixupVEH: suppressing sentinel log messages (20 logged)");
+                    logger::warn("FormFixupVEH: suppressing skip log messages (20 logged)");
                 }
-                *regs[i] = reinterpret_cast<DWORD64>(&g_sentinelForm[0]);
+                // Zero the register that held the form ID
+                *regs[i] = 0;
+                // Skip the faulting instruction
+                const auto* rip = reinterpret_cast<const std::uint8_t*>(pep->ContextRecord->Rip);
+                pep->ContextRecord->Rip += x86_instr_len(rip);
+                // Set ZF=1 (bit 6 of EFLAGS) — "test result is zero"
+                pep->ContextRecord->EFlags |= 0x40;
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
 
