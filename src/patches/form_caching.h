@@ -7,6 +7,7 @@
 #include <set>
 #include <shared_mutex>
 #include <sstream>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -73,7 +74,7 @@ namespace Patches::FormCaching
         inline std::atomic<std::uint64_t> g_formFixupCount{ 0 };
         // v1.22.27: Count of forms that faulted during InitItem (SEH-caught)
         inline std::atomic<std::uint64_t> g_initFaultCount{ 0 };
-        // v1.22.34: Sentinel form page — a fake TESForm that looks "deleted"
+        // v1.22.35: Sentinel form page — a fake TESForm that looks "deleted"
         // to the engine. VEH redirects null form pointers here. The engine
         // reads kDeleted from formFlags and skips processing entirely.
         //
@@ -95,6 +96,7 @@ namespace Patches::FormCaching
         inline DWORD64 g_zeroPageEnd = 0;
         inline std::atomic<std::uint64_t> g_zeroPageUseCount{ 0 };
         inline std::atomic<std::uint64_t> g_zeroPageWriteSkips{ 0 };
+        inline std::atomic<std::uint64_t> g_catchAllCount{ 0 };
         // Legacy sentinel (kept for FormReferenceFixupVEH compatibility)
         alignas(64) inline std::uint8_t g_sentinelForm[0x400] = {};
         inline std::atomic<std::uint64_t> g_sentinelUseCount{ 0 };
@@ -570,7 +572,7 @@ namespace Patches::FormCaching
             if (pep->ExceptionRecord->NumberParameters >= 2)
                 targetAddr = pep->ExceptionRecord->ExceptionInformation[1];
 
-            // v1.22.34: Handle null-pointer form dereferences.
+            // v1.22.35: Handle null-pointer form dereferences.
             // After kDeleted flagging + code cave, the engine still hits
             // null form pointers (RAX=0) in the AI evaluation chain.
             // Pattern: `cmp byte ptr [rax+0x1A], 0x2B` where rax=0.
@@ -663,7 +665,7 @@ namespace Patches::FormCaching
                     return EXCEPTION_CONTINUE_EXECUTION;
                 }
 
-                // v1.22.34: Form not in cache — let the crash happen cleanly.
+                // v1.22.35: Form not in cache — let the crash happen cleanly.
                 // Previous approaches (sentinel, instruction skip, zero+ZF)
                 // all caused cascading failures downstream. A clean crash
                 // at the original site gives better diagnostic information.
@@ -682,7 +684,7 @@ namespace Patches::FormCaching
         }
 
         // ================================================================
-        // v1.22.34: First-chance crash logger VEH.
+        // v1.22.35: First-chance crash logger VEH.
         //
         // Catches access violations and writes diagnostic info
         // (crash address, exception code, registers, module offset)
@@ -1048,8 +1050,7 @@ namespace Patches::FormCaching
                     pep->ContextRecord->Rip += instrLen;
                     pep->ContextRecord->Rax = 0;
 
-                    static std::atomic<std::uint64_t> s_catchAllCount{ 0 };
-                    auto count = s_catchAllCount.fetch_add(1, std::memory_order_relaxed);
+                    auto count = g_catchAllCount.fetch_add(1, std::memory_order_relaxed);
                     if (count < 200) {
                         const char* logPath = "C:\\SSEEngineFixesForWine_crash.log";
                         FILE* f2 = nullptr;
@@ -1059,6 +1060,19 @@ namespace Patches::FormCaching
                                 count + 1, rip - sImgBase, instrLen,
                                 (unsigned long long)targetAddr,
                                 (unsigned long long)pep->ContextRecord->Rax);
+                            // Byte dump: first time per unique RIP
+                            static DWORD64 s_dumpedRips[32] = {};
+                            static int s_dumpCount = 0;
+                            bool alreadyDumped = false;
+                            for (int d = 0; d < s_dumpCount; ++d)
+                                if (s_dumpedRips[d] == rip) { alreadyDumped = true; break; }
+                            if (!alreadyDumped && s_dumpCount < 32) {
+                                s_dumpedRips[s_dumpCount++] = rip;
+                                fprintf(f2, "  BYTES[+0x%llX]:", rip - sImgBase);
+                                if (!IsBadReadPtr(ripBytes, 32))
+                                    for (int b = 0; b < 32; ++b) fprintf(f2, " %02X", ripBytes[b]);
+                                fprintf(f2, "\n");
+                            }
                             fflush(f2);
                             fclose(f2);
                         }
@@ -1084,7 +1098,7 @@ namespace Patches::FormCaching
                     auto offset = rip - sImgBase;
                     bool inModule = true; // We already verified RIP is in SkyrimSE.exe
 
-                    fprintf(f, "\n=== SSEEngineFixesForWine CRASH LOG (v1.22.34) ===\n");
+                    fprintf(f, "\n=== SSEEngineFixesForWine CRASH LOG (v1.22.35) ===\n");
                     fprintf(f, "Exception: 0x%08lX at RIP=0x%llX (SkyrimSE.exe+0x%llX)\n",
                         code, rip, offset);
                     fprintf(f, "Target address: 0x%llX\n", (unsigned long long)targetAddr);
@@ -1559,7 +1573,7 @@ namespace Patches::FormCaching
         // loop at +0x11C then runs, loading all forms natively.
         // ================================================================
         // ================================================================
-        // v1.22.34: Binary patch at AE 29846+0x95 — targeted crash fix
+        // v1.22.35: Binary patch at AE 29846+0x95 — targeted crash fix
         // with form ID resolution.
         //
         // The instruction `test dword ptr [rax+0x28], 0x3FF` crashes when
@@ -1571,7 +1585,7 @@ namespace Patches::FormCaching
         //   3. If resolved: replace RAX, execute original TEST
         //   4. If not resolved: xor eax,eax + ZF=1, skip
         //
-        // v1.22.34: Now resolves form IDs instead of just zeroing RAX.
+        // v1.22.35: Now resolves form IDs instead of just zeroing RAX.
         // This prevents cascading null-pointer failures downstream.
         // ================================================================
         inline void PatchFormPointerValidation()
@@ -1744,6 +1758,189 @@ namespace Patches::FormCaching
             FlushInstructionCache(GetCurrentProcess(), patchSite, 7);
 
             logger::info("PatchFormPointerValidation: patched 29846+0x95 → code cave (rel32={})", rel32);
+#endif
+        }
+
+        // v1.22.35: Binary patches at hot VEH addresses with inline null checks.
+        // Eliminates VEH overhead for the most-hit crash sites by checking for
+        // null/sentinel form pointers before the faulting instruction.
+        inline void PatchHotSpotNullChecks()
+        {
+#ifdef SKYRIM_AE
+            auto base = REL::Module::get().base();
+            auto& trampoline = SKSE::GetTrampoline();
+
+            // ── Patch A: +0x2ED880 — null check before call [rax+0x4B8] ──
+            // Original: FF 90 B8 04 00 00 (6 bytes)
+            // If RAX is null or in sentinel page, skip the call and return 0.
+            {
+                auto* site = reinterpret_cast<std::uint8_t*>(base + 0x2ED880);
+                auto returnAddr = reinterpret_cast<std::uint64_t>(site + 6);
+
+                logger::info("PatchHotSpotA: bytes at +0x2ED880: "
+                    "{:02X} {:02X} {:02X} {:02X} {:02X} {:02X}",
+                    site[0], site[1], site[2], site[3], site[4], site[5]);
+
+                if (site[0] != 0xFF || site[1] != 0x90 || site[2] != 0xB8 ||
+                    site[3] != 0x04 || site[4] != 0x00 || site[5] != 0x00) {
+                    logger::error("PatchHotSpotA: unexpected bytes — NOT patching");
+                } else {
+                    auto* cave = static_cast<std::uint8_t*>(trampoline.allocate(80));
+                    int off = 0;
+
+                    // test rax, rax
+                    cave[off++] = 0x48; cave[off++] = 0x85; cave[off++] = 0xC0;
+                    // jz .null_form
+                    cave[off++] = 0x74;
+                    int jzOff = off;
+                    cave[off++] = 0x00; // placeholder
+
+                    // Check sentinel range using R11 (volatile, destroyed by call)
+                    if (g_zeroPage) {
+                        // mov r11, <sentinelBase>
+                        cave[off++] = 0x49; cave[off++] = 0xBB;
+                        std::memcpy(&cave[off], &g_zeroPageBase, 8); off += 8;
+                        // cmp rax, r11
+                        cave[off++] = 0x4C; cave[off++] = 0x39; cave[off++] = 0xD8;
+                        // jb .do_call
+                        cave[off++] = 0x72;
+                        int jbCallOff = off;
+                        cave[off++] = 0x00;
+                        // add r11, 0x10000
+                        cave[off++] = 0x49; cave[off++] = 0x81; cave[off++] = 0xC3;
+                        cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x01; cave[off++] = 0x00;
+                        // cmp rax, r11
+                        cave[off++] = 0x4C; cave[off++] = 0x39; cave[off++] = 0xD8;
+                        // jb .null_form (in sentinel range)
+                        cave[off++] = 0x72;
+                        int jbNullOff = off;
+                        cave[off++] = 0x00;
+
+                        // .do_call:
+                        int doCallStart = off;
+                        cave[jbCallOff] = static_cast<std::uint8_t>(doCallStart - (jbCallOff + 1));
+
+                        // Original: call qword ptr [rax+0x4B8]
+                        cave[off++] = 0xFF; cave[off++] = 0x90;
+                        cave[off++] = 0xB8; cave[off++] = 0x04; cave[off++] = 0x00; cave[off++] = 0x00;
+                        // jmp [rip+0] → returnSite
+                        cave[off++] = 0xFF; cave[off++] = 0x25;
+                        cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00;
+                        std::memcpy(&cave[off], &returnAddr, 8); off += 8;
+
+                        // .null_form:
+                        int nullStart = off;
+                        cave[jzOff] = static_cast<std::uint8_t>(nullStart - (jzOff + 1));
+                        cave[jbNullOff] = static_cast<std::uint8_t>(nullStart - (jbNullOff + 1));
+                    } else {
+                        // No sentinel — just null check
+                        // Original: call qword ptr [rax+0x4B8]
+                        cave[off++] = 0xFF; cave[off++] = 0x90;
+                        cave[off++] = 0xB8; cave[off++] = 0x04; cave[off++] = 0x00; cave[off++] = 0x00;
+                        // jmp [rip+0] → returnSite
+                        cave[off++] = 0xFF; cave[off++] = 0x25;
+                        cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00;
+                        std::memcpy(&cave[off], &returnAddr, 8); off += 8;
+
+                        // .null_form:
+                        int nullStart = off;
+                        cave[jzOff] = static_cast<std::uint8_t>(nullStart - (jzOff + 1));
+                    }
+
+                    // xor eax, eax
+                    cave[off++] = 0x31; cave[off++] = 0xC0;
+                    // jmp [rip+0] → returnSite
+                    cave[off++] = 0xFF; cave[off++] = 0x25;
+                    cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00;
+                    std::memcpy(&cave[off], &returnAddr, 8); off += 8;
+
+                    logger::info("PatchHotSpotA: cave {} bytes at 0x{:X}", off,
+                        reinterpret_cast<std::uintptr_t>(cave));
+
+                    // Patch: JMP rel32 (5 bytes) + NOP (1 byte)
+                    DWORD oldProt;
+                    VirtualProtect(site, 6, PAGE_EXECUTE_READWRITE, &oldProt);
+                    auto jmpTarget = reinterpret_cast<std::intptr_t>(cave);
+                    auto jmpFrom = reinterpret_cast<std::intptr_t>(site + 5);
+                    auto dist = jmpTarget - jmpFrom;
+                    if (dist > INT32_MAX || dist < INT32_MIN) {
+                        logger::error("PatchHotSpotA: JMP too far ({}) — NOT patching", dist);
+                        VirtualProtect(site, 6, oldProt, &oldProt);
+                    } else {
+                        auto rel32 = static_cast<std::int32_t>(dist);
+                        site[0] = 0xE9;
+                        std::memcpy(&site[1], &rel32, 4);
+                        site[5] = 0x90;
+                        VirtualProtect(site, 6, oldProt, &oldProt);
+                        FlushInstructionCache(GetCurrentProcess(), site, 6);
+                        logger::info("PatchHotSpotA: +0x2ED880 patched (rel32={})", rel32);
+                    }
+                }
+            }
+
+            // ── Patch B: +0x32D146 — null check before cmp byte [rax+0x1A] ──
+            // Original: 80 78 1A 2B 4C 0F 44 D0 (8 bytes)
+            // cmp byte [rax+0x1A], 0x2B; cmovz r10, rax
+            // If RAX is null, skip both instructions (type won't match anyway).
+            {
+                auto* site = reinterpret_cast<std::uint8_t*>(base + 0x32D146);
+                auto returnAddr = reinterpret_cast<std::uint64_t>(site + 8);
+
+                logger::info("PatchHotSpotB: bytes at +0x32D146: "
+                    "{:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X}",
+                    site[0], site[1], site[2], site[3],
+                    site[4], site[5], site[6], site[7]);
+
+                if (site[0] != 0x80 || site[1] != 0x78 || site[2] != 0x1A || site[3] != 0x2B ||
+                    site[4] != 0x4C || site[5] != 0x0F || site[6] != 0x44 || site[7] != 0xD0) {
+                    logger::error("PatchHotSpotB: unexpected bytes — NOT patching");
+                } else {
+                    auto* cave = static_cast<std::uint8_t*>(trampoline.allocate(48));
+                    int off = 0;
+
+                    // test rax, rax
+                    cave[off++] = 0x48; cave[off++] = 0x85; cave[off++] = 0xC0;
+                    // jz .skip
+                    cave[off++] = 0x74;
+                    int jzOff = off;
+                    cave[off++] = 0x00;
+                    // Original: cmp byte [rax+0x1A], 0x2B
+                    cave[off++] = 0x80; cave[off++] = 0x78; cave[off++] = 0x1A; cave[off++] = 0x2B;
+                    // Original: cmovz r10, rax
+                    cave[off++] = 0x4C; cave[off++] = 0x0F; cave[off++] = 0x44; cave[off++] = 0xD0;
+                    // .skip:
+                    int skipStart = off;
+                    cave[jzOff] = static_cast<std::uint8_t>(skipStart - (jzOff + 1));
+                    // jmp [rip+0] → returnSite
+                    cave[off++] = 0xFF; cave[off++] = 0x25;
+                    cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00;
+                    std::memcpy(&cave[off], &returnAddr, 8); off += 8;
+
+                    logger::info("PatchHotSpotB: cave {} bytes at 0x{:X}", off,
+                        reinterpret_cast<std::uintptr_t>(cave));
+
+                    // Patch: JMP rel32 (5 bytes) + 3 NOPs
+                    DWORD oldProt;
+                    VirtualProtect(site, 8, PAGE_EXECUTE_READWRITE, &oldProt);
+                    auto jmpTarget = reinterpret_cast<std::intptr_t>(cave);
+                    auto jmpFrom = reinterpret_cast<std::intptr_t>(site + 5);
+                    auto dist = jmpTarget - jmpFrom;
+                    if (dist > INT32_MAX || dist < INT32_MIN) {
+                        logger::error("PatchHotSpotB: JMP too far ({}) — NOT patching", dist);
+                        VirtualProtect(site, 8, oldProt, &oldProt);
+                    } else {
+                        auto rel32 = static_cast<std::int32_t>(dist);
+                        site[0] = 0xE9;
+                        std::memcpy(&site[1], &rel32, 4);
+                        site[5] = 0x90; site[6] = 0x90; site[7] = 0x90;
+                        VirtualProtect(site, 8, oldProt, &oldProt);
+                        FlushInstructionCache(GetCurrentProcess(), site, 8);
+                        logger::info("PatchHotSpotB: +0x32D146 patched (rel32={})", rel32);
+                    }
+                }
+            }
+
+            logger::info("PatchHotSpotNullChecks: done");
 #endif
         }
 
@@ -1957,7 +2154,7 @@ namespace Patches::FormCaching
             }
 
             // ==========================================================
-            // v1.22.34: Hex dump AE 13753 validation loop for future analysis.
+            // v1.22.35: Hex dump AE 13753 validation loop for future analysis.
             // The per-file validation at +0xE0 to +0x120 determines which
             // files get loaded. Dumping bytes helps reverse-engineer the
             // skip logic that blocks 1787 files under Wine.
@@ -1980,7 +2177,7 @@ namespace Patches::FormCaching
             }
 
             // ==========================================================
-            // v1.22.34: Multi-pass form loading.
+            // v1.22.35: Multi-pass form loading.
             //
             // After the first AE 13753 call, 1787 files are skipped
             // (compileIndex still 0xFF). The per-file validation function
@@ -2068,11 +2265,11 @@ namespace Patches::FormCaching
             // After loading forms, call InitItemImpl() on every form to
             // resolve stored form IDs into live pointers.
             //
-            // v1.22.34: Multi-pass InitItem — retry faulted forms after
+            // v1.22.35: Multi-pass InitItem — retry faulted forms after
             // the first pass, since more references may be resolvable.
             // ==========================================================
             if (addFormDelta > 100) {
-                logger::info("=== InitItemImpl Phase (v1.22.34 — multi-pass) ==="sv);
+                logger::info("=== InitItemImpl Phase (v1.22.35 — multi-pass) ==="sv);
 
                 auto* saveLoadGame = RE::BGSSaveLoadGame::GetSingleton();
                 if (saveLoadGame) {
@@ -2165,7 +2362,7 @@ namespace Patches::FormCaching
                 logger::info("  InitItem pass 1: {} initialized, {} faulted, {}ms",
                     initCount, faultedForms.size(), pass1Ms);
 
-                // v1.22.34: Retry faulted forms (up to 3 retry passes).
+                // v1.22.35: Retry faulted forms (up to 3 retry passes).
                 // After pass 1 resolves many references, previously-faulting
                 // forms may now succeed because their dependencies are resolved.
                 for (int retryPass = 2; retryPass <= 4 && !faultedForms.empty(); ++retryPass) {
@@ -2204,7 +2401,7 @@ namespace Patches::FormCaching
                     initCount, faultedForms.size(), totalMs);
 
                 // ==========================================================
-                // v1.22.34: Mark permanently faulted forms as kDeleted.
+                // v1.22.35: Mark permanently faulted forms as kDeleted.
                 //
                 // The 179 faulted ActorCharacter forms have null internal
                 // pointers (race, base NPC, etc) that cause null-dereference
@@ -2243,19 +2440,18 @@ namespace Patches::FormCaching
                     logger::info("  Flagged {} permanently faulted forms as kDeleted+kDisabled", flaggedCount);
                 }
 
-                // v1.22.34: Allocate zero page for null-form substitution.
+                // v1.22.35: Allocate zero page for null-form substitution.
                 // ── Sentinel form infrastructure ──
                 // 1. Stub function page (PAGE_EXECUTE_READ): "xor eax,eax; ret"
                 g_stubFuncPage = VirtualAlloc(nullptr, 0x1000,
                     MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
                 if (g_stubFuncPage) {
                     auto* code = reinterpret_cast<std::uint8_t*>(g_stubFuncPage);
-                    // Return 1 (not 0): many engine functions treat 0 as
-                    // "not found / retry" causing infinite loops. 1 means
-                    // "done / success / skip" in most contexts.
-                    code[0] = 0xB8; code[1] = 0x01; code[2] = 0x00; // mov eax, 1
-                    code[3] = 0x00; code[4] = 0x00;
-                    code[5] = 0xC3;                                   // ret
+                    // Return 0: stub function for sentinel form vtable calls.
+                    // Returning 1 caused secondary faults (test byte [1+0x40]).
+                    // Returning 0 makes callers take "not found" branches cleanly.
+                    code[0] = 0x31; code[1] = 0xC0; // xor eax, eax
+                    code[2] = 0xC3;                  // ret
                     DWORD oldProt = 0;
                     VirtualProtect(g_stubFuncPage, 0x1000, PAGE_EXECUTE_READ, &oldProt);
                     logger::info("  Stub function at 0x{:X}",
@@ -2319,20 +2515,47 @@ namespace Patches::FormCaching
                 AddVectoredExceptionHandler(1, FormReferenceFixupVEH);
                 logger::info("  Installed persistent FormReferenceFixupVEH");
 
-                // v1.22.34: Binary patch at 29846+0x95 with form resolution.
+                // v1.22.35: Binary patch at 29846+0x95 with form resolution.
                 PatchFormPointerValidation();
 
-                // v1.22.34: Install first-chance crash logger VEH.
+                // v1.22.35: Binary patches at hot VEH addresses with null checks.
+                PatchHotSpotNullChecks();
+
+                // v1.22.35: Install first-chance crash logger VEH.
                 // This logs crash info to Data/SKSE/Plugins/ for guaranteed
                 // capture even when spdlog hasn't flushed.
                 AddVectoredExceptionHandler(1, CrashLoggerVEH);
                 g_crashLoggerActive.store(true, std::memory_order_release);
                 logger::info("  Installed CrashLoggerVEH (first-chance, writes to Data/SKSE/Plugins/)");
 
-                logger::info("=== END InitItemImpl Phase (v1.22.34) ==="sv);
+                // v1.22.35: Watchdog thread — logs VEH counters every 10 seconds
+                // to diagnose freezes (infinite loop vs slow processing).
+                std::thread([]() {
+                    int tick = 0;
+                    while (true) {
+                        Sleep(10000);
+                        tick++;
+                        FILE* f = nullptr;
+                        fopen_s(&f, "C:\\SSEEngineFixesForWine_crash.log", "a");
+                        if (f) {
+                            fprintf(f, "WATCHDOG #%d (t=%ds): zp=%llu ws=%llu nc=%d fi=%d ca=%llu\n",
+                                tick, tick * 10,
+                                g_zeroPageUseCount.load(std::memory_order_relaxed),
+                                g_zeroPageWriteSkips.load(std::memory_order_relaxed),
+                                g_nullSkipCount.load(std::memory_order_relaxed),
+                                g_formIdSkipCount.load(std::memory_order_relaxed),
+                                g_catchAllCount.load(std::memory_order_relaxed));
+                            fflush(f);
+                            fclose(f);
+                        }
+                    }
+                }).detach();
+                logger::info("  Started watchdog thread (10s interval)");
+
+                logger::info("=== END InitItemImpl Phase (v1.22.35) ==="sv);
             }
 
-            logger::info("=== END ForceLoadAllForms (v1.22.34) ==="sv);
+            logger::info("=== END ForceLoadAllForms (v1.22.35) ==="sv);
 #else
             logger::info("ForceLoadAllForms: SE build — skipping (AE-only fix)"sv);
 #endif
