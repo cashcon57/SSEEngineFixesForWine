@@ -34,6 +34,7 @@ Provides the same 38 bug fixes and 14 patches as the original, rewritten to work
   - [The 179 Faulted ActorCharacter Forms](#the-179-faulted-actorcharacter-forms)
   - [Form-ID-as-Pointer Bug Under Wine](#form-id-as-pointer-bug-under-wine)
   - [Vectored Exception Handler Architecture](#vectored-exception-handler-architecture)
+  - [Sentinel Zero Page Architecture](#sentinel-zero-page-architecture)
 - [Who Else This Helps](#who-else-this-helps)
 - [Diagnostic Version History](#diagnostic-version-history)
 - [Credits](#credits)
@@ -652,6 +653,43 @@ Without the VEH, the game crashes at step 1. With null-skip only, it crashes at 
 
 ---
 
+### Sentinel Zero Page Architecture
+
+(v1.22.41+) A 64KB VirtualAlloc page (`g_zeroPage`) serves as a "null object" for missing or faulted forms. Instead of leaving null pointers for the engine to crash on, all form pointer fields that would be null are redirected to the zero page. The zero page contains:
+
+| Offset | Content | Purpose |
+|--------|---------|---------|
+| `+0x00` | `g_stubVtable` pointer | Stub vtable where every entry points to a no-op function returning 0 |
+| `+0x10` | `0x20` (kDeleted flag) | Engine checks `formFlags & kDeleted` before processing; prevents AI evaluation, rendering, physics |
+| `+0x4B8` | `g_stubFuncPage` pointer | Stub function page for virtual calls at known hot offsets |
+
+**PAGE_READWRITE vs PAGE_READONLY:**
+
+The zero page protection mode is a critical tradeoff:
+
+- **PAGE_READONLY** (default after ForceLoadAllForms): Engine writes to sentinel forms trigger VEH exceptions. Each exception is handled by skipping the write instruction. This is safe but generates ~7K exceptions/sec during certain operations (write-skip flood).
+
+- **PAGE_READWRITE** (during initial load only): Writes succeed silently — no VEH overhead. But the engine can corrupt the vtable at `+0x00` and formFlags at `+0x10`. If ClearData (which calls virtual functions on sentinel forms) runs while PAGE_READWRITE is active, the corrupted vtable causes infinite loops.
+
+**Current strategy (v1.22.50):** PAGE_READWRITE on first FORM-ZEROPAGE redirect during initial load (eliminates the flood — only 3 write-skip events vs 7K+/10s). ForceLoadAllForms restores vtable, formFlags, and stub pointers, then switches to PAGE_READONLY. ClearData always runs with PAGE_READONLY to prevent vtable corruption.
+
+**`g_zpWritable` atomic flag:** Tracks the current protection state. Set `true` on first redirect; cleared when ForceLoadAllForms restores PAGE_READONLY. Avoids redundant `VirtualProtect` calls.
+
+```
+Initial load:
+  ┌─ First FORM-ZEROPAGE redirect → PAGE_READWRITE (g_zpWritable = true)
+  │  Engine writes succeed silently, no VEH overhead
+  │  ...loading continues...
+  └─ ForceLoadAllForms complete → restore vtable+flags+stubs → PAGE_READONLY (g_zpWritable = false)
+
+Post-load (gameplay):
+  Page is PAGE_READONLY
+  Any writes → VEH skip (rare during gameplay, frequent during ClearData)
+  ClearData virtual calls on sentinel forms → stub vtable → safe no-op returns
+```
+
+---
+
 ## Who Else This Helps
 
 The work in this project has broad applicability beyond just SSE Engine Fixes. The following are concrete examples of projects that could directly benefit from these findings.
@@ -754,6 +792,21 @@ The versionlib hash format documented in [Address Library: versionlib Binary For
 | v1.22.32 | PatchFormPointerValidation: binary code cave at AE 29846+0x95 (`test dword ptr [rax+0x28], 0x3FF`). If RAX looks like a form ID (high 32 bits = 0), calls `GetFormByNumericId` to resolve. If resolved, uses real pointer; if not, zeros RAX. 136-byte code cave at dynamically allocated page. |
 | v1.22.33 | Identified 179 permanently faulted ActorCharacter forms (type 62). All from ESL-flagged mods. `InitItem` retry has no effect — the fault is permanent, not ordering-dependent. Crash sites at +0x32D146 (`cmp byte ptr [rax+0x1A], 0x2B`), +0x2ED880 (`call [rax+0x4B8]`), +0x49CAF2 (`lock inc [rax+0x28]`). |
 | v1.22.34 | **kDeleted flagging** of 179 faulted forms (`formFlags \|= 0x20 \| 0x800`). **CrashLoggerVEH** with file-based crash diagnostics (`C:\SSEEngineFixesForWine_crash.log`). **Consolidated VEH**: null-pointer skip with instruction classification (CMP→clear ZF, CALL→zero RAX), form-ID-as-pointer resolution/skip, register zeroing for unresolvable form IDs. |
+| v1.22.35 | Code caves at hot VEH crash sites (avoiding VEH overhead). Watchdog thread for hang detection. Revert stub return to 0. |
+| v1.22.36 | Log out-of-image and non-access-violation crashes for diagnosis. |
+| v1.22.37 | Auto-new-game feature for automated testing (flag-file triggered). Multiple input methods tested: SendInput, WM_CHAR, PostMessage, keybd_event, GFx HandleEvent. |
+| v1.22.38–39 | GFx HandleEvent for auto-newgame input. Poll for Main Menu readiness before sending input. Use `RE::Main::resetGame` for clean ClearData path. |
+| v1.22.40 | Use `RE::Main::resetGame = true` for auto-newgame — engine's own ClearData+reload path. |
+| v1.22.41 | **Sentinel zero page** made writable (PAGE_READWRITE). Periodic vtable refresh to repair engine corruption. |
+| v1.22.42 | Recompile plugins after ClearData to fix empty compiledFileCollection during reload. |
+| v1.22.43 | Auto-repair zero page vtable + handle corrupted vtable virtual calls. |
+| v1.22.44 | Revert to PAGE_READONLY sentinel page — writable page caused cascading vtable corruption. |
+| v1.22.45 | Catch-all VEH redirects to zero page instead of skipping instructions. All unrecognized null/low-address dereferences get redirected to the sentinel page. |
+| v1.22.46 | Watchdog RIP sampling for freeze diagnosis. Detects infinite loops by sampling instruction pointer every 5s. |
+| v1.22.47 | Two-phase catch-all redirect (never skip), faster RIP sampling rate. |
+| v1.22.48 | PAGE_READWRITE during reload (ClearData path), PAGE_READONLY restored after ForceLoadAllForms. Intended to eliminate VEH write-skip flood during reload. |
+| v1.22.49 | **Eliminated VEH write-skip flood**: `g_zpWritable` atomic flag + PAGE_READWRITE on first FORM-ZEROPAGE redirect during initial load. Moved ClearData PAGE_READWRITE to before original call. Result: 3 write-skip events (down from ~7K/10s). |
+| v1.22.50 | **Reverted ClearData PAGE_READWRITE** — causes vtable corruption → infinite loop hang (ClearData calls virtual functions on sentinel forms, corrupted vtable at offset +0x00 → infinite CPU loop with 0 memory growth). Removed auto_newgame flag. Manual "New Game" from UI does not call ClearData, avoiding both the write-skip flood and the vtable corruption. |
 
 ---
 

@@ -108,6 +108,47 @@ namespace Patches::FormCaching
         alignas(64) inline std::uint8_t g_sentinelForm[0x400] = {};
         inline std::atomic<std::uint64_t> g_sentinelUseCount{ 0 };
 
+        // v1.22.51: Persistent VEH handles — stored for potential cleanup.
+        inline PVOID g_vehFormFixup = nullptr;
+        inline PVOID g_vehCrashLogger = nullptr;
+
+        // v1.22.51: Dynamic log paths — resolved once at init from SKSE log dir.
+        // Fixed-size char arrays are safe to read from VEH handlers (no allocation).
+        inline char g_crashLogPath[MAX_PATH] = {};
+        inline char g_autoNewgameFlagPath[MAX_PATH] = {};
+
+        inline void InitPaths()
+        {
+            auto logDir = SKSE::log::log_directory();
+            if (logDir) {
+                auto crashPath = *logDir / "SSEEngineFixesForWine_crash.log";
+                strncpy_s(g_crashLogPath, crashPath.string().c_str(), _TRUNCATE);
+
+                auto flagPath = *logDir / "auto_newgame.flag";
+                strncpy_s(g_autoNewgameFlagPath, flagPath.string().c_str(), _TRUNCATE);
+            } else {
+                // Fallback if SKSE log dir unavailable (shouldn't happen in practice)
+                strncpy_s(g_crashLogPath, g_crashLogPath, _TRUNCATE);
+                strncpy_s(g_autoNewgameFlagPath, g_autoNewgameFlagPath, _TRUNCATE);
+            }
+            logger::info("Crash log path: {}", g_crashLogPath);
+        }
+
+        // v1.22.51: RAII guard for temporary VEH handlers.
+        // Ensures RemoveVectoredExceptionHandler runs on all exit paths,
+        // including exceptions thrown by the guarded code.
+        struct VehGuard {
+            PVOID handle;
+            VehGuard(ULONG first, PVECTORED_EXCEPTION_HANDLER handler)
+                : handle(AddVectoredExceptionHandler(first, handler)) {}
+            ~VehGuard() {
+                if (handle)
+                    RemoveVectoredExceptionHandler(handle);
+            }
+            VehGuard(const VehGuard&) = delete;
+            VehGuard& operator=(const VehGuard&) = delete;
+        };
+
         // v1.22.10: Enhanced ClearData diagnostic — dumps files list state
         // when ClearData fires, to see what the engine knew about before compile
         inline void DumpFilesListState(RE::TESDataHandler* a_self, const char* context)
@@ -530,7 +571,7 @@ namespace Patches::FormCaching
         inline LONG CALLBACK ForceLoadVEH(PEXCEPTION_POINTERS pep)
         {
             // Only active during ForceLoadAllForms
-            if (!g_forceLoadInProgress.load(std::memory_order_relaxed))
+            if (!g_forceLoadInProgress.load(std::memory_order_acquire))
                 return EXCEPTION_CONTINUE_SEARCH;
 
             // Only handle access violations
@@ -575,7 +616,7 @@ namespace Patches::FormCaching
         // ================================================================
         inline LONG CALLBACK FormReferenceFixupVEH(PEXCEPTION_POINTERS pep)
         {
-            if (!g_formFixupActive.load(std::memory_order_relaxed))
+            if (!g_formFixupActive.load(std::memory_order_acquire))
                 return EXCEPTION_CONTINUE_SEARCH;
 
             if (pep->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION)
@@ -773,7 +814,7 @@ namespace Patches::FormCaching
 
         inline LONG CALLBACK CrashLoggerVEH(PEXCEPTION_POINTERS pep)
         {
-            if (!g_crashLoggerActive.load(std::memory_order_relaxed))
+            if (!g_crashLoggerActive.load(std::memory_order_acquire))
                 return EXCEPTION_CONTINUE_SEARCH;
 
             auto code = pep->ExceptionRecord->ExceptionCode;
@@ -784,7 +825,7 @@ namespace Patches::FormCaching
                 auto cnt = s_nonAvCount.fetch_add(1, std::memory_order_relaxed);
                 if (cnt < 5) {
                     FILE* f = nullptr;
-                    fopen_s(&f, "C:\\SSEEngineFixesForWine_crash.log", "a");
+                    fopen_s(&f, g_crashLogPath, "a");
                     if (f) {
                         auto imgBase = REL::Module::get().base();
                         auto rip2 = pep->ContextRecord->Rip;
@@ -821,7 +862,7 @@ namespace Patches::FormCaching
 
                     auto count = g_zeroPageWriteSkips.fetch_add(1, std::memory_order_relaxed);
                     if (count < 200) {
-                        const char* logPath = "C:\\SSEEngineFixesForWine_crash.log";
+                        const char* logPath = g_crashLogPath;
                         FILE* f2 = nullptr;
                         fopen_s(&f2, logPath, "a");
                         if (f2) {
@@ -861,7 +902,7 @@ namespace Patches::FormCaching
 
                     auto count = g_nullSkipCount.fetch_add(1, std::memory_order_relaxed);
                     if (count < 50) {
-                        const char* logPath = "C:\\SSEEngineFixesForWine_crash.log";
+                        const char* logPath = g_crashLogPath;
                         FILE* f2 = nullptr;
                         fopen_s(&f2, logPath, "a");
                         if (f2) {
@@ -895,7 +936,7 @@ namespace Patches::FormCaching
                         static std::atomic<int> s_extFixCount{ 0 };
                         auto cnt2 = s_extFixCount.fetch_add(1, std::memory_order_relaxed);
                         if (cnt2 < 50) {
-                            const char* logPath = "C:\\SSEEngineFixesForWine_crash.log";
+                            const char* logPath = g_crashLogPath;
                             FILE* f = nullptr;
                             fopen_s(&f, logPath, "a");
                             if (f) {
@@ -913,7 +954,7 @@ namespace Patches::FormCaching
                 static std::atomic<int> s_extCount{ 0 };
                 auto cnt = s_extCount.fetch_add(1, std::memory_order_relaxed);
                 if (cnt < 10) {
-                    const char* logPath = "C:\\SSEEngineFixesForWine_crash.log";
+                    const char* logPath = g_crashLogPath;
                     FILE* f = nullptr;
                     fopen_s(&f, logPath, "a");
                     if (f) {
@@ -1010,7 +1051,7 @@ namespace Patches::FormCaching
 
                 auto count = g_zeroPageUseCount.fetch_add(1, std::memory_order_relaxed);
                 if (count < 200) {
-                    const char* logPath = "C:\\SSEEngineFixesForWine_crash.log";
+                    const char* logPath = g_crashLogPath;
                     FILE* f2 = nullptr;
                     fopen_s(&f2, logPath, "a");
                     if (f2) {
@@ -1086,7 +1127,7 @@ namespace Patches::FormCaching
                         *regs[i] = reinterpret_cast<DWORD64>(resolved);
                         auto count = g_formIdSkipCount.fetch_add(1, std::memory_order_relaxed);
                         if (count < 20) {
-                            const char* logPath = "C:\\SSEEngineFixesForWine_crash.log";
+                            const char* logPath = g_crashLogPath;
                             FILE* f2 = nullptr;
                             fopen_s(&f2, logPath, "a");
                             if (f2) {
@@ -1123,7 +1164,7 @@ namespace Patches::FormCaching
 
                         auto count = g_formIdSkipCount.fetch_add(1, std::memory_order_relaxed);
                         if (count < 50) {
-                            const char* logPath = "C:\\SSEEngineFixesForWine_crash.log";
+                            const char* logPath = g_crashLogPath;
                             FILE* f2 = nullptr;
                             fopen_s(&f2, logPath, "a");
                             if (f2) {
@@ -1212,7 +1253,7 @@ namespace Patches::FormCaching
 
                 auto count = g_catchAllCount.fetch_add(1, std::memory_order_relaxed);
                 if (count < 200) {
-                    const char* logPath = "C:\\SSEEngineFixesForWine_crash.log";
+                    const char* logPath = g_crashLogPath;
                     FILE* f2 = nullptr;
                     fopen_s(&f2, logPath, "a");
                     if (f2) {
@@ -1248,9 +1289,9 @@ namespace Patches::FormCaching
             if (g_crashLogCount.fetch_add(1, std::memory_order_relaxed) >= 20)
                 return EXCEPTION_CONTINUE_SEARCH;
 
-            // Write to C:\ root (guaranteed known Wine path)
+            // Write crash details to SKSE log directory
             {
-                const char* logPath = "C:\\SSEEngineFixesForWine_crash.log";
+                const char* logPath = g_crashLogPath;
                 FILE* f = nullptr;
                 fopen_s(&f, logPath, "a");
                 if (f) {
@@ -1374,7 +1415,7 @@ namespace Patches::FormCaching
                 // Re-compile every 1000 CloseTES calls to pick up newly-cataloged files.
                 // SUPPRESSED during ForceLoadAllForms: AE 13753 iterates compiledFileCollection
                 // and calling ManuallyCompileFiles here would clear+rebuild it (iterator invalidation).
-                if (!g_forceLoadInProgress.load(std::memory_order_relaxed) &&
+                if (!g_forceLoadInProgress.load(std::memory_order_acquire) &&
                     count >= s_lastCompileAtClose + 1000) {
                     s_lastCompileAtClose = count;
                     ManuallyCompileFiles();
@@ -2237,12 +2278,12 @@ namespace Patches::FormCaching
             // from invalidating compiledFileCollection while AE 13753 iterates it.
             g_vehSkipCount.store(0, std::memory_order_relaxed);
             g_forceLoadInProgress.store(true, std::memory_order_release);
-            auto* vehHandle = AddVectoredExceptionHandler(1, ForceLoadVEH);
+            {
+                VehGuard veh(1, ForceLoadVEH);
 
-            logger::info(">>> Calling AE 13753(TDH*, false) with VEH null guard (v1.22.27) <<<");
-            loadForms(tdh, false);
-
-            RemoveVectoredExceptionHandler(vehHandle);
+                logger::info(">>> Calling AE 13753(TDH*, false) with VEH null guard (v1.22.27) <<<");
+                loadForms(tdh, false);
+            }
             g_forceLoadInProgress.store(false, std::memory_order_release);
             auto skipCount = g_vehSkipCount.load(std::memory_order_relaxed);
             logger::info("  VEH skipped {} null dereferences during AE 13753", skipCount);
@@ -2380,12 +2421,12 @@ namespace Patches::FormCaching
                 // Call AE 13753 again
                 g_vehSkipCount.store(0, std::memory_order_relaxed);
                 g_forceLoadInProgress.store(true, std::memory_order_release);
-                auto* vehHandle2 = AddVectoredExceptionHandler(1, ForceLoadVEH);
+                {
+                    VehGuard veh(1, ForceLoadVEH);
 
-                logger::info("  Calling AE 13753 pass {} ...", pass);
-                loadForms(tdh, false);
-
-                RemoveVectoredExceptionHandler(vehHandle2);
+                    logger::info("  Calling AE 13753 pass {} ...", pass);
+                    loadForms(tdh, false);
+                }
                 g_forceLoadInProgress.store(false, std::memory_order_release);
 
                 auto addFormDelta2 = g_addFormCalls.load(std::memory_order_relaxed) - addFormBefore2;
@@ -2679,7 +2720,7 @@ namespace Patches::FormCaching
                 // Install persistent form-reference fixup VEH
                 g_formFixupCount.store(0, std::memory_order_relaxed);
                 g_formFixupActive.store(true, std::memory_order_release);
-                AddVectoredExceptionHandler(1, FormReferenceFixupVEH);
+                g_vehFormFixup = AddVectoredExceptionHandler(1, FormReferenceFixupVEH);
                 logger::info("  Installed persistent FormReferenceFixupVEH");
 
                 // v1.22.36: Binary patch at 29846+0x95 with form resolution.
@@ -2691,9 +2732,9 @@ namespace Patches::FormCaching
                 // v1.22.36: Install first-chance crash logger VEH.
                 // This logs crash info to Data/SKSE/Plugins/ for guaranteed
                 // capture even when spdlog hasn't flushed.
-                AddVectoredExceptionHandler(1, CrashLoggerVEH);
+                g_vehCrashLogger = AddVectoredExceptionHandler(1, CrashLoggerVEH);
                 g_crashLoggerActive.store(true, std::memory_order_release);
-                logger::info("  Installed CrashLoggerVEH (first-chance, writes to Data/SKSE/Plugins/)");
+                logger::info("  Installed CrashLoggerVEH (first-chance, writes to SKSE log dir)");
 
                 // v1.22.46: Capture main thread handle for RIP sampling
                 g_mainThreadId = GetCurrentThreadId();
@@ -2745,7 +2786,7 @@ namespace Patches::FormCaching
                         }
 
                         FILE* f = nullptr;
-                        fopen_s(&f, "C:\\SSEEngineFixesForWine_crash.log", "a");
+                        fopen_s(&f, g_crashLogPath, "a");
                         if (f) {
                             fprintf(f, "WATCHDOG #%d (t=%ds): zp=%llu ws=%llu nc=%d fi=%d ca=%llu",
                                 tick, tick * 10,
@@ -2802,19 +2843,19 @@ namespace Patches::FormCaching
 
                 // ==========================================================
                 // Auto-New-Game for automated testing
-                // If C:\auto_newgame.flag exists, inject Enter key directly
+                // If auto_newgame.flag exists in SKSE log dir, inject Enter key directly
                 // into the main menu's Scaleform movie via GFx HandleEvent.
                 // This bypasses Win32 input (unreliable under Wine).
                 // ==========================================================
                 {
                     FILE* flagFile = nullptr;
-                    fopen_s(&flagFile, "C:\\auto_newgame.flag", "r");
+                    fopen_s(&flagFile, g_autoNewgameFlagPath, "r");
                     if (flagFile) {
                         fclose(flagFile);
                         logger::info("  auto_newgame.flag found — polling for Main Menu (up to 180s)");
                         std::thread([]() {
                             FILE* f = nullptr;
-                            fopen_s(&f, "C:\\SSEEngineFixesForWine_crash.log", "a");
+                            fopen_s(&f, g_crashLogPath, "a");
 
                             // Poll every 2s for up to 180s until Main Menu opens
                             bool found = false;
@@ -2908,6 +2949,7 @@ namespace Patches::FormCaching
 
     inline void Install()
     {
+        detail::InitPaths();
         detail::ReplaceFormMapFunctions();
 
         logger::info("installed form caching patch"sv);
