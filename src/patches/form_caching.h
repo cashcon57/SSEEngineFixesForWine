@@ -550,13 +550,40 @@ namespace Patches::FormCaching
             if (pep->ExceptionRecord->NumberParameters >= 2)
                 targetAddr = pep->ExceptionRecord->ExceptionInformation[1];
 
+            // v1.22.34: Handle null-pointer form dereferences.
+            // After kDeleted flagging + code cave, the engine still hits
+            // null form pointers (RAX=0) in the AI evaluation chain.
+            // Pattern: `cmp byte ptr [rax+0x1A], 0x2B` where rax=0.
+            // The target address is < 0x100 (null page + small offset).
+            //
+            // Instead of patching each crash site, skip the faulting
+            // instruction. The destination register stays 0 / unchanged,
+            // and downstream null checks handle the rest.
+            if (targetAddr < 0x100) {
+                static std::atomic<int> s_nullSkipCount{ 0 };
+                auto count = s_nullSkipCount.fetch_add(1, std::memory_order_relaxed);
+
+                const auto* rip = reinterpret_cast<const std::uint8_t*>(pep->ContextRecord->Rip);
+                auto instrLen = x86_instr_len(rip);
+                pep->ContextRecord->Rip += instrLen;
+
+                if (count < 50) {
+                    logger::warn("FormFixupVEH: null-ptr skip #{}: RIP=0x{:X} (+{}B) target=0x{:X} RAX=0x{:X}",
+                        count + 1, pep->ContextRecord->Rip - instrLen, instrLen,
+                        targetAddr, pep->ContextRecord->Rax);
+                } else if (count == 50) {
+                    logger::warn("FormFixupVEH: suppressing null-ptr skip messages (50 logged)");
+                }
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+
             // Form IDs are 32-bit values: master index (0x00-0xFE) in top byte.
             // Valid range: [0x100, 0xFF000000). Under Wine/64-bit, heap addresses
             // are >> 0x100000000 (e.g., 0x248...), so the 32-bit range is safe.
             // The faulting address may be offset from the base register
             // (e.g., [rax+0x28]), so we also check all registers below.
-            // Reject null-page faults (< 0x100) and real pointers (>= 0xFF000000).
-            if (targetAddr >= 0xFF000000 || targetAddr < 0x100)
+            // Reject real pointers (>= 0xFF000000).
+            if (targetAddr >= 0xFF000000)
                 return EXCEPTION_CONTINUE_SEARCH;
 
             // Scan all general-purpose registers for a value that looks like a form ID.
