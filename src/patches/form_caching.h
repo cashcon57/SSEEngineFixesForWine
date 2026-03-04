@@ -616,27 +616,18 @@ namespace Patches::FormCaching
                     return EXCEPTION_CONTINUE_EXECUTION;
                 }
 
-                // v1.22.31: Form not in cache — skip the faulting instruction.
-                // Zero the register and advance RIP. Set ZF=1 in EFLAGS so
-                // any conditional branch after a TEST/CMP takes the "no match"
-                // / "zero" path, which is the safe/skip path.
-                // The sentinel approach (v1.22.29) caused cascading failures
-                // because downstream code read invalid data from the sentinel.
+                // v1.22.33: Form not in cache — let the crash happen cleanly.
+                // Previous approaches (sentinel, instruction skip, zero+ZF)
+                // all caused cascading failures downstream. A clean crash
+                // at the original site gives better diagnostic information.
                 auto sentCount = g_sentinelUseCount.fetch_add(1, std::memory_order_relaxed);
-                if (sentCount < 20) {
-                    logger::warn("FormFixupVEH: {}=0x{:X} (formID 0x{:08X}) NOT FOUND → skip at RIP=0x{:X}",
+                if (sentCount < 50) {
+                    logger::warn("FormFixupVEH: {}=0x{:X} (formID 0x{:08X}) NOT FOUND at RIP=0x{:X} — passing through",
                         regNames[i], val, formId, pep->ContextRecord->Rip);
-                } else if (sentCount == 20) {
-                    logger::warn("FormFixupVEH: suppressing skip log messages (20 logged)");
+                } else if (sentCount == 50) {
+                    logger::warn("FormFixupVEH: suppressing pass-through log messages (50 logged)");
                 }
-                // Zero the register that held the form ID
-                *regs[i] = 0;
-                // Skip the faulting instruction
-                const auto* rip = reinterpret_cast<const std::uint8_t*>(pep->ContextRecord->Rip);
-                pep->ContextRecord->Rip += x86_instr_len(rip);
-                // Set ZF=1 (bit 6 of EFLAGS) — "test result is zero"
-                pep->ContextRecord->EFlags |= 0x40;
-                return EXCEPTION_CONTINUE_EXECUTION;
+                return EXCEPTION_CONTINUE_SEARCH;
             }
 
             // No register held a form ID — this is a different kind of crash
@@ -1067,22 +1058,20 @@ namespace Patches::FormCaching
         // loop at +0x11C then runs, loading all forms natively.
         // ================================================================
         // ================================================================
-        // v1.22.31: Binary patch at AE 29846+0x95 — targeted crash fix.
+        // v1.22.33: Binary patch at AE 29846+0x95 — targeted crash fix
+        // with form ID resolution.
         //
         // The instruction `test dword ptr [rax+0x28], 0x3FF` crashes when
-        // RAX holds a raw form ID (< 0xFF000000) instead of a pointer.
-        // This happens in the AI package procedure evaluation pipeline.
+        // RAX holds a raw form ID (< 0x1'00000000) instead of a pointer.
         //
-        // We replace the 7-byte TEST with a 5-byte JMP to a code cave
-        // + 2 NOPs. The code cave:
-        //   1. Checks if RAX >= 0x1'00000000 (valid 64-bit pointer)
-        //   2. If valid: execute original TEST, JMP back to +0x9C
-        //   3. If form ID: try resolve via sharded cache; if found, patch
-        //      RAX and do the TEST; if not found, XOR EAX,EAX + set ZF=1,
-        //      JMP back to +0x9C
+        // Code cave logic:
+        //   1. Check if RAX high 32 bits != 0 → valid pointer → original TEST
+        //   2. If form ID: call TESForm::GetFormByNumericId to resolve
+        //   3. If resolved: replace RAX, execute original TEST
+        //   4. If not resolved: xor eax,eax + ZF=1, skip
         //
-        // This prevents both the original crash and cascading failures
-        // from sentinel/instruction-skip approaches.
+        // v1.22.33: Now resolves form IDs instead of just zeroing RAX.
+        // This prevents cascading null-pointer failures downstream.
         // ================================================================
         inline void PatchFormPointerValidation()
         {
@@ -1091,105 +1080,153 @@ namespace Patches::FormCaching
             auto* patchSite = reinterpret_cast<std::uint8_t*>(fn29846.address() + 0x95);
             auto* returnSite = patchSite + 7; // +0x9C = after the 7-byte TEST
 
-            // Verify we're patching the right instruction
-            // Expected: F7 40 28 FF 03 00 00 (test dword ptr [rax+28h], 3FFh)
-            // or with REX: could vary. Check the modrm pattern.
-            // Actually the instruction encoding depends on whether there's a REX prefix.
-            // Let's check the actual bytes at +0x95.
             logger::info("PatchFormPointerValidation: bytes at 29846+0x95: "
                 "{:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X}",
                 patchSite[0], patchSite[1], patchSite[2], patchSite[3],
                 patchSite[4], patchSite[5], patchSite[6], patchSite[7]);
 
-            // The crash log says: test dword ptr [rax+0x28], 0x3FF
-            // Encoding: F7 40 28 FF 03 00 00 (7 bytes, no REX)
-            // F7 /0 = TEST r/m32, imm32; ModRM 40 = [RAX+disp8]; disp8 = 0x28; imm32 = 0x000003FF
             if (patchSite[0] != 0xF7 || patchSite[1] != 0x40 || patchSite[2] != 0x28) {
                 logger::error("PatchFormPointerValidation: unexpected bytes — NOT patching");
                 return;
             }
 
-            // Allocate code cave from SKSE trampoline (already near SkyrimSE.exe,
-            // within 2GB for rel32 JMP)
-            auto caveSize = 128;
+            // Get the address of TESForm::GetFormByNumericId (AE 14617)
+            REL::Relocation<std::uintptr_t> fnGetForm{ REL::ID(14617) };
+            auto getFormAddr = fnGetForm.address();
+            logger::info("PatchFormPointerValidation: GetFormByNumericId at 0x{:X}", getFormAddr);
+
+            // Allocate code cave from SKSE trampoline (near SkyrimSE.exe for rel32)
+            auto caveSize = 256;
             auto& trampoline = SKSE::GetTrampoline();
             auto* cave = static_cast<std::uint8_t*>(trampoline.allocate(caveSize));
+            auto returnAddr = reinterpret_cast<std::uint64_t>(returnSite);
 
-            // Build the code cave
-            // Layout:
-            //   cmp rax, 0xFF000000     ; is RAX a valid pointer?
-            //   jb  .form_id            ; if below, it's a form ID
-            //   test dword ptr [rax+28h], 3FFh  ; original instruction
-            //   jmp returnSite          ; back to +0x9C
-            // .form_id:
-            //   test rax, rax           ; set ZF=1 (RAX could be small form ID)
-            //   xor eax, eax            ; RAX = 0, ZF=1
-            //   jmp returnSite          ; back to +0x9C
             int off = 0;
 
-            // cmp rax, 0xFF000000  →  48 3D 00 00 00 FF (wrong, that's cmp eax)
-            // Actually: mov r11, 0xFF000000; cmp rax, r11
-            // Or: cmp rax, imm32 (sign-extended) won't work for 0xFF000000
-            // Use: 48 81 F8 00 00 00 FF  = cmp rax, 0xFF000000 (BUT imm32 is sign-extended
-            //   to 64-bit, so 0xFF000000 → 0xFFFFFFFF'FF000000 which is negative)
-            // We need unsigned comparison: use a different approach.
-            // Simplest: shr a copy of rax by 32; if non-zero, it's a 64-bit pointer.
-
-            // push r11 (save it)
-            cave[off++] = 0x41; cave[off++] = 0x53; // push r11
-
+            // ---- CHECK IF RAX IS A VALID POINTER ----
+            // push r11
+            cave[off++] = 0x41; cave[off++] = 0x53;
             // mov r11, rax
-            cave[off++] = 0x49; cave[off++] = 0x89; cave[off++] = 0xC3; // mov r11, rax
-
+            cave[off++] = 0x49; cave[off++] = 0x89; cave[off++] = 0xC3;
             // shr r11, 32
-            cave[off++] = 0x49; cave[off++] = 0xC1; cave[off++] = 0xEB; cave[off++] = 0x20; // shr r11, 32
-
-            // test r11, r11 (if high 32 bits are non-zero, RAX is a real pointer)
-            cave[off++] = 0x4D; cave[off++] = 0x85; cave[off++] = 0xDB; // test r11, r11
-
-            // pop r11 (restore)
-            cave[off++] = 0x41; cave[off++] = 0x5B; // pop r11
-
-            // jz .form_id (if high 32 bits are zero, RAX is a form ID)
+            cave[off++] = 0x49; cave[off++] = 0xC1; cave[off++] = 0xEB; cave[off++] = 0x20;
+            // test r11, r11
+            cave[off++] = 0x4D; cave[off++] = 0x85; cave[off++] = 0xDB;
+            // pop r11
+            cave[off++] = 0x41; cave[off++] = 0x5B;
+            // jz .form_id
             cave[off++] = 0x74;
-            int jzOffset = off; // placeholder for rel8
-            cave[off++] = 0x00; // will fill in
+            int jzOffset = off;
+            cave[off++] = 0x00;
 
-            // === VALID POINTER PATH ===
-            // test dword ptr [rax+28h], 3FFh (original 7-byte instruction)
+            // ---- VALID POINTER PATH ----
+            // test dword ptr [rax+28h], 3FFh
             cave[off++] = 0xF7; cave[off++] = 0x40; cave[off++] = 0x28;
             cave[off++] = 0xFF; cave[off++] = 0x03; cave[off++] = 0x00; cave[off++] = 0x00;
-
-            // jmp returnSite (absolute 64-bit: FF 25 00 00 00 00 + 8-byte addr)
+            // jmp [rip+xx] → returnSite
             cave[off++] = 0xFF; cave[off++] = 0x25;
             cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00;
-            auto returnAddr = reinterpret_cast<std::uint64_t>(returnSite);
-            std::memcpy(&cave[off], &returnAddr, 8);
-            off += 8;
+            std::memcpy(&cave[off], &returnAddr, 8); off += 8;
 
-            // === FORM ID PATH ===
-            // Fill in the jz target
-            cave[jzOffset] = static_cast<std::uint8_t>(off - (jzOffset + 1));
+            // ---- FORM ID PATH: resolve via GetFormByNumericId ----
+            int formIdPathStart = off;
+            cave[jzOffset] = static_cast<std::uint8_t>(formIdPathStart - (jzOffset + 1));
 
-            // xor eax, eax (sets RAX=0, ZF=1)
+            // Save volatile registers (preserve caller state for the call)
+            // push rcx
+            cave[off++] = 0x51;
+            // push rdx
+            cave[off++] = 0x52;
+            // push r8
+            cave[off++] = 0x41; cave[off++] = 0x50;
+            // push r9
+            cave[off++] = 0x41; cave[off++] = 0x51;
+            // push r10
+            cave[off++] = 0x41; cave[off++] = 0x52;
+            // push r11
+            cave[off++] = 0x41; cave[off++] = 0x53;
+            // push rax (save original form ID)
+            cave[off++] = 0x50;
+            // sub rsp, 0x28 (shadow space 0x20 + 8 alignment: 7 pushes=56, +0x28=96, 96%16=0)
+            cave[off++] = 0x48; cave[off++] = 0x83; cave[off++] = 0xEC; cave[off++] = 0x28;
+
+            // mov ecx, eax (form ID → first arg, zero-extended)
+            cave[off++] = 0x89; cave[off++] = 0xC1;
+
+            // mov rax, <GetFormByNumericId address>
+            cave[off++] = 0x48; cave[off++] = 0xB8;
+            std::memcpy(&cave[off], &getFormAddr, 8); off += 8;
+
+            // call rax
+            cave[off++] = 0xFF; cave[off++] = 0xD0;
+
+            // test rax, rax (check if form was found)
+            cave[off++] = 0x48; cave[off++] = 0x85; cave[off++] = 0xC0;
+
+            // jz .not_found
+            cave[off++] = 0x74;
+            int jzNotFoundOff = off;
+            cave[off++] = 0x00;
+
+            // ---- FOUND: RAX = resolved TESForm* ----
+            // add rsp, 0x30 (0x28 shadow + 8 skip saved rax)
+            cave[off++] = 0x48; cave[off++] = 0x83; cave[off++] = 0xC4; cave[off++] = 0x30;
+            // pop r11
+            cave[off++] = 0x41; cave[off++] = 0x5B;
+            // pop r10
+            cave[off++] = 0x41; cave[off++] = 0x5A;
+            // pop r9
+            cave[off++] = 0x41; cave[off++] = 0x59;
+            // pop r8
+            cave[off++] = 0x41; cave[off++] = 0x58;
+            // pop rdx
+            cave[off++] = 0x5A;
+            // pop rcx
+            cave[off++] = 0x59;
+            // RAX holds resolved pointer — execute original TEST
+            // test dword ptr [rax+28h], 3FFh
+            cave[off++] = 0xF7; cave[off++] = 0x40; cave[off++] = 0x28;
+            cave[off++] = 0xFF; cave[off++] = 0x03; cave[off++] = 0x00; cave[off++] = 0x00;
+            // jmp [rip+xx] → returnSite
+            cave[off++] = 0xFF; cave[off++] = 0x25;
+            cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00;
+            std::memcpy(&cave[off], &returnAddr, 8); off += 8;
+
+            // ---- NOT FOUND: zero RAX as last resort ----
+            int notFoundStart = off;
+            cave[jzNotFoundOff] = static_cast<std::uint8_t>(notFoundStart - (jzNotFoundOff + 1));
+            // add rsp, 0x30 (0x28 shadow + 8 skip saved rax)
+            cave[off++] = 0x48; cave[off++] = 0x83; cave[off++] = 0xC4; cave[off++] = 0x30;
+            // pop r11
+            cave[off++] = 0x41; cave[off++] = 0x5B;
+            // pop r10
+            cave[off++] = 0x41; cave[off++] = 0x5A;
+            // pop r9
+            cave[off++] = 0x41; cave[off++] = 0x59;
+            // pop r8
+            cave[off++] = 0x41; cave[off++] = 0x58;
+            // pop rdx
+            cave[off++] = 0x5A;
+            // pop rcx
+            cave[off++] = 0x59;
+            // xor eax, eax (RAX=0, ZF=1)
             cave[off++] = 0x31; cave[off++] = 0xC0;
-
-            // jmp returnSite
+            // jmp [rip+xx] → returnSite
             cave[off++] = 0xFF; cave[off++] = 0x25;
             cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00;
-            std::memcpy(&cave[off], &returnAddr, 8);
-            off += 8;
+            std::memcpy(&cave[off], &returnAddr, 8); off += 8;
 
-            // Now patch the original site: 5-byte JMP rel32 + 2 NOPs
+            logger::info("PatchFormPointerValidation: code cave built, {} bytes at 0x{:X}",
+                off, reinterpret_cast<std::uintptr_t>(cave));
+
+            // Patch the original site: 5-byte JMP rel32 + 2 NOPs
             DWORD oldProtect;
             VirtualProtect(patchSite, 7, PAGE_EXECUTE_READWRITE, &oldProtect);
 
-            // Calculate relative offset for JMP
             auto jmpTarget = reinterpret_cast<std::intptr_t>(cave);
             auto jmpFrom = reinterpret_cast<std::intptr_t>(patchSite + 5);
             auto rel32 = static_cast<std::int32_t>(jmpTarget - jmpFrom);
 
-            // Check if rel32 fits (should be fine for VirtualAlloc'd memory... maybe not)
             auto actualDist = jmpTarget - jmpFrom;
             if (actualDist > INT32_MAX || actualDist < INT32_MIN) {
                 logger::error("PatchFormPointerValidation: JMP distance too large ({} bytes) — NOT patching", actualDist);
@@ -1197,16 +1234,15 @@ namespace Patches::FormCaching
                 return;
             }
 
-            patchSite[0] = 0xE9; // JMP rel32
+            patchSite[0] = 0xE9;
             std::memcpy(&patchSite[1], &rel32, 4);
-            patchSite[5] = 0x90; // NOP
-            patchSite[6] = 0x90; // NOP
+            patchSite[5] = 0x90;
+            patchSite[6] = 0x90;
 
             VirtualProtect(patchSite, 7, oldProtect, &oldProtect);
             FlushInstructionCache(GetCurrentProcess(), patchSite, 7);
 
-            logger::info("PatchFormPointerValidation: patched 29846+0x95 → code cave at 0x{:X} (rel32={})",
-                reinterpret_cast<std::uintptr_t>(cave), rel32);
+            logger::info("PatchFormPointerValidation: patched 29846+0x95 → code cave (rel32={})", rel32);
 #endif
         }
 
@@ -1417,36 +1453,125 @@ namespace Patches::FormCaching
                 logger::warn("Partial result: {} forms loaded (may need further investigation)", addFormDelta);
             } else {
                 logger::error("NO forms loaded — validation bypass alone is insufficient");
-                logger::error("The form loading loop at +0x11C may have its own gating conditions");
-                logger::error("Next step: investigate SomeFunc (module+0x1C8E40) per-file filtering");
+            }
+
+            // ==========================================================
+            // v1.22.33: Hex dump AE 13753 validation loop for future analysis.
+            // The per-file validation at +0xE0 to +0x120 determines which
+            // files get loaded. Dumping bytes helps reverse-engineer the
+            // skip logic that blocks 1787 files under Wine.
+            // ==========================================================
+            {
+                auto* fnBytes = reinterpret_cast<const std::uint8_t*>(fnAddr);
+                std::string hexDump;
+                for (int i = 0xC0; i < 0x140; ++i) {
+                    char buf[8];
+                    snprintf(buf, sizeof(buf), "%02X ", fnBytes[i]);
+                    hexDump += buf;
+                    if ((i + 1) % 16 == 0) {
+                        logger::info("  AE13753+0x{:03X}: {}", i - 15, hexDump);
+                        hexDump.clear();
+                    }
+                }
+                if (!hexDump.empty()) {
+                    logger::info("  AE13753+0x{:03X}: {}", 0x130, hexDump);
+                }
+            }
+
+            // ==========================================================
+            // v1.22.33: Multi-pass form loading.
+            //
+            // After the first AE 13753 call, 1787 files are skipped
+            // (compileIndex still 0xFF). The per-file validation function
+            // (SomeFunc at module+0x1C8E40) rejects them, possibly because
+            // their masters weren't compiled yet on the first pass.
+            //
+            // Strategy: re-compile skipped files and call AE 13753 again.
+            // On subsequent passes, more masters are available, so more
+            // dependent files may pass validation.
+            //
+            // Repeat up to 3 additional passes or until no progress.
+            // ==========================================================
+            for (int pass = 2; pass <= 4; ++pass) {
+                // Count currently-skipped files
+                std::size_t skippedCount = 0;
+                for (auto& file : tdh->files) {
+                    if (!file) continue;
+                    if (file->compileIndex == 0xFF && file->smallFileCompileIndex == 0)
+                        ++skippedCount;
+                }
+
+                if (skippedCount == 0) {
+                    logger::info("  Multi-pass: all files compiled after pass {} — no more passes needed", pass - 1);
+                    break;
+                }
+
+                logger::info("=== Multi-pass loading: pass {} ({} files still skipped) ===", pass, skippedCount);
+
+                // Re-compile skipped files (ManuallyCompileFiles is idempotent —
+                // only processes files with compileIndex=0xFF)
+                ManuallyCompileFiles();
+
+                // Ensure loading state
+                tdh->loadingFiles = true;
+                tdh->hasDesiredFiles = true;
+
+                // Record counters before pass
+                auto addFormBefore2 = g_addFormCalls.load(std::memory_order_relaxed);
+
+                // Call AE 13753 again
+                g_vehSkipCount.store(0, std::memory_order_relaxed);
+                g_forceLoadInProgress.store(true, std::memory_order_release);
+                auto* vehHandle2 = AddVectoredExceptionHandler(1, ForceLoadVEH);
+
+                logger::info("  Calling AE 13753 pass {} ...", pass);
+                loadForms(tdh, false);
+
+                RemoveVectoredExceptionHandler(vehHandle2);
+                g_forceLoadInProgress.store(false, std::memory_order_release);
+
+                auto addFormDelta2 = g_addFormCalls.load(std::memory_order_relaxed) - addFormBefore2;
+                auto vehSkips2 = g_vehSkipCount.load(std::memory_order_relaxed);
+
+                // Count still-skipped files after this pass
+                std::size_t stillSkipped = 0;
+                for (auto& file : tdh->files) {
+                    if (!file) continue;
+                    if (file->compileIndex == 0xFF && file->smallFileCompileIndex == 0)
+                        ++stillSkipped;
+                }
+
+                logger::info("  Pass {} result: {} new forms, {} VEH skips, {} → {} still skipped",
+                    pass, addFormDelta2, vehSkips2, skippedCount, stillSkipped);
+
+                if (stillSkipped >= skippedCount) {
+                    logger::info("  No progress — stopping multi-pass loading");
+                    break;
+                }
+            }
+
+            // Final skipped files count
+            {
+                std::size_t finalSkipped = 0;
+                for (auto& file : tdh->files) {
+                    if (!file) continue;
+                    if (file->compileIndex == 0xFF && file->smallFileCompileIndex == 0)
+                        ++finalSkipped;
+                }
+                logger::info("  Final: {} files still skipped after all passes", finalSkipped);
             }
 
             // ==========================================================
             // v1.22.27: Form Reference Resolution (InitItemImpl)
             //
-            // After loading forms from files, the engine normally runs a
-            // separate pass that calls InitItemImpl() on every form to
-            // resolve stored form IDs into live pointers. Our
-            // ForceLoadAllForms path bypasses this phase, leaving cross-
-            // references (NPC→AI package, actor→race, weapon→enchantment)
-            // as raw form IDs instead of resolved pointers.
+            // After loading forms, call InitItemImpl() on every form to
+            // resolve stored form IDs into live pointers.
             //
-            // v1.22.26 iterated TESDataHandler::formArrays (365K forms),
-            // but the full hash table has 1.07M forms — ~700K were missed.
-            // The crash at RAX=0x5000823 persisted because BGSProcedureFollow
-            // (sub-object of TESPackage) wasn't reached.
-            //
-            // v1.22.27: Iterate the FULL global form hash table via
-            // TESForm::GetAllForms() using raw scanning (proven approach
-            // from editor_id_cache.h). This covers ALL 1.07M forms.
-            //
-            // Additionally, install a persistent VEH (FormReferenceFixupVEH)
-            // that catches any remaining unresolved form IDs at point of use
-            // during gameplay — a safety net for references that InitItemImpl
-            // alone cannot resolve (e.g., nested procedure trees).
+            // v1.22.33: Multi-pass InitItem — retry faulted forms after
+            // the first pass, since more references may be resolvable.
             // ==========================================================
             if (addFormDelta > 100) {
-                logger::info("=== InitItemImpl Phase (v1.22.27 — full hash table) ==="sv);
+                logger::info("=== InitItemImpl Phase (v1.22.33 — multi-pass) ==="sv);
 
                 auto* saveLoadGame = RE::BGSSaveLoadGame::GetSingleton();
                 if (saveLoadGame) {
@@ -1455,13 +1580,20 @@ namespace Patches::FormCaching
                     logger::info("  Set kInitingForms flag");
                 }
 
-                std::uint64_t initCount = 0;
-                std::uint64_t skipCount = 0;
                 auto initStart = std::chrono::high_resolution_clock::now();
 
-                // Scan the FULL global form hash table (BSTHashMap<FormID, TESForm*>)
-                // using raw pointer arithmetic — same approach proven in editor_id_cache.h
+                // Collect image bounds for vtable validation
+                auto imgBase = REL::Module::get().base();
+                const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(imgBase);
+                const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(imgBase + dos->e_lfanew);
+                auto imgEnd = imgBase + nt->OptionalHeader.SizeOfImage;
+
+                // Scan the FULL global form hash table
                 const auto& [formMap, formLock] = RE::TESForm::GetAllForms();
+                std::uint64_t initCount = 0;
+                std::uint64_t skipCount = 0;
+                std::vector<RE::TESForm*> faultedForms; // Track faulted forms for retry
+
                 if (formMap) {
                     auto* mapRaw = reinterpret_cast<const std::uint8_t*>(formMap);
                     auto capacity = *reinterpret_cast<const std::uint32_t*>(mapRaw + 0x0C);
@@ -1472,17 +1604,11 @@ namespace Patches::FormCaching
                         capacity, sentinel, entriesPtr);
 
                     if (capacity > 0 && capacity <= 0x1000000 && entriesPtr >= 0x10000) {
-                        auto imgBase = REL::Module::get().base();
-                        const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(imgBase);
-                        const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(imgBase + dos->e_lfanew);
-                        auto imgEnd = imgBase + nt->OptionalHeader.SizeOfImage;
-
                         auto* entryBase = reinterpret_cast<const std::uint8_t*>(entriesPtr);
 
                         for (std::uint32_t i = 0; i < capacity; ++i) {
                             auto* entry = entryBase + i * 24;
 
-                            // Validate entry page every 4096 entries
                             if (i % 4096 == 0) {
                                 if (IsBadReadPtr(entry, static_cast<UINT_PTR>(
                                     std::min(std::size_t((capacity - i) * 24), std::size_t(4096 * 24)))))
@@ -1497,7 +1623,6 @@ namespace Patches::FormCaching
                                 continue;
                             }
 
-                            // Validate vtable is within SkyrimSE.exe image
                             auto* formObj = reinterpret_cast<const std::uint8_t*>(formPtr);
                             if (IsBadReadPtr(formObj, 0x20)) {
                                 ++skipCount;
@@ -1509,13 +1634,13 @@ namespace Patches::FormCaching
                                 continue;
                             }
 
-                            // Valid form — call InitItem (SEH-protected)
                             auto* form = reinterpret_cast<RE::TESForm*>(
                                 const_cast<std::uint8_t*>(formObj));
                             if (SafeInitItem(form)) {
                                 ++initCount;
                             } else {
                                 ++skipCount;
+                                faultedForms.push_back(form);
                                 auto faulted = g_initFaultCount.fetch_add(1, std::memory_order_relaxed);
                                 if (faulted < 20) {
                                     logger::warn("  InitItem faulted on form 0x{:08X} (type={}, vtable=0x{:X})",
@@ -1534,8 +1659,38 @@ namespace Patches::FormCaching
                     logger::error("  TESForm::GetAllForms() returned null — skipping InitItemImpl");
                 }
 
-                auto initElapsed = std::chrono::high_resolution_clock::now() - initStart;
-                auto initMs = std::chrono::duration_cast<std::chrono::milliseconds>(initElapsed).count();
+                auto pass1Elapsed = std::chrono::high_resolution_clock::now() - initStart;
+                auto pass1Ms = std::chrono::duration_cast<std::chrono::milliseconds>(pass1Elapsed).count();
+                logger::info("  InitItem pass 1: {} initialized, {} faulted, {}ms",
+                    initCount, faultedForms.size(), pass1Ms);
+
+                // v1.22.33: Retry faulted forms (up to 3 retry passes).
+                // After pass 1 resolves many references, previously-faulting
+                // forms may now succeed because their dependencies are resolved.
+                for (int retryPass = 2; retryPass <= 4 && !faultedForms.empty(); ++retryPass) {
+                    std::vector<RE::TESForm*> stillFaulted;
+                    std::uint64_t retryOk = 0;
+
+                    for (auto* form : faultedForms) {
+                        if (SafeInitItem(form)) {
+                            ++retryOk;
+                        } else {
+                            stillFaulted.push_back(form);
+                        }
+                    }
+
+                    logger::info("  InitItem pass {}: {} succeeded, {} still faulted",
+                        retryPass, retryOk, stillFaulted.size());
+
+                    if (retryOk == 0) {
+                        logger::info("  No progress — stopping InitItem retry");
+                        break;
+                    }
+                    faultedForms = std::move(stillFaulted);
+                }
+
+                auto totalElapsed = std::chrono::high_resolution_clock::now() - initStart;
+                auto totalMs = std::chrono::duration_cast<std::chrono::milliseconds>(totalElapsed).count();
 
                 if (saveLoadGame) {
                     saveLoadGame->globalFlags.reset(
@@ -1544,28 +1699,22 @@ namespace Patches::FormCaching
                 }
 
                 auto faultCount = g_initFaultCount.load(std::memory_order_relaxed);
-                logger::info("  InitItemImpl: {} forms initialized, {} entries skipped, {} faulted (SEH), {}ms",
-                    initCount, skipCount, faultCount, initMs);
+                logger::info("  InitItemImpl total: {} initialized, {} permanently faulted, {}ms",
+                    initCount, faultedForms.size(), totalMs);
 
-                // Install persistent form-reference fixup VEH.
-                // This stays active for the rest of the session to catch
-                // any form IDs that InitItemImpl couldn't resolve (e.g.,
-                // nested procedure trees, lazy-loaded cross-references).
+                // Install persistent form-reference fixup VEH
                 g_formFixupCount.store(0, std::memory_order_relaxed);
                 g_formFixupActive.store(true, std::memory_order_release);
                 AddVectoredExceptionHandler(1, FormReferenceFixupVEH);
                 logger::info("  Installed persistent FormReferenceFixupVEH");
 
-                // v1.22.31: Binary patch at 29846+0x95 — the specific crash site.
-                // test dword ptr [rax+0x28], 0x3FF (7 bytes)
-                // RAX should hold a form pointer but contains a raw form ID.
-                // Replace with JMP to trampoline that validates RAX.
+                // v1.22.33: Binary patch at 29846+0x95 with form resolution.
                 PatchFormPointerValidation();
 
-                logger::info("=== END InitItemImpl Phase (v1.22.31) ==="sv);
+                logger::info("=== END InitItemImpl Phase (v1.22.33) ==="sv);
             }
 
-            logger::info("=== END ForceLoadAllForms (v1.22.27) ==="sv);
+            logger::info("=== END ForceLoadAllForms (v1.22.33) ==="sv);
 #else
             logger::info("ForceLoadAllForms: SE build — skipping (AE-only fix)"sv);
 #endif
