@@ -102,8 +102,42 @@ void MessageHandler(SKSE::MessagingInterface::Message* a_msg)
             break;
         }
     case SKSE::MessagingInterface::kPostLoadGame:
+        {
+            logger::info(">>> kPostLoadGame fired <<<");
+            // Fallback: retry editor ID cache if kDataLoaded found nothing.
+            if (Settings::Patches::bEditorIdCache.GetValue())
+                Patches::EditorIdCache::OnDataLoaded();
+
+            if (Settings::Warnings::bRefHandleLimit.GetValue()) {
+                Warnings::WarnActiveRefrHandleCount(Settings::Warnings::uRefrLoadedGameLimit.GetValue());
+            }
+            break;
+        }
     case SKSE::MessagingInterface::kNewGame:
         {
+            logger::info(">>> kNewGame fired — sentinel zpWritable={} zeroPageUse={} writeSkips={} catchAll={} formIdSkips={} <<<",
+                Patches::FormCaching::detail::g_zpWritable.load(std::memory_order_relaxed),
+                Patches::FormCaching::detail::g_zeroPageUseCount.load(std::memory_order_relaxed),
+                Patches::FormCaching::detail::g_zeroPageWriteSkips.load(std::memory_order_relaxed),
+                Patches::FormCaching::detail::g_catchAllCount.load(std::memory_order_relaxed),
+                Patches::FormCaching::detail::g_formIdSkipCount.load(std::memory_order_relaxed));
+
+            // Also write to crash log for guaranteed capture
+            {
+                FILE* f = nullptr;
+                fopen_s(&f, Patches::FormCaching::detail::g_crashLogPath, "a");
+                if (f) {
+                    fprintf(f, "\n=== kNewGame (v1.22.52) === zpWritable=%d zpUse=%llu ws=%llu ca=%llu fi=%d\n",
+                        Patches::FormCaching::detail::g_zpWritable.load(std::memory_order_relaxed) ? 1 : 0,
+                        Patches::FormCaching::detail::g_zeroPageUseCount.load(std::memory_order_relaxed),
+                        Patches::FormCaching::detail::g_zeroPageWriteSkips.load(std::memory_order_relaxed),
+                        Patches::FormCaching::detail::g_catchAllCount.load(std::memory_order_relaxed),
+                        Patches::FormCaching::detail::g_formIdSkipCount.load(std::memory_order_relaxed));
+                    fflush(f);
+                    fclose(f);
+                }
+            }
+
             // Fallback: retry editor ID cache if kDataLoaded found nothing.
             if (Settings::Patches::bEditorIdCache.GetValue())
                 Patches::EditorIdCache::OnDataLoaded();

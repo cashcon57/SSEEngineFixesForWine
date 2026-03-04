@@ -97,9 +97,10 @@ namespace Patches::FormCaching
         inline std::atomic<std::uint64_t> g_zeroPageUseCount{ 0 };
         inline std::atomic<std::uint64_t> g_zeroPageWriteSkips{ 0 };
         inline std::atomic<std::uint64_t> g_catchAllCount{ 0 };
-        // v1.22.49: Track whether zero page is currently PAGE_READWRITE.
-        // Set true when we switch to writable (first FORM-ZEROPAGE or pre-ClearData),
-        // cleared when ForceLoadAllForms restores PAGE_READONLY.
+        // v1.22.52: Track whether zero page is currently PAGE_READWRITE.
+        // Only set during ForceLoadAllForms reload; cleared when it restores PAGE_READONLY.
+        // NEVER set during gameplay — sentinel must stay PAGE_READONLY to prevent
+        // vtable corruption from engine writes.
         inline std::atomic<bool> g_zpWritable{false};
         // v1.22.46: Main thread handle for watchdog RIP sampling
         inline HANDLE g_mainThreadHandle = nullptr;
@@ -1150,17 +1151,17 @@ namespace Patches::FormCaching
                         auto offset = static_cast<std::int64_t>(targetAddr) - static_cast<std::int64_t>(val);
                         *regs[i] = zp; // Point to zero page
 
-                        // v1.22.49: Switch to PAGE_READWRITE on first redirect.
-                        // The engine will write to the sentinel form (formFlags
-                        // etc.) thousands of times during loading. With READONLY,
-                        // each write triggers a VEH exception. We switch to
-                        // writable here (after the early DLL writes at t<10s
-                        // have been safely write-skipped with READONLY).
-                        if (!g_zpWritable.load(std::memory_order_relaxed)) {
-                            DWORD oldProt = 0;
-                            VirtualProtect(g_zeroPage, 0x10000, PAGE_READWRITE, &oldProt);
-                            g_zpWritable.store(true, std::memory_order_relaxed);
-                        }
+                        // v1.22.52: REMOVED PAGE_READWRITE switch.
+                        // This was added in v1.22.49 to reduce VEH write-skip
+                        // floods during loading, but CrashLoggerVEH is only
+                        // installed AFTER ForceLoadAllForms completes — so this
+                        // switch could only fire during gameplay (New Game, cell
+                        // loading). Making the sentinel writable during gameplay
+                        // lets the engine overwrite the vtable at offset 0x00,
+                        // causing infinite loops through corrupted virtual calls.
+                        // The sentinel stays PAGE_READONLY; writes are safely
+                        // caught by CASE W (write-skip) with minimal overhead
+                        // during gameplay (writes are infrequent outside loading).
 
                         auto count = g_formIdSkipCount.fetch_add(1, std::memory_order_relaxed);
                         if (count < 50) {
@@ -2913,31 +2914,27 @@ namespace Patches::FormCaching
                 logger::info("=== END InitItemImpl Phase (v1.22.36) ==="sv);
             }
 
-            // v1.22.49: Restore PAGE_READONLY on the sentinel page.
-            // During loading (initial + reload), we set PAGE_READWRITE to
-            // avoid the ~7K/s VEH write-skip flood. Now that loading is
-            // done, restore critical fields and lock it down to prevent
-            // vtable corruption during gameplay.
+            // v1.22.52: Ensure sentinel page integrity and PAGE_READONLY.
+            // Temporarily switch to READWRITE to refresh critical fields
+            // (vtable, kDeleted flag, stub pointers), then lock down.
+            // Safe regardless of current protection state.
             if (g_zeroPage) {
-                // Restore critical fields: vtable and kDeleted flag
+                DWORD oldProt = 0;
+                VirtualProtect(g_zeroPage, 0x10000, PAGE_READWRITE, &oldProt);
+
                 auto* zpBytes = reinterpret_cast<std::uint8_t*>(g_zeroPage);
                 auto stubVtable = reinterpret_cast<DWORD64>(g_stubVtable);
                 std::memcpy(&zpBytes[0x0000], &stubVtable, 8); // vtable
-                // Restore formFlags = kDeleted (full 4 bytes to clear any
-                // engine writes that occurred while page was writable)
                 auto flags = static_cast<std::uint32_t>(0x20);
-                std::memcpy(&zpBytes[0x0010], &flags, 4);
-
-                // Also restore the stub function pointer at offset 0x4B8
+                std::memcpy(&zpBytes[0x0010], &flags, 4); // kDeleted
                 if (g_stubFuncPage) {
                     auto stubAddr = reinterpret_cast<DWORD64>(g_stubFuncPage);
                     std::memcpy(&zpBytes[0x04B8], &stubAddr, 8);
                 }
 
-                DWORD oldProt = 0;
                 VirtualProtect(g_zeroPage, 0x10000, PAGE_READONLY, &oldProt);
                 g_zpWritable.store(false, std::memory_order_relaxed);
-                logger::info("  Sentinel page restored to PAGE_READONLY (vtable+flags+stubs refreshed)");
+                logger::info("  Sentinel page verified PAGE_READONLY (vtable+flags+stubs refreshed)");
             }
 
             logger::info("=== END ForceLoadAllForms (v1.22.36) ==="sv);
