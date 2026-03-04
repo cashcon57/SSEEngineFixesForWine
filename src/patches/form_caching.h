@@ -635,27 +635,44 @@ namespace Patches::FormCaching
         }
 
         // ================================================================
-        // v1.22.34: Last-resort crash logger.
+        // v1.22.34: First-chance crash logger VEH.
         //
-        // Catches ANY unhandled exception and writes diagnostic info
+        // Catches access violations and writes diagnostic info
         // (crash address, exception code, registers, module offset)
-        // directly to a file before the process terminates.
+        // directly to a file. Uses a known game directory path.
         //
-        // This ensures we always know WHERE crashes happen, even if
-        // spdlog buffers haven't been flushed.
-        //
-        // Installed as UnhandledExceptionFilter — fires only for
-        // truly unhandled exceptions (after all VEH/SEH handlers).
+        // Only active after g_crashLoggerActive is set (post form loading).
+        // Logs once per crash site, then returns EXCEPTION_CONTINUE_SEARCH.
         // ================================================================
-        inline LONG WINAPI CrashLoggerFilter(PEXCEPTION_POINTERS pep)
+        inline std::atomic<bool> g_crashLoggerActive{ false };
+        inline std::atomic<int> g_crashLogCount{ 0 };
+
+        inline LONG CALLBACK CrashLoggerVEH(PEXCEPTION_POINTERS pep)
         {
-            // Write crash info directly to file (bypass spdlog for reliability)
-            char* userProfile = nullptr;
-            std::size_t envLen = 0;
-            _dupenv_s(&userProfile, &envLen, "USERPROFILE");
-            auto logPath = std::string(userProfile ? userProfile : "C:\\");
-            free(userProfile);
-            logPath += "\\My Documents\\My Games\\Skyrim Special Edition\\SKSE\\SSEEngineFixesForWine_crash.log";
+            if (!g_crashLoggerActive.load(std::memory_order_relaxed))
+                return EXCEPTION_CONTINUE_SEARCH;
+
+            // Only log access violations and fatal exceptions
+            auto code = pep->ExceptionRecord->ExceptionCode;
+            if (code != EXCEPTION_ACCESS_VIOLATION &&
+                code != EXCEPTION_STACK_OVERFLOW &&
+                code != EXCEPTION_INT_DIVIDE_BY_ZERO &&
+                code != 0xC0000374 /* heap corruption */)
+                return EXCEPTION_CONTINUE_SEARCH;
+
+            // Only log first 5 crashes to avoid filling disk
+            if (g_crashLogCount.fetch_add(1, std::memory_order_relaxed) >= 5)
+                return EXCEPTION_CONTINUE_SEARCH;
+
+            // Write to game directory (known Wine path via REL::Module)
+            auto imgBase = REL::Module::get().base();
+            auto exePath = REL::Module::get().filename();
+            auto logPath = std::string(exePath.data(), exePath.size());
+            // Replace SkyrimSE.exe with crash log name
+            auto lastSlash = logPath.rfind('\\');
+            if (lastSlash != std::string::npos)
+                logPath = logPath.substr(0, lastSlash);
+            logPath += "\\Data\\SKSE\\Plugins\\SSEEngineFixesForWine_crash.log";
 
             FILE* f = nullptr;
             fopen_s(&f, logPath.c_str(), "a");
@@ -1842,12 +1859,12 @@ namespace Patches::FormCaching
                 // v1.22.34: Binary patch at 29846+0x95 with form resolution.
                 PatchFormPointerValidation();
 
-                // v1.22.34: Install crash logger as last-resort diagnostics.
-                // This fires for ANY unhandled exception — writes crash info
-                // to a separate file for guaranteed capture even if spdlog
-                // hasn't flushed.
-                SetUnhandledExceptionFilter(CrashLoggerFilter);
-                logger::info("  Installed CrashLoggerFilter (UnhandledExceptionFilter)");
+                // v1.22.34: Install first-chance crash logger VEH.
+                // This logs crash info to Data/SKSE/Plugins/ for guaranteed
+                // capture even when spdlog hasn't flushed.
+                AddVectoredExceptionHandler(1, CrashLoggerVEH);
+                g_crashLoggerActive.store(true, std::memory_order_release);
+                logger::info("  Installed CrashLoggerVEH (first-chance, writes to Data/SKSE/Plugins/)");
 
                 logger::info("=== END InitItemImpl Phase (v1.22.34) ==="sv);
             }
