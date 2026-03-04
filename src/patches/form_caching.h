@@ -1116,54 +1116,86 @@ namespace Patches::FormCaching
             }
 
             // ─────────────────────────────────────────────────────────────
-            // CASE 3: Catch-all — skip instruction + zero result register.
-            // Handles remaining AVs that fall through all other cases:
-            //  - Out-of-bounds array access (e.g., [R14+RAX*8] past image)
-            //  - Unmapped heap/stack addresses
-            //  - Any other unresolvable access
-            //
-            // We skip the faulting instruction and zero RAX (the most common
-            // result register). This is "last resort" recovery — imprecise
-            // but better than crashing. The engine may null-check downstream.
+            // CASE 3: Catch-all — redirect register to zero page + RETRY.
+            // v1.22.44: Instead of skipping the instruction (which breaks
+            // control flow and causes freezes), find the register that
+            // holds the unmapped address, redirect it to the zero page,
+            // and retry. The instruction reads zeros from the sentinel
+            // and continues naturally.
             // ─────────────────────────────────────────────────────────────
-            {
-                auto instrLen = x86_instr_len(ripBytes);
-                if (instrLen > 0 && instrLen <= 15) {
-                    pep->ContextRecord->Rip += instrLen;
-                    pep->ContextRecord->Rax = 0;
+            if (g_zeroPage) {
+                DWORD64 zp = reinterpret_cast<DWORD64>(g_zeroPage);
+                DWORD64* gprs[] = {
+                    &pep->ContextRecord->Rax,
+                    &pep->ContextRecord->Rcx,
+                    &pep->ContextRecord->Rdx,
+                    &pep->ContextRecord->Rbx,
+                    &pep->ContextRecord->Rbp,
+                    &pep->ContextRecord->Rsi,
+                    &pep->ContextRecord->Rdi,
+                    &pep->ContextRecord->R8,
+                    &pep->ContextRecord->R9,
+                    &pep->ContextRecord->R10,
+                    &pep->ContextRecord->R11,
+                    &pep->ContextRecord->R12,
+                    &pep->ContextRecord->R13,
+                    &pep->ContextRecord->R14,
+                    &pep->ContextRecord->R15,
+                };
 
-                    auto count = g_catchAllCount.fetch_add(1, std::memory_order_relaxed);
-                    if (count < 200) {
-                        const char* logPath = "C:\\SSEEngineFixesForWine_crash.log";
-                        FILE* f2 = nullptr;
-                        fopen_s(&f2, logPath, "a");
-                        if (f2) {
-                            fprintf(f2, "CATCH-ALL #%d: RIP=+0x%llX +%dB target=0x%llX RAX=0x%llX\n",
-                                count + 1, rip - sImgBase, instrLen,
-                                (unsigned long long)targetAddr,
-                                (unsigned long long)pep->ContextRecord->Rax);
-                            // Byte dump: first time per unique RIP
-                            static DWORD64 s_dumpedRips[32] = {};
-                            static int s_dumpCount = 0;
-                            bool alreadyDumped = false;
-                            for (int d = 0; d < s_dumpCount; ++d)
-                                if (s_dumpedRips[d] == rip) { alreadyDumped = true; break; }
-                            if (!alreadyDumped && s_dumpCount < 32) {
-                                s_dumpedRips[s_dumpCount++] = rip;
-                                fprintf(f2, "  BYTES[+0x%llX]:", rip - sImgBase);
-                                if (!IsBadReadPtr(ripBytes, 32))
-                                    for (int b = 0; b < 32; ++b) fprintf(f2, " %02X", ripBytes[b]);
-                                fprintf(f2, "\n");
-                            }
-                            fflush(f2);
-                            fclose(f2);
-                        }
+                // Find register closest to targetAddr (within reasonable offset)
+                bool patched = false;
+                for (int i = 0; i < 15; ++i) {
+                    DWORD64 val = *gprs[i];
+                    if (val == 0 || val == zp) continue; // Skip zero/already-patched
+                    auto diff = static_cast<std::int64_t>(targetAddr) -
+                                static_cast<std::int64_t>(val);
+                    if (diff >= 0 && diff < 0x100000) { // Within 1MB offset
+                        *gprs[i] = zp; // Redirect to zero page
+                        patched = true;
+                        break;
                     }
-                    // Safety valve: after 10000 catch-all skips, stop handling
-                    // to prevent infinite loops from starving the process
-                    if (count < 10000)
-                        return EXCEPTION_CONTINUE_EXECUTION;
                 }
+                if (!patched) {
+                    // Fallback: skip instruction + zero RAX (old behavior)
+                    auto instrLen = x86_instr_len(ripBytes);
+                    if (instrLen > 0 && instrLen <= 15) {
+                        pep->ContextRecord->Rip += instrLen;
+                        pep->ContextRecord->Rax = 0;
+                    }
+                }
+
+                auto count = g_catchAllCount.fetch_add(1, std::memory_order_relaxed);
+                if (count < 200) {
+                    const char* logPath = "C:\\SSEEngineFixesForWine_crash.log";
+                    FILE* f2 = nullptr;
+                    fopen_s(&f2, logPath, "a");
+                    if (f2) {
+                        fprintf(f2, "CATCH-ALL #%d: RIP=+0x%llX target=0x%llX patched=%s RAX=0x%llX\n",
+                            count + 1, rip - sImgBase,
+                            (unsigned long long)targetAddr,
+                            patched ? "redirect" : "skip",
+                            (unsigned long long)pep->ContextRecord->Rax);
+                        // Byte dump: first time per unique RIP
+                        static DWORD64 s_dumpedRips[32] = {};
+                        static int s_dumpCount = 0;
+                        bool alreadyDumped = false;
+                        for (int d = 0; d < s_dumpCount; ++d)
+                            if (s_dumpedRips[d] == rip) { alreadyDumped = true; break; }
+                        if (!alreadyDumped && s_dumpCount < 32) {
+                            s_dumpedRips[s_dumpCount++] = rip;
+                            fprintf(f2, "  BYTES[+0x%llX]:", rip - sImgBase);
+                            if (!IsBadReadPtr(ripBytes, 32))
+                                for (int b = 0; b < 32; ++b) fprintf(f2, " %02X", ripBytes[b]);
+                            fprintf(f2, "\n");
+                        }
+                        fflush(f2);
+                        fclose(f2);
+                    }
+                }
+                // Safety valve: after 10000 catch-all redirects, stop handling
+                if (count < 10000)
+                    return EXCEPTION_CONTINUE_EXECUTION;
             }
 
             // Only log first 20 non-handled crashes
