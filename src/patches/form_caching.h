@@ -778,10 +778,9 @@ namespace Patches::FormCaching
 
             // ─────────────────────────────────────────────────────────────
             // CASE W: Write to zero page — skip the instruction.
-            // The zero page is PAGE_READONLY. When the engine tries to
-            // write to a "form" that's actually our zero page, we skip
-            // the write instruction to keep the page pristine (all zeros).
-            // This prevents cross-contamination between VEH invocations.
+            // v1.22.41: Sentinel page is now PAGE_READWRITE, so most
+            // writes succeed without VEH. This handler is kept as a
+            // safety net in case protection is ever changed back.
             // ─────────────────────────────────────────────────────────────
             if (accessType == 1 && g_zeroPage &&
                 targetAddr >= g_zeroPageBase &&
@@ -2531,11 +2530,14 @@ namespace Patches::FormCaching
                         memcpy(page + 0x4B8, &stubAddr, 8);
                     }
 
-                    DWORD oldProt = 0;
-                    VirtualProtect(g_zeroPage, 0x10000, PAGE_READONLY, &oldProt);
+                    // Keep PAGE_READWRITE — letting the engine write freely to the
+                    // sentinel avoids 275K+ VEH exceptions per New Game load.
+                    // The sentinel absorbs garbage writes; reads return whatever was
+                    // last written, but kDeleted flag causes the engine to skip the
+                    // form in most processing paths anyway.
                     g_zeroPageBase = reinterpret_cast<DWORD64>(g_zeroPage);
                     g_zeroPageEnd = g_zeroPageBase + 0x10000;
-                    logger::info("  Sentinel form page at 0x{:X} (PAGE_READONLY, kDeleted=0x20, vtable=0x{:X})",
+                    logger::info("  Sentinel form page at 0x{:X} (PAGE_READWRITE, kDeleted=0x20, vtable=0x{:X})",
                         g_zeroPageBase,
                         g_stubVtable ? reinterpret_cast<std::uintptr_t>(g_stubVtable) : 0);
                 } else {
@@ -2562,12 +2564,33 @@ namespace Patches::FormCaching
                 logger::info("  Installed CrashLoggerVEH (first-chance, writes to Data/SKSE/Plugins/)");
 
                 // v1.22.36: Watchdog thread — logs VEH counters every 10 seconds
-                // to diagnose freezes (infinite loop vs slow processing).
+                // and refreshes sentinel form critical fields (vtable, kDeleted).
                 std::thread([]() {
                     int tick = 0;
                     while (true) {
                         Sleep(10000);
                         tick++;
+
+                        // v1.22.41: Refresh sentinel form critical fields.
+                        // With PAGE_READWRITE, the engine may overwrite the vtable,
+                        // kDeleted flag, or stub pointers. Restore them every tick.
+                        if (g_zeroPage) {
+                            auto* page = reinterpret_cast<std::uint8_t*>(g_zeroPage);
+                            // Vtable pointer at offset 0x0
+                            if (g_stubVtable) {
+                                auto vtAddr = reinterpret_cast<DWORD64>(g_stubVtable);
+                                memcpy(page + 0x00, &vtAddr, 8);
+                            }
+                            // formFlags at offset 0x10 = kDeleted|kDisabled
+                            auto flags = static_cast<std::uint32_t>(0x820);
+                            memcpy(page + 0x10, &flags, 4);
+                            // Stub function at offset 0x4B8
+                            if (g_stubFuncPage) {
+                                auto stubAddr = reinterpret_cast<DWORD64>(g_stubFuncPage);
+                                memcpy(page + 0x4B8, &stubAddr, 8);
+                            }
+                        }
+
                         FILE* f = nullptr;
                         fopen_s(&f, "C:\\SSEEngineFixesForWine_crash.log", "a");
                         if (f) {
