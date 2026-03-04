@@ -921,6 +921,19 @@ namespace Patches::FormCaching
                             (unsigned long long)targetAddr,
                             isNullAccess ? "null" : "high-invalid",
                             (unsigned long long)zp);
+                        // Byte dump: first time we see each RIP, dump 32 bytes
+                        static DWORD64 s_dumpedRips[32] = {};
+                        static int s_dumpCount = 0;
+                        bool alreadyDumped = false;
+                        for (int d = 0; d < s_dumpCount; ++d)
+                            if (s_dumpedRips[d] == rip) { alreadyDumped = true; break; }
+                        if (!alreadyDumped && s_dumpCount < 32) {
+                            s_dumpedRips[s_dumpCount++] = rip;
+                            fprintf(f2, "  BYTES[+0x%llX]:", rip - sImgBase);
+                            if (!IsBadReadPtr(ripBytes, 32))
+                                for (int b = 0; b < 32; ++b) fprintf(f2, " %02X", ripBytes[b]);
+                            fprintf(f2, "\n");
+                        }
                         fflush(f2);
                         fclose(f2);
                     }
@@ -2237,8 +2250,12 @@ namespace Patches::FormCaching
                     MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
                 if (g_stubFuncPage) {
                     auto* code = reinterpret_cast<std::uint8_t*>(g_stubFuncPage);
-                    code[0] = 0x31; code[1] = 0xC0; // xor eax, eax
-                    code[2] = 0xC3;                   // ret
+                    // Return 1 (not 0): many engine functions treat 0 as
+                    // "not found / retry" causing infinite loops. 1 means
+                    // "done / success / skip" in most contexts.
+                    code[0] = 0xB8; code[1] = 0x01; code[2] = 0x00; // mov eax, 1
+                    code[3] = 0x00; code[4] = 0x00;
+                    code[5] = 0xC3;                                   // ret
                     DWORD oldProt = 0;
                     VirtualProtect(g_stubFuncPage, 0x1000, PAGE_EXECUTE_READ, &oldProt);
                     logger::info("  Stub function at 0x{:X}",
