@@ -71,6 +71,8 @@ namespace Patches::FormCaching
         // TESForm_GetFormByNumericId, and continues execution.
         inline std::atomic<bool> g_formFixupActive{ false };
         inline std::atomic<std::uint64_t> g_formFixupCount{ 0 };
+        // v1.22.27: Count of forms that faulted during InitItem (SEH-caught)
+        inline std::atomic<std::uint64_t> g_initFaultCount{ 0 };
 
         // v1.22.10: Enhanced ClearData diagnostic — dumps files list state
         // when ClearData fires, to see what the engine knew about before compile
@@ -571,6 +573,22 @@ namespace Patches::FormCaching
 
             // No register held a form ID — this is a different kind of crash
             return EXCEPTION_CONTINUE_SEARCH;
+        }
+
+        // ================================================================
+        // v1.22.27: SEH-isolated InitItem — prevents crash on forms with
+        // null internal fields (e.g., Character forms with null race ptr).
+        // MSVC: __try/__except cannot coexist with C++ destructors, so
+        // this must be a separate function (same pattern as SafeGetEditorID).
+        // ================================================================
+        inline bool SafeInitItem(RE::TESForm* form) noexcept
+        {
+            __try {
+                form->InitItem();
+                return true;
+            } __except(EXCEPTION_EXECUTE_HANDLER) {
+                return false;
+            }
         }
 
         // Forward declarations (defined after CloseTES hook)
@@ -1279,11 +1297,23 @@ namespace Patches::FormCaching
                                 continue;
                             }
 
-                            // Valid form — call InitItem
+                            // Valid form — call InitItem (SEH-protected)
                             auto* form = reinterpret_cast<RE::TESForm*>(
                                 const_cast<std::uint8_t*>(formObj));
-                            form->InitItem();
-                            ++initCount;
+                            if (SafeInitItem(form)) {
+                                ++initCount;
+                            } else {
+                                ++skipCount;
+                                auto faulted = g_initFaultCount.fetch_add(1, std::memory_order_relaxed);
+                                if (faulted < 20) {
+                                    logger::warn("  InitItem faulted on form 0x{:08X} (type={}, vtable=0x{:X})",
+                                        form->GetFormID(),
+                                        std::to_underlying(form->GetFormType()),
+                                        vtable);
+                                } else if (faulted == 20) {
+                                    logger::warn("  InitItem: suppressing further fault messages (20 logged)");
+                                }
+                            }
                         }
                     } else {
                         logger::error("  Hash table layout invalid — skipping InitItemImpl");
@@ -1301,8 +1331,9 @@ namespace Patches::FormCaching
                     logger::info("  Cleared kInitingForms flag");
                 }
 
-                logger::info("  InitItemImpl: {} forms initialized, {} entries skipped, {}ms",
-                    initCount, skipCount, initMs);
+                auto faultCount = g_initFaultCount.load(std::memory_order_relaxed);
+                logger::info("  InitItemImpl: {} forms initialized, {} entries skipped, {} faulted (SEH), {}ms",
+                    initCount, skipCount, faultCount, initMs);
 
                 // Install persistent form-reference fixup VEH.
                 // This stays active for the rest of the session to catch
