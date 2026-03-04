@@ -950,6 +950,9 @@ namespace Patches::FormCaching
                     DWORD64 val = *regs[i];
                     if (val < 0x100 || val >= 0xFF000000ULL)
                         continue;
+                    // Skip values that point into our zero page — not form IDs!
+                    if (g_zeroPage && val >= g_zeroPageBase && val < g_zeroPageEnd)
+                        continue;
                     auto diff = static_cast<std::int64_t>(targetAddr) - static_cast<std::int64_t>(val);
                     if (diff < -0x1000 || diff > 0x1000)
                         continue;
