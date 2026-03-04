@@ -635,6 +635,93 @@ namespace Patches::FormCaching
         }
 
         // ================================================================
+        // v1.22.34: Last-resort crash logger.
+        //
+        // Catches ANY unhandled exception and writes diagnostic info
+        // (crash address, exception code, registers, module offset)
+        // directly to a file before the process terminates.
+        //
+        // This ensures we always know WHERE crashes happen, even if
+        // spdlog buffers haven't been flushed.
+        //
+        // Installed as UnhandledExceptionFilter — fires only for
+        // truly unhandled exceptions (after all VEH/SEH handlers).
+        // ================================================================
+        inline LONG WINAPI CrashLoggerFilter(PEXCEPTION_POINTERS pep)
+        {
+            // Write crash info directly to file (bypass spdlog for reliability)
+            auto logPath = std::string(getenv("USERPROFILE") ? getenv("USERPROFILE") : "C:\\");
+            logPath += "\\My Documents\\My Games\\Skyrim Special Edition\\SKSE\\SSEEngineFixesForWine_crash.log";
+
+            FILE* f = nullptr;
+            fopen_s(&f, logPath.c_str(), "a");
+            if (f) {
+                auto code = pep->ExceptionRecord->ExceptionCode;
+                auto rip = pep->ContextRecord->Rip;
+
+                // Compute module-relative offset
+                static auto imgBase = REL::Module::get().base();
+                auto offset = rip - imgBase;
+                bool inModule = (rip >= imgBase && rip < imgBase + 0x10000000);
+
+                ULONG_PTR targetAddr = 0;
+                if (pep->ExceptionRecord->NumberParameters >= 2)
+                    targetAddr = pep->ExceptionRecord->ExceptionInformation[1];
+
+                fprintf(f, "\n=== SSEEngineFixesForWine CRASH LOG (v1.22.34) ===\n");
+                fprintf(f, "Exception: 0x%08lX at RIP=0x%llX", code, rip);
+                if (inModule)
+                    fprintf(f, " (SkyrimSE.exe+0x%llX)", offset);
+                fprintf(f, "\n");
+                fprintf(f, "Target address: 0x%llX\n", (unsigned long long)targetAddr);
+                fprintf(f, "Registers:\n");
+                fprintf(f, "  RAX=0x%016llX  RBX=0x%016llX  RCX=0x%016llX  RDX=0x%016llX\n",
+                    pep->ContextRecord->Rax, pep->ContextRecord->Rbx,
+                    pep->ContextRecord->Rcx, pep->ContextRecord->Rdx);
+                fprintf(f, "  RSI=0x%016llX  RDI=0x%016llX  RBP=0x%016llX  RSP=0x%016llX\n",
+                    pep->ContextRecord->Rsi, pep->ContextRecord->Rdi,
+                    pep->ContextRecord->Rbp, pep->ContextRecord->Rsp);
+                fprintf(f, "  R8 =0x%016llX  R9 =0x%016llX  R10=0x%016llX  R11=0x%016llX\n",
+                    pep->ContextRecord->R8, pep->ContextRecord->R9,
+                    pep->ContextRecord->R10, pep->ContextRecord->R11);
+                fprintf(f, "  R12=0x%016llX  R13=0x%016llX  R14=0x%016llX  R15=0x%016llX\n",
+                    pep->ContextRecord->R12, pep->ContextRecord->R13,
+                    pep->ContextRecord->R14, pep->ContextRecord->R15);
+
+                // Dump bytes at RIP for disassembly
+                fprintf(f, "Bytes at RIP:");
+                auto* ripBytes = reinterpret_cast<const std::uint8_t*>(rip);
+                if (!IsBadReadPtr(ripBytes, 16)) {
+                    for (int i = 0; i < 16; ++i)
+                        fprintf(f, " %02X", ripBytes[i]);
+                } else {
+                    fprintf(f, " <unreadable>");
+                }
+                fprintf(f, "\n");
+
+                // Stack dump (16 entries)
+                fprintf(f, "Stack (RSP):");
+                auto* rspPtr = reinterpret_cast<const DWORD64*>(pep->ContextRecord->Rsp);
+                if (!IsBadReadPtr(rspPtr, 128)) {
+                    fprintf(f, "\n");
+                    for (int i = 0; i < 16; ++i)
+                        fprintf(f, "  [RSP+0x%02X] = 0x%016llX\n", i * 8, rspPtr[i]);
+                } else {
+                    fprintf(f, " <unreadable>\n");
+                }
+
+                fprintf(f, "=== END CRASH LOG ===\n");
+                fflush(f);
+                fclose(f);
+            }
+
+            // Also try to flush spdlog
+            try { spdlog::default_logger()->flush(); } catch (...) {}
+
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+
+        // ================================================================
         // v1.22.27: SEH-isolated InitItem — prevents crash on forms with
         // null internal fields (e.g., Character forms with null race ptr).
         // MSVC: __try/__except cannot coexist with C++ destructors, so
@@ -1750,6 +1837,13 @@ namespace Patches::FormCaching
 
                 // v1.22.34: Binary patch at 29846+0x95 with form resolution.
                 PatchFormPointerValidation();
+
+                // v1.22.34: Install crash logger as last-resort diagnostics.
+                // This fires for ANY unhandled exception — writes crash info
+                // to a separate file for guaranteed capture even if spdlog
+                // hasn't flushed.
+                SetUnhandledExceptionFilter(CrashLoggerFilter);
+                logger::info("  Installed CrashLoggerFilter (UnhandledExceptionFilter)");
 
                 logger::info("=== END InitItemImpl Phase (v1.22.34) ==="sv);
             }
