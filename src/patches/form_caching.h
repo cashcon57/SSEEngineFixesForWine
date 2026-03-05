@@ -128,6 +128,7 @@ namespace Patches::FormCaching
         inline CavePatchInfo g_cavePatches[8] = {};
         inline std::atomic<int> g_numCavePatches{ 0 };
         inline std::atomic<std::uint64_t> g_caveFaultCount{ 0 };
+        inline std::atomic<std::uint64_t> g_execRecoverCount{ 0 };
 
         inline void RegisterCavePatch(std::uint8_t* caveStart, int caveSize,
                                       std::uintptr_t nullReturnAddr, const char* name)
@@ -1002,6 +1003,38 @@ namespace Patches::FormCaching
                                         g_cavePatches[i].name,
                                         (unsigned long long)targetAddr,
                                         (unsigned long long)g_cavePatches[i].nullReturnAddr);
+                                    fflush(f);
+                                    fclose(f);
+                                }
+                            }
+                            return EXCEPTION_CONTINUE_EXECUTION;
+                        }
+                    }
+                }
+
+                // v1.22.55: Execute-fault recovery — corrupted function pointer
+                // or vtable entry jumped to non-executable memory (heap, freed
+                // page, etc.). When RIP == targetAddr, the CPU faulted trying
+                // to fetch instruction bytes at that address. If the stack top
+                // holds a valid return address in the game image, this was a
+                // CALL through a bad pointer — pop the return addr and continue.
+                if (rip == targetAddr && accessType != 1) {
+                    auto* rspPtr2 = reinterpret_cast<DWORD64*>(pep->ContextRecord->Rsp);
+                    if (!IsBadReadPtr(rspPtr2, 8)) {
+                        DWORD64 retAddr = *rspPtr2;
+                        if (retAddr >= sImgBase && retAddr < sImgEnd) {
+                            pep->ContextRecord->Rip = retAddr;
+                            pep->ContextRecord->Rsp += 8;
+                            pep->ContextRecord->Rax = 0;
+
+                            auto cnt3 = static_cast<int>(g_execRecoverCount.fetch_add(1, std::memory_order_relaxed));
+                            if (cnt3 < 50) {
+                                const char* logPath = g_crashLogPath;
+                                FILE* f = nullptr;
+                                fopen_s(&f, logPath, "a");
+                                if (f) {
+                                    fprintf(f, "EXT-EXEC-RECOVER #%d: RIP=0x%llX (bad call target) → returning to 0x%llX (+0x%llX) RAX=0\n",
+                                        cnt3 + 1, rip, retAddr, retAddr - sImgBase);
                                     fflush(f);
                                     fclose(f);
                                 }
@@ -3026,12 +3059,13 @@ namespace Patches::FormCaching
                         FILE* f = nullptr;
                         fopen_s(&f, g_crashLogPath, "a");
                         if (f) {
-                            fprintf(f, "WATCHDOG #%d (t=%ds): zp=%llu ws=%llu nc=%d fi=%d ca=%llu cf=%llu",
+                            fprintf(f, "WATCHDOG #%d (t=%ds): zp=%llu ws=%llu nc=%d fi=%d ca=%llu cf=%llu er=%llu",
                                 tick, tick * 10,
                                 curZp, curWs,
                                 g_nullSkipCount.load(std::memory_order_relaxed),
                                 curFi, curCa,
-                                (unsigned long long)g_caveFaultCount.load(std::memory_order_relaxed));
+                                (unsigned long long)g_caveFaultCount.load(std::memory_order_relaxed),
+                                (unsigned long long)g_execRecoverCount.load(std::memory_order_relaxed));
 
                             // v1.22.46: Sample main thread RIP when frozen
                             if (ripSampling && g_mainThreadHandle) {
