@@ -131,6 +131,8 @@ namespace Patches::FormCaching
             std::uintptr_t caveEnd;
             std::uintptr_t nullReturnAddr;  // game address to resume at (null/skip path)
             const char* name;               // for logging
+            std::uint8_t* patchSite;        // original code address (for watchdog verification)
+            int patchSize;                   // number of bytes overwritten
         };
         inline CavePatchInfo g_cavePatches[16] = {};
         inline std::atomic<int> g_numCavePatches{ 0 };
@@ -138,7 +140,8 @@ namespace Patches::FormCaching
         inline std::atomic<std::uint64_t> g_execRecoverCount{ 0 };
 
         inline void RegisterCavePatch(std::uint8_t* caveStart, int caveSize,
-                                      std::uintptr_t nullReturnAddr, const char* name)
+                                      std::uintptr_t nullReturnAddr, const char* name,
+                                      std::uint8_t* patchSite = nullptr, int patchSize = 0)
         {
             int idx = g_numCavePatches.load(std::memory_order_relaxed);
             if (idx < 16) {
@@ -146,7 +149,36 @@ namespace Patches::FormCaching
                 g_cavePatches[idx].caveEnd = reinterpret_cast<std::uintptr_t>(caveStart) + caveSize;
                 g_cavePatches[idx].nullReturnAddr = nullReturnAddr;
                 g_cavePatches[idx].name = name;
+                g_cavePatches[idx].patchSite = patchSite;
+                g_cavePatches[idx].patchSize = patchSize;
                 g_numCavePatches.store(idx + 1, std::memory_order_release);
+            }
+        }
+
+        // Verify all code cave patches still have JMP opcode at their sites.
+        // Wine may revert file-backed code pages; re-apply if needed.
+        inline void VerifyAndRepairCavePatches()
+        {
+            int numCaves = g_numCavePatches.load(std::memory_order_acquire);
+            for (int i = 0; i < numCaves; ++i) {
+                auto& cp = g_cavePatches[i];
+                if (!cp.patchSite || cp.patchSize == 0) continue;
+                if (cp.patchSite[0] != 0xE9) {
+                    // Patch was reverted! Re-apply.
+                    logger::warn("{}: patch REVERTED at 0x{:X} (byte={:02X}), re-applying",
+                        cp.name, reinterpret_cast<std::uintptr_t>(cp.patchSite), cp.patchSite[0]);
+                    DWORD oldProt;
+                    VirtualProtect(cp.patchSite, cp.patchSize, PAGE_EXECUTE_READWRITE, &oldProt);
+                    auto jmpTarget = static_cast<std::intptr_t>(cp.caveStart);
+                    auto jmpFrom = reinterpret_cast<std::intptr_t>(cp.patchSite + 5);
+                    auto rel32 = static_cast<std::int32_t>(jmpTarget - jmpFrom);
+                    cp.patchSite[0] = 0xE9;
+                    std::memcpy(&cp.patchSite[1], &rel32, 4);
+                    for (int b = 5; b < cp.patchSize; ++b)
+                        cp.patchSite[b] = 0x90;
+                    FlushInstructionCache(GetCurrentProcess(), cp.patchSite, cp.patchSize);
+                    logger::info("{}: re-applied (verify={:02X})", cp.name, cp.patchSite[0]);
+                }
             }
         }
 
@@ -1411,7 +1443,7 @@ namespace Patches::FormCaching
                     auto offset = rip - sImgBase;
                     bool inModule = true; // We already verified RIP is in SkyrimSE.exe
 
-                    fprintf(f, "\n=== SSEEngineFixesForWine CRASH LOG (v1.22.36) ===\n");
+                    fprintf(f, "\n=== SSEEngineFixesForWine CRASH LOG (v1.22.62) ===\n");
                     fprintf(f, "Exception: 0x%08lX at RIP=0x%llX (SkyrimSE.exe+0x%llX)\n",
                         code, rip, offset);
                     fprintf(f, "Target address: 0x%llX\n", (unsigned long long)targetAddr);
@@ -2184,10 +2216,12 @@ namespace Patches::FormCaching
                         site[0] = 0xE9;
                         std::memcpy(&site[1], &rel32, 4);
                         site[5] = 0x90;
-                        VirtualProtect(site, 6, oldProt, &oldProt);
+                        // NOTE: Do NOT restore original page protection — Wine reverts
+                        // file-backed code pages when protection is restored, undoing patches.
                         FlushInstructionCache(GetCurrentProcess(), site, 6);
-                        RegisterCavePatch(cave, off, static_cast<std::uintptr_t>(returnAddr), "PatchA");
-                        logger::info("PatchHotSpotA: +0x2ED880 patched (rel32={})", rel32);
+                        RegisterCavePatch(cave, off, static_cast<std::uintptr_t>(returnAddr), "PatchA", site, 6);
+                        logger::info("PatchHotSpotA: +0x2ED880 patched (rel32={}) verify={:02X}",
+                            rel32, site[0]);
                     }
                 }
             }
@@ -2247,10 +2281,10 @@ namespace Patches::FormCaching
                         site[0] = 0xE9;
                         std::memcpy(&site[1], &rel32, 4);
                         site[5] = 0x90; site[6] = 0x90; site[7] = 0x90;
-                        VirtualProtect(site, 8, oldProt, &oldProt);
                         FlushInstructionCache(GetCurrentProcess(), site, 8);
-                        RegisterCavePatch(cave, off, static_cast<std::uintptr_t>(returnAddr), "PatchB");
-                        logger::info("PatchHotSpotB: +0x32D146 patched (rel32={})", rel32);
+                        RegisterCavePatch(cave, off, static_cast<std::uintptr_t>(returnAddr), "PatchB", site, 8);
+                        logger::info("PatchHotSpotB: +0x32D146 patched (rel32={}) verify={:02X}",
+                            rel32, site[0]);
                     }
                 }
             }
@@ -2342,10 +2376,10 @@ namespace Patches::FormCaching
                         site[0] = 0xE9;
                         std::memcpy(&site[1], &rel32, 4);
                         site[5] = 0x90;
-                        VirtualProtect(site, 6, oldProt, &oldProt);
                         FlushInstructionCache(GetCurrentProcess(), site, 6);
-                        RegisterCavePatch(cave, off, static_cast<std::uintptr_t>(returnZeroAddr), "PatchC");
-                        logger::info("PatchHotSpotC: +0x2ED88B patched (rel32={})", rel32);
+                        RegisterCavePatch(cave, off, static_cast<std::uintptr_t>(returnZeroAddr), "PatchC", site, 6);
+                        logger::info("PatchHotSpotC: +0x2ED88B patched (rel32={}) verify={:02X}",
+                            rel32, site[0]);
                     }
                 }
             }
@@ -2432,10 +2466,10 @@ namespace Patches::FormCaching
                         site[0] = 0xE9;
                         std::memcpy(&site[1], &rel32, 4);
                         site[5] = 0x90;
-                        VirtualProtect(site, 6, oldProt, &oldProt);
                         FlushInstructionCache(GetCurrentProcess(), site, 6);
-                        RegisterCavePatch(cave, off, static_cast<std::uintptr_t>(skipFormAddr), "PatchD");
-                        logger::info("PatchHotSpotD: +0x664A0B patched (rel32={})", rel32);
+                        RegisterCavePatch(cave, off, static_cast<std::uintptr_t>(skipFormAddr), "PatchD", site, 6);
+                        logger::info("PatchHotSpotD: +0x664A0B patched (rel32={}) verify={:02X}",
+                            rel32, site[0]);
                     }
                 }
             }
@@ -2525,10 +2559,10 @@ namespace Patches::FormCaching
                         site[0] = 0xE9;
                         std::memcpy(&site[1], &rel32, 4);
                         site[5] = 0x90; site[6] = 0x90; site[7] = 0x90;
-                        VirtualProtect(site, 8, oldProt, &oldProt);
                         FlushInstructionCache(GetCurrentProcess(), site, 8);
-                        RegisterCavePatch(cave, off, static_cast<std::uintptr_t>(epilogueAddr), "PatchE");
-                        logger::info("PatchHotSpotE: +0x1AF7EF patched (rel32={})", rel32);
+                        RegisterCavePatch(cave, off, static_cast<std::uintptr_t>(epilogueAddr), "PatchE", site, 8);
+                        logger::info("PatchHotSpotE: +0x1AF7EF patched (rel32={}) verify={:02X}",
+                            rel32, site[0]);
                     }
                 }
             }
@@ -2613,10 +2647,10 @@ namespace Patches::FormCaching
                         site[0] = 0xE9;
                         std::memcpy(&site[1], &rel32, 4);
                         site[5] = 0x90; site[6] = 0x90; site[7] = 0x90;
-                        VirtualProtect(site, 8, oldProt, &oldProt);
                         FlushInstructionCache(GetCurrentProcess(), site, 8);
-                        RegisterCavePatch(cave, off, static_cast<std::uintptr_t>(continueAddr), "PatchF");
-                        logger::info("PatchHotSpotF: +0x2EB95D patched (rel32={})", rel32);
+                        RegisterCavePatch(cave, off, static_cast<std::uintptr_t>(continueAddr), "PatchF", site, 8);
+                        logger::info("PatchHotSpotF: +0x2EB95D patched (rel32={}) verify={:02X}",
+                            rel32, site[0]);
                     }
                 }
             }
@@ -2722,10 +2756,10 @@ namespace Patches::FormCaching
                         site[0] = 0xE9;
                         std::memcpy(&site[1], &rel32, 4);
                         site[5] = 0x90; site[6] = 0x90; site[7] = 0x90; site[8] = 0x90;
-                        VirtualProtect(site, 9, oldProt, &oldProt);
                         FlushInstructionCache(GetCurrentProcess(), site, 9);
-                        RegisterCavePatch(cave, off, static_cast<std::uintptr_t>(exitLoopAddr), "PatchG");
-                        logger::info("PatchHotSpotG: +0x179337 patched (rel32={})", rel32);
+                        RegisterCavePatch(cave, off, static_cast<std::uintptr_t>(exitLoopAddr), "PatchG", site, 9);
+                        logger::info("PatchHotSpotG: +0x179337 patched (rel32={}) verify={:02X}",
+                            rel32, site[0]);
                     }
                 }
             }
@@ -2813,10 +2847,10 @@ namespace Patches::FormCaching
                         site[0] = 0xE9;
                         std::memcpy(&site[1], &rel32, 4);
                         site[5] = 0x90; site[6] = 0x90; site[7] = 0x90; site[8] = 0x90;
-                        VirtualProtect(site, 9, oldProt, &oldProt);
                         FlushInstructionCache(GetCurrentProcess(), site, 9);
-                        RegisterCavePatch(cave, off, static_cast<std::uintptr_t>(continueAddr), "PatchH");
-                        logger::info("PatchHotSpotH: +0x1790A4 patched (rel32={})", rel32);
+                        RegisterCavePatch(cave, off, static_cast<std::uintptr_t>(continueAddr), "PatchH", site, 9);
+                        logger::info("PatchHotSpotH: +0x1790A4 patched (rel32={}) verify={:02X}",
+                            rel32, site[0]);
                     }
                 }
             }
@@ -3567,6 +3601,10 @@ namespace Patches::FormCaching
                                 memcpy(page + 0x4B8, &stubAddr, 8);
                             }
                         }
+
+                        // v1.22.62: Verify code cave patches still have JMP opcode.
+                        // Wine may revert file-backed code pages; re-apply if needed.
+                        VerifyAndRepairCavePatches();
 
                         FILE* f = nullptr;
                         fopen_s(&f, g_crashLogPath, "a");
