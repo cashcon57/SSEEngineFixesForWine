@@ -113,6 +113,13 @@ namespace Patches::FormCaching
         inline PVOID g_vehFormFixup = nullptr;
         inline PVOID g_vehCrashLogger = nullptr;
 
+        // v1.22.57: Low null guard — map readable memory at address 0.
+        // If Wine allows this, null-form dereferences ([null+offset]) read
+        // zeros silently with zero VEH overhead. Eliminates ALL null-form
+        // floods regardless of code site.
+        inline void* g_lowNullGuard = nullptr;
+        inline DWORD64 g_lowNullGuardEnd = 0;
+
         // v1.22.54: Code cave fault recovery.
         // When a garbage form pointer (not null, not valid heap) causes a fault
         // inside a code cave, the VEH redirects execution to the cave's null path.
@@ -2502,6 +2509,88 @@ namespace Patches::FormCaching
             }
 
             logger::info("PatchHotSpotNullChecks: {} code caves registered", g_numCavePatches.load());
+
+            // ── Patch F: +0x2EB95D ──────────────────────────────────────
+            // Hot site in form flag-checking code (same area as Patch C).
+            // Original bytes: F6 46 40 01 48 0F 44 F3 (8 bytes)
+            //   test byte [rsi+0x40], 0x01  ; check form flag
+            //   cmovz rsi, rbx              ; if flag clear, rsi = rbx
+            // When rsi is null/near-null (0x7D00), [rsi+0x40] = 0x7D40
+            // faults ~43K/sec on New Game.
+            // Fix: inline null check → skip test, force cmovz (rsi=rbx).
+            {
+                auto* site = reinterpret_cast<std::uint8_t*>(base + 0x2EB95D);
+
+                logger::info("PatchHotSpotF: bytes at +0x2EB95D: "
+                    "{:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X}",
+                    site[0], site[1], site[2], site[3], site[4], site[5], site[6], site[7]);
+
+                if (site[0] != 0xF6 || site[1] != 0x46 || site[2] != 0x40 ||
+                    site[3] != 0x01 || site[4] != 0x48 || site[5] != 0x0F ||
+                    site[6] != 0x44 || site[7] != 0xF3) {
+                    logger::error("PatchHotSpotF: unexpected bytes — NOT patching");
+                } else {
+                    // After the 8 patched bytes, code continues at +0x2EB965:
+                    //   4C 8B FB  mov r15, rbx
+                    //   48 85 F6  test rsi, rsi
+                    //   75 09     jne +9 → +0x2EB971
+                    // Null path: rsi=rbx (rbx is the fallback), continue at +0x2EB965
+                    // Normal path: test [rsi+0x40], cmovz, continue at +0x2EB965
+                    std::uint64_t continueAddr = static_cast<std::uint64_t>(base + 0x2EB965);
+
+                    auto* cave = static_cast<std::uint8_t*>(trampoline.allocate(48));
+                    int off = 0;
+
+                    // cmp rsi, 0x10000
+                    cave[off++] = 0x48; cave[off++] = 0x81; cave[off++] = 0xFE;
+                    cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x01; cave[off++] = 0x00;
+                    // jb .null_path (rsi near-null → force rsi=rbx)
+                    cave[off++] = 0x72;
+                    int jbNullOff = off;
+                    cave[off++] = 0x00;
+
+                    // Original: test byte [rsi+0x40], 0x01
+                    cave[off++] = 0xF6; cave[off++] = 0x46; cave[off++] = 0x40; cave[off++] = 0x01;
+                    // Original: cmovz rsi, rbx
+                    cave[off++] = 0x48; cave[off++] = 0x0F; cave[off++] = 0x44; cave[off++] = 0xF3;
+                    // jmp continue
+                    cave[off++] = 0xFF; cave[off++] = 0x25;
+                    cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00;
+                    std::memcpy(&cave[off], &continueAddr, 8); off += 8;
+
+                    // .null_path: mov rsi, rbx (force fallback)
+                    int nullStart = off;
+                    cave[jbNullOff] = static_cast<std::uint8_t>(nullStart - (jbNullOff + 1));
+                    cave[off++] = 0x48; cave[off++] = 0x89; cave[off++] = 0xDE; // mov rsi, rbx
+                    // jmp continue
+                    cave[off++] = 0xFF; cave[off++] = 0x25;
+                    cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00;
+                    std::memcpy(&cave[off], &continueAddr, 8); off += 8;
+
+                    logger::info("PatchHotSpotF: cave {} bytes at 0x{:X}", off,
+                        reinterpret_cast<std::uintptr_t>(cave));
+
+                    // Patch: JMP rel32 (5 bytes) + 3 NOPs (overwrite all 8 bytes)
+                    DWORD oldProt;
+                    VirtualProtect(site, 8, PAGE_EXECUTE_READWRITE, &oldProt);
+                    auto jmpTarget = reinterpret_cast<std::intptr_t>(cave);
+                    auto jmpFrom = reinterpret_cast<std::intptr_t>(site + 5);
+                    auto dist = jmpTarget - jmpFrom;
+                    if (dist > INT32_MAX || dist < INT32_MIN) {
+                        logger::error("PatchHotSpotF: JMP too far ({}) — NOT patching", dist);
+                        VirtualProtect(site, 8, oldProt, &oldProt);
+                    } else {
+                        auto rel32 = static_cast<std::int32_t>(dist);
+                        site[0] = 0xE9;
+                        std::memcpy(&site[1], &rel32, 4);
+                        site[5] = 0x90; site[6] = 0x90; site[7] = 0x90;
+                        VirtualProtect(site, 8, oldProt, &oldProt);
+                        FlushInstructionCache(GetCurrentProcess(), site, 8);
+                        RegisterCavePatch(cave, off, static_cast<std::uintptr_t>(continueAddr), "PatchF");
+                        logger::info("PatchHotSpotF: +0x2EB95D patched (rel32={})", rel32);
+                    }
+                }
+            }
 #endif
         }
 
@@ -3034,6 +3123,96 @@ namespace Patches::FormCaching
                 }
 
                 // 3. Sentinel form page (PAGE_READONLY, 64KB):
+                // 2b. Low null guard — try to map readable memory at address 0.
+                // On Wine, VirtualAlloc at very low addresses may succeed because
+                // Wine's memory management is more permissive than real Windows.
+                // If this works, [null+offset] accesses read zeros directly
+                // without triggering any VEH faults — zero overhead.
+                {
+                    // Try addresses from lowest to highest until one works.
+                    // NtAllocateVirtualMemory with explicit address may bypass
+                    // Wine's allocation granularity enforcement.
+                    using NtAVM_t = LONG(WINAPI*)(HANDLE, PVOID*, ULONG_PTR, PSIZE_T, ULONG, ULONG);
+                    auto NtAVM = reinterpret_cast<NtAVM_t>(
+                        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtAllocateVirtualMemory"));
+
+                    bool mapped = false;
+                    if (NtAVM) {
+                        // Try to allocate 64KB starting at page 0 (address 0x0)
+                        void* baseAddr = reinterpret_cast<void*>(static_cast<ULONG_PTR>(1));
+                        SIZE_T regionSize = 0x10000; // 64KB — covers all known offsets (max 0x7D40)
+                        LONG status = NtAVM(GetCurrentProcess(), &baseAddr, 0, &regionSize,
+                            MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+                        if (status >= 0 && baseAddr != nullptr &&
+                            reinterpret_cast<ULONG_PTR>(baseAddr) < 0x1000) {
+                            g_lowNullGuard = baseAddr;
+                            g_lowNullGuardEnd = reinterpret_cast<DWORD64>(baseAddr) + regionSize;
+                            memset(baseAddr, 0, regionSize);
+
+                            // Write sentinel data so null-form reads get sane values:
+                            auto* page = reinterpret_cast<std::uint8_t*>(baseAddr);
+                            if (g_stubVtable) {
+                                auto vtAddr = reinterpret_cast<DWORD64>(g_stubVtable);
+                                memcpy(page + 0x00, &vtAddr, 8); // vtable at offset 0
+                            }
+                            auto flags = static_cast<std::uint32_t>(0x20); // kDeleted
+                            memcpy(page + 0x10, &flags, 4);
+                            if (g_stubFuncPage) {
+                                auto stubAddr = reinterpret_cast<DWORD64>(g_stubFuncPage);
+                                memcpy(page + 0x4B8, &stubAddr, 8);
+                            }
+
+                            // Make it PAGE_READONLY to prevent corruption
+                            DWORD oldP = 0;
+                            VirtualProtect(baseAddr, regionSize, PAGE_READONLY, &oldP);
+
+                            mapped = true;
+                            logger::info("  LOW NULL GUARD: mapped {} bytes at 0x{:X} (PAGE_READONLY) — "
+                                "null-form dereferences will read zeros with ZERO VEH overhead!",
+                                regionSize, reinterpret_cast<std::uintptr_t>(baseAddr));
+                        } else {
+                            logger::info("  Low null guard: NtAllocateVirtualMemory at addr 1 returned "
+                                "status=0x{:X}, baseAddr=0x{:X} — trying VirtualAlloc fallbacks",
+                                (unsigned)status, reinterpret_cast<std::uintptr_t>(baseAddr));
+                        }
+                    }
+
+                    if (!mapped) {
+                        // Fallback: try VirtualAlloc at increasing addresses
+                        for (ULONG_PTR tryAddr : {(ULONG_PTR)0x1000, (ULONG_PTR)0x10000}) {
+                            auto* p = VirtualAlloc(reinterpret_cast<void*>(tryAddr), 0x10000,
+                                MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+                            if (p && reinterpret_cast<ULONG_PTR>(p) <= 0x10000) {
+                                g_lowNullGuard = p;
+                                g_lowNullGuardEnd = reinterpret_cast<DWORD64>(p) + 0x10000;
+                                memset(p, 0, 0x10000);
+                                auto* page = reinterpret_cast<std::uint8_t*>(p);
+                                if (g_stubVtable) {
+                                    auto vtAddr = reinterpret_cast<DWORD64>(g_stubVtable);
+                                    memcpy(page + 0x00, &vtAddr, 8);
+                                }
+                                auto flags2 = static_cast<std::uint32_t>(0x20);
+                                memcpy(page + 0x10, &flags2, 4);
+                                if (g_stubFuncPage) {
+                                    auto stubAddr = reinterpret_cast<DWORD64>(g_stubFuncPage);
+                                    memcpy(page + 0x4B8, &stubAddr, 8);
+                                }
+                                DWORD oldP = 0;
+                                VirtualProtect(p, 0x10000, PAGE_READONLY, &oldP);
+                                mapped = true;
+                                logger::info("  LOW NULL GUARD: VirtualAlloc at 0x{:X} succeeded! "
+                                    "Null-form floods eliminated.", reinterpret_cast<std::uintptr_t>(p));
+                                break;
+                            }
+                        }
+                    }
+
+                    if (!mapped) {
+                        logger::info("  Low null guard: could not map low memory — "
+                            "will rely on VEH + code cave patches for null-form handling");
+                    }
+                }
+
                 //    Fake TESForm with kDeleted flag, valid vtable, stub pointers.
                 //    Engine reads kDeleted and skips; virtual calls → stub → ret 0.
                 g_zeroPage = VirtualAlloc(nullptr, 0x10000,
