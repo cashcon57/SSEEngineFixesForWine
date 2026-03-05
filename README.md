@@ -538,6 +538,7 @@ Behaviors confirmed under Wine/CrossOver/Proton that differ from native Windows:
 | **Form-ID-as-pointer fields** | Wine's loading path skips post-load reference resolution passes, leaving raw 32-bit form IDs in 64-bit pointer fields. The engine crashes when dereferencing these (addresses in 0–256MB range). Requires VEH or code-cave interception. See [Form-ID-as-Pointer Bug](#form-id-as-pointer-bug-under-wine). |
 | **InitItem faults on ESL actors** | 179 ActorCharacter forms from ESL-flagged mods fault during `InitItem()` due to unresolved internal references (null race, null base NPC). These must be flagged kDeleted to prevent AI evaluation crashes. See [The 179 Faulted ActorCharacter Forms](#the-179-faulted-actorcharacter-forms). |
 | **SKSE plugin load order matters** | Wine's `readdir()` on macOS APFS returns entries sorted alphabetically. SKSE enumerates `*.dll` in the Plugins directory using `readdir()`. To ensure this mod's `kDataLoaded` handler runs before other plugins, the DLL is named `0_SSEEngineFixesForWine.dll` (sorts first). |
+| **VirtualProtect reverts file-backed code pages** | When you `VirtualProtect(site, PAGE_EXECUTE_READWRITE)`, write bytes, then `VirtualProtect(site, oldProt)` to restore the original protection, Wine reloads the page from the file-backed mapping — silently reverting your written bytes. On native Windows, the page remains modified. **Fix:** Leave patched pages as `PAGE_EXECUTE_READWRITE` (don't restore original protection). Discovered in v1.22.62 when all 8 code cave patches were found silently reverted during gameplay. |
 
 ---
 
@@ -807,6 +808,17 @@ The versionlib hash format documented in [Address Library: versionlib Binary For
 | v1.22.48 | PAGE_READWRITE during reload (ClearData path), PAGE_READONLY restored after ForceLoadAllForms. Intended to eliminate VEH write-skip flood during reload. |
 | v1.22.49 | **Eliminated VEH write-skip flood**: `g_zpWritable` atomic flag + PAGE_READWRITE on first FORM-ZEROPAGE redirect during initial load. Moved ClearData PAGE_READWRITE to before original call. Result: 3 write-skip events (down from ~7K/10s). |
 | v1.22.50 | **Reverted ClearData PAGE_READWRITE** — causes vtable corruption → infinite loop hang (ClearData calls virtual functions on sentinel forms, corrupted vtable at offset +0x00 → infinite CPU loop with 0 memory growth). Removed auto_newgame flag. Manual "New Game" from UI does not call ClearData, avoiding both the write-skip flood and the vtable corruption. |
+| v1.22.51 | Code quality: dynamic log paths via `SKSE::log::log_directory()`, RAII `VehGuard` for exception-safe VEH cleanup, correct `acquire`/`release` memory ordering on all atomics. |
+| v1.22.52 | Removed CrashLoggerVEH's PAGE_READWRITE switch in CASE 2. Diagnostic kNewGame logging. |
+| v1.22.53 | **Code cave patches C+D** at +0x2ED88B and +0x664A0B — inline null checks for the two dominant VEH flood sites (~42K faults/sec → 0). Bypass VEH entirely (~2ns vs ~50μs per check). |
+| v1.22.55 | **Execute-fault recovery** — if RIP points to non-executable memory (corrupted vtable/function pointer call), pop return address from stack and continue instead of crashing. |
+| v1.22.56 | **Patch E** at +0x1AF7EF — code cave for form refcount null guard (`cmp [rdi], eax; lock inc [rdi+4]`). |
+| v1.22.57 | **Patch F** at +0x2EB95D — code cave for form flag check null guard (`test byte [rsi+0x40], 0x01; cmovz`). |
+| v1.22.58 | Sentinel page changed to **PAGE_READWRITE permanently**. Watchdog thread repairs vtable + kDeleted flag every 10s. Eliminates all write-skip VEH faults. |
+| v1.22.59 | **Patch G** at +0x179337 — validates vtable high dword == 1 (SkyrimSE.exe image range) before linked list virtual call. Invalid vtable → exit loop. |
+| v1.22.60 | **Patch H** at +0x1790A4 — validates R14 high dword nonzero before array indexed access. R14=sentinel (32-bit) → skip with eax=0. VEH events reduced to ~30 total (down from millions). |
+| v1.22.61 | Upgraded all cave thresholds (C/D/E/F/G) to 64-bit validation (`shr reg,32; test; jz`). Catches null, sentinel, AND form-ID-as-pointer in one check. Added `GetModuleHandleEx` module logging for EXT-CRASH events. |
+| v1.22.62 | **ROOT CAUSE: Wine page reversion.** All 8 code cave patches were silently reverted by Wine's `VirtualProtect` restoring original file-backed page contents. Fix: don't restore original protection after patching (leave `PAGE_EXECUTE_READWRITE`). Added `VerifyAndRepairCavePatches()` to watchdog — verifies patch bytes every 10s and re-applies any reverted patches. Extended `CavePatchInfo` struct with `patchSite`/`patchSize` for verification. |
 
 ---
 
