@@ -1061,8 +1061,32 @@ namespace Patches::FormCaching
                     auto* rspPtr2 = reinterpret_cast<DWORD64*>(pep->ContextRecord->Rsp);
                     if (!IsBadReadPtr(rspPtr2, 8)) {
                         DWORD64 retAddr = *rspPtr2;
-                        if (retAddr >= sImgBase && retAddr < sImgEnd) {
-                            pep->ContextRecord->Rip = retAddr;
+
+                        // v1.22.63: Also accept return addresses inside our code caves.
+                        // PatchA's cave calls [rax+0x4B8] — if the function pointer is
+                        // garbage, the CPU faults here with retAddr pointing back into
+                        // the cave, not the game image. Redirect to the cave's null path.
+                        bool inGameImage = (retAddr >= sImgBase && retAddr < sImgEnd);
+                        bool inCave = false;
+                        int caveIdx = -1;
+                        if (!inGameImage) {
+                            int numCaves = g_numCavePatches.load(std::memory_order_acquire);
+                            for (int i = 0; i < numCaves; ++i) {
+                                if (retAddr >= g_cavePatches[i].caveStart && retAddr < g_cavePatches[i].caveEnd) {
+                                    inCave = true;
+                                    caveIdx = i;
+                                    break;
+                                }
+                            }
+                        }
+
+                        if (inGameImage || inCave) {
+                            if (inCave) {
+                                // Return to cave's null/skip path instead of resuming mid-cave
+                                pep->ContextRecord->Rip = g_cavePatches[caveIdx].nullReturnAddr;
+                            } else {
+                                pep->ContextRecord->Rip = retAddr;
+                            }
                             pep->ContextRecord->Rsp += 8;
                             pep->ContextRecord->Rax = 0;
 
@@ -1072,8 +1096,14 @@ namespace Patches::FormCaching
                                 FILE* f = nullptr;
                                 fopen_s(&f, logPath, "a");
                                 if (f) {
-                                    fprintf(f, "EXT-EXEC-RECOVER #%d: RIP=0x%llX (bad call target) → returning to 0x%llX (+0x%llX) RAX=0\n",
-                                        cnt3 + 1, rip, retAddr, retAddr - sImgBase);
+                                    fprintf(f, "EXT-EXEC-RECOVER #%d: RIP=0x%llX (bad call target) → returning to 0x%llX (%s%s) RAX=0\n",
+                                        cnt3 + 1, rip,
+                                        (unsigned long long)pep->ContextRecord->Rip,
+                                        inCave ? "cave:" : "+0x",
+                                        inCave ? g_cavePatches[caveIdx].name : "");
+                                    if (!inCave) {
+                                        fprintf(f, "  (offset +0x%llX)\n", retAddr - sImgBase);
+                                    }
                                     fflush(f);
                                     fclose(f);
                                 }
@@ -1443,7 +1473,7 @@ namespace Patches::FormCaching
                     auto offset = rip - sImgBase;
                     bool inModule = true; // We already verified RIP is in SkyrimSE.exe
 
-                    fprintf(f, "\n=== SSEEngineFixesForWine CRASH LOG (v1.22.62) ===\n");
+                    fprintf(f, "\n=== SSEEngineFixesForWine CRASH LOG (v1.22.63) ===\n");
                     fprintf(f, "Exception: 0x%08lX at RIP=0x%llX (SkyrimSE.exe+0x%llX)\n",
                         code, rip, offset);
                     fprintf(f, "Target address: 0x%llX\n", (unsigned long long)targetAddr);
@@ -3585,11 +3615,18 @@ namespace Patches::FormCaching
                             ripSampling = true;
                         }
 
-                        // v1.22.58: Repair sentinel page critical fields.
-                        // PAGE_READWRITE lets engine write freely (no VEH overhead),
-                        // but writes can corrupt vtable/formFlags. Repair every tick.
+                        // v1.22.63: Aggressively zero sentinel page to break garbage
+                        // pointer chains. Engine writes garbage to sentinel (it's RW),
+                        // and code that reads a "next pointer" from sentinel gets a
+                        // random value like 0x7D00000000 → second-hop fault → CATCH-ALL.
+                        // By zeroing the entire page and re-writing only critical fields,
+                        // any "next pointer" read returns 0, which existing code cave
+                        // null checks catch without VEH involvement.
                         if (g_zeroPage) {
                             auto* page = reinterpret_cast<std::uint8_t*>(g_zeroPage);
+                            // Zero entire first 0x500 bytes (covers all form field offsets)
+                            memset(page, 0, 0x500);
+                            // Re-write critical fields
                             if (g_stubVtable) {
                                 auto vtAddr = reinterpret_cast<DWORD64>(g_stubVtable);
                                 memcpy(page + 0x00, &vtAddr, 8);
