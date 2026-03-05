@@ -3469,13 +3469,10 @@ namespace Patches::FormCaching
                 logger::info("=== END InitItemImpl Phase (v1.22.36) ==="sv);
             }
 
-            // v1.22.52/58: Ensure sentinel page integrity (PAGE_READWRITE since v1.22.58).
-            // Temporarily switch to READWRITE to refresh critical fields
-            // (vtable, kDeleted flag, stub pointers), then lock down.
-            // Safe regardless of current protection state.
+            // v1.22.52/58: Ensure sentinel page integrity.
+            // Page is PAGE_READWRITE since v1.22.58 — just refresh critical fields.
             if (g_zeroPage) {
-                DWORD oldProt = 0;
-                VirtualProtect(g_zeroPage, 0x10000, PAGE_READWRITE, &oldProt);
+                // Page is already PAGE_READWRITE since v1.22.58
 
                 auto* zpBytes = reinterpret_cast<std::uint8_t*>(g_zeroPage);
                 auto stubVtable = reinterpret_cast<DWORD64>(g_stubVtable);
@@ -3487,9 +3484,10 @@ namespace Patches::FormCaching
                     std::memcpy(&zpBytes[0x04B8], &stubAddr, 8);
                 }
 
-                VirtualProtect(g_zeroPage, 0x10000, PAGE_READONLY, &oldProt);
+                // v1.22.58: Keep PAGE_READWRITE — no restore to PAGE_READONLY.
+                // Watchdog repairs critical fields every 10s tick.
                 g_zpWritable.store(false, std::memory_order_relaxed);
-                logger::info("  Sentinel page verified PAGE_READONLY (vtable+flags+stubs refreshed)");
+                logger::info("  Sentinel page verified (vtable+flags+stubs refreshed, PAGE_READWRITE)");
             }
 
             logger::info("=== END ForceLoadAllForms (v1.22.36) ==="sv);
