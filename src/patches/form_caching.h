@@ -2169,8 +2169,8 @@ namespace Patches::FormCaching
                     // Return sites:
                     //   "return 0"   path: +0x2ED891 (xor eax,eax; add rsp,0x28; ret)
                     //   "get member" path: +0x2ED898 (mov rax,[rax+0x128]; add rsp,0x28; ret)
-                    auto returnZeroAddr = reinterpret_cast<std::uint64_t>(base + 0x2ED891);
-                    auto getMemberAddr  = reinterpret_cast<std::uint64_t>(base + 0x2ED898);
+                    std::uint64_t returnZeroAddr = static_cast<std::uint64_t>(base + 0x2ED891);
+                    std::uint64_t getMemberAddr  = static_cast<std::uint64_t>(base + 0x2ED898);
 
                     auto* cave = static_cast<std::uint8_t*>(trampoline.allocate(48));
                     int off = 0;
@@ -2255,8 +2255,8 @@ namespace Patches::FormCaching
                     // Return sites:
                     //   je NOT taken: +0x664A11 (mov rsi, rbp — use this form)
                     //   je taken / null: +0x664A16 (test rbx, rbx — skip form)
-                    auto useFormAddr = reinterpret_cast<std::uint64_t>(base + 0x664A11);
-                    auto skipFormAddr = reinterpret_cast<std::uint64_t>(base + 0x664A16);
+                    std::uint64_t useFormAddr  = static_cast<std::uint64_t>(base + 0x664A11);
+                    std::uint64_t skipFormAddr = static_cast<std::uint64_t>(base + 0x664A16);
 
                     auto* cave = static_cast<std::uint8_t*>(trampoline.allocate(48));
                     int off = 0;
