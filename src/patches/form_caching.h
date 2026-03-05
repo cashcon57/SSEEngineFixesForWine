@@ -2985,6 +2985,317 @@ namespace Patches::FormCaching
                     }
                 }
             }
+
+            // ── Patch J: +0x19CDF5 ──────────────────────────────────────
+            // Form type check — movzx eax, byte [rdx+0x44] then cmp al, 3.
+            // RDX is corrupted sentinel data. Safe default: xor eax, eax.
+            // Overwrite 6 bytes: 0F B6 42 44 3C 03 (movzx + cmp al,3).
+            // Cave executes both if valid. Continue at +0x19CDFB.
+            {
+                auto* site = reinterpret_cast<std::uint8_t*>(base + 0x19CDF5);
+
+                logger::info("PatchHotSpotJ: bytes at +0x19CDF5: "
+                    "{:02X} {:02X} {:02X} {:02X} {:02X} {:02X}",
+                    site[0], site[1], site[2], site[3], site[4], site[5]);
+
+                // Expected: 0F B6 42 44 3C 03
+                if (site[0] != 0x0F || site[1] != 0xB6 || site[2] != 0x42 ||
+                    site[3] != 0x44 || site[4] != 0x3C || site[5] != 0x03) {
+                    logger::error("PatchHotSpotJ: unexpected bytes — NOT patching");
+                } else {
+                    std::uint64_t continueAddr = static_cast<std::uint64_t>(base + 0x19CDFB);
+
+                    auto* cave = static_cast<std::uint8_t*>(trampoline.allocate(48));
+                    int off = 0;
+
+                    // 64-bit validation: high dword == 0 → invalid
+                    // mov r10, rdx
+                    cave[off++] = 0x49; cave[off++] = 0x89; cave[off++] = 0xD2;
+                    // shr r10, 32
+                    cave[off++] = 0x49; cave[off++] = 0xC1; cave[off++] = 0xEA; cave[off++] = 0x20;
+                    // test r10d, r10d
+                    cave[off++] = 0x45; cave[off++] = 0x85; cave[off++] = 0xD2;
+                    // jz .invalid
+                    cave[off++] = 0x74;
+                    int jzInvalidOff = off;
+                    cave[off++] = 0x00;
+
+                    // .valid: original movzx eax, byte [rdx+0x44]
+                    cave[off++] = 0x0F; cave[off++] = 0xB6; cave[off++] = 0x42; cave[off++] = 0x44;
+                    // original cmp al, 3
+                    cave[off++] = 0x3C; cave[off++] = 0x03;
+                    // jmp [rip+0] → continueAddr
+                    cave[off++] = 0xFF; cave[off++] = 0x25;
+                    cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00;
+                    std::memcpy(&cave[off], &continueAddr, 8); off += 8;
+
+                    // .invalid: xor eax, eax (safe default) then continue
+                    int invalidStart = off;
+                    cave[jzInvalidOff] = static_cast<std::uint8_t>(invalidStart - (jzInvalidOff + 1));
+                    cave[off++] = 0x31; cave[off++] = 0xC0;
+                    // cmp al, 3 (set flags consistently — al=0 so CF=1, ZF=0)
+                    cave[off++] = 0x3C; cave[off++] = 0x03;
+                    // jmp [rip+0] → continueAddr
+                    cave[off++] = 0xFF; cave[off++] = 0x25;
+                    cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00;
+                    std::memcpy(&cave[off], &continueAddr, 8); off += 8;
+
+                    logger::info("PatchHotSpotJ: cave {} bytes at 0x{:X}", off,
+                        reinterpret_cast<std::uintptr_t>(cave));
+
+                    // Patch: JMP rel32 (5 bytes) + 1 NOP (overwrite all 6 bytes)
+                    DWORD oldProt;
+                    VirtualProtect(site, 6, PAGE_EXECUTE_READWRITE, &oldProt);
+                    auto jmpTarget = reinterpret_cast<std::intptr_t>(cave);
+                    auto jmpFrom = reinterpret_cast<std::intptr_t>(site + 5);
+                    auto dist = jmpTarget - jmpFrom;
+                    if (dist > INT32_MAX || dist < INT32_MIN) {
+                        logger::error("PatchHotSpotJ: JMP too far ({}) — NOT patching", dist);
+                        VirtualProtect(site, 6, oldProt, &oldProt);
+                    } else {
+                        auto rel32 = static_cast<std::int32_t>(dist);
+                        site[0] = 0xE9;
+                        std::memcpy(&site[1], &rel32, 4);
+                        site[5] = 0x90;
+                        FlushInstructionCache(GetCurrentProcess(), site, 6);
+                        RegisterCavePatch(cave, off, static_cast<std::uintptr_t>(continueAddr), "PatchJ", site, 6);
+                        logger::info("PatchHotSpotJ: +0x19CDF5 patched (rel32={}) verify={:02X}",
+                            rel32, site[0]);
+                    }
+                }
+            }
+
+            // ── Patch K: +0x2B54D0 ──────────────────────────────────────
+            // Reading formFlags — mov eax, [rcx+0x10] then shr eax, 0xA.
+            // RCX is corrupted. Safe default: xor eax, eax.
+            // Overwrite 6 bytes: 8B 41 10 C1 E8 0A (mov + shr).
+            // Cave executes both if valid. Continue at +0x2B54D6.
+            {
+                auto* site = reinterpret_cast<std::uint8_t*>(base + 0x2B54D0);
+
+                logger::info("PatchHotSpotK: bytes at +0x2B54D0: "
+                    "{:02X} {:02X} {:02X} {:02X} {:02X} {:02X}",
+                    site[0], site[1], site[2], site[3], site[4], site[5]);
+
+                // Expected: 8B 41 10 C1 E8 0A
+                if (site[0] != 0x8B || site[1] != 0x41 || site[2] != 0x10 ||
+                    site[3] != 0xC1 || site[4] != 0xE8 || site[5] != 0x0A) {
+                    logger::error("PatchHotSpotK: unexpected bytes — NOT patching");
+                } else {
+                    std::uint64_t continueAddr = static_cast<std::uint64_t>(base + 0x2B54D6);
+
+                    auto* cave = static_cast<std::uint8_t*>(trampoline.allocate(48));
+                    int off = 0;
+
+                    // 64-bit validation: high dword == 0 → invalid
+                    // mov r10, rcx
+                    cave[off++] = 0x49; cave[off++] = 0x89; cave[off++] = 0xCA;
+                    // shr r10, 32
+                    cave[off++] = 0x49; cave[off++] = 0xC1; cave[off++] = 0xEA; cave[off++] = 0x20;
+                    // test r10d, r10d
+                    cave[off++] = 0x45; cave[off++] = 0x85; cave[off++] = 0xD2;
+                    // jz .invalid
+                    cave[off++] = 0x74;
+                    int jzInvalidOff = off;
+                    cave[off++] = 0x00;
+
+                    // .valid: original mov eax, [rcx+0x10]
+                    cave[off++] = 0x8B; cave[off++] = 0x41; cave[off++] = 0x10;
+                    // original shr eax, 0xA
+                    cave[off++] = 0xC1; cave[off++] = 0xE8; cave[off++] = 0x0A;
+                    // jmp [rip+0] → continueAddr
+                    cave[off++] = 0xFF; cave[off++] = 0x25;
+                    cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00;
+                    std::memcpy(&cave[off], &continueAddr, 8); off += 8;
+
+                    // .invalid: xor eax, eax (safe default, already 0 after shr)
+                    int invalidStart = off;
+                    cave[jzInvalidOff] = static_cast<std::uint8_t>(invalidStart - (jzInvalidOff + 1));
+                    cave[off++] = 0x31; cave[off++] = 0xC0;
+                    // jmp [rip+0] → continueAddr
+                    cave[off++] = 0xFF; cave[off++] = 0x25;
+                    cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00;
+                    std::memcpy(&cave[off], &continueAddr, 8); off += 8;
+
+                    logger::info("PatchHotSpotK: cave {} bytes at 0x{:X}", off,
+                        reinterpret_cast<std::uintptr_t>(cave));
+
+                    // Patch: JMP rel32 (5 bytes) + 1 NOP (overwrite all 6 bytes)
+                    DWORD oldProt;
+                    VirtualProtect(site, 6, PAGE_EXECUTE_READWRITE, &oldProt);
+                    auto jmpTarget = reinterpret_cast<std::intptr_t>(cave);
+                    auto jmpFrom = reinterpret_cast<std::intptr_t>(site + 5);
+                    auto dist = jmpTarget - jmpFrom;
+                    if (dist > INT32_MAX || dist < INT32_MIN) {
+                        logger::error("PatchHotSpotK: JMP too far ({}) — NOT patching", dist);
+                        VirtualProtect(site, 6, oldProt, &oldProt);
+                    } else {
+                        auto rel32 = static_cast<std::int32_t>(dist);
+                        site[0] = 0xE9;
+                        std::memcpy(&site[1], &rel32, 4);
+                        site[5] = 0x90;
+                        FlushInstructionCache(GetCurrentProcess(), site, 6);
+                        RegisterCavePatch(cave, off, static_cast<std::uintptr_t>(continueAddr), "PatchK", site, 6);
+                        logger::info("PatchHotSpotK: +0x2B54D0 patched (rel32={}) verify={:02X}",
+                            rel32, site[0]);
+                    }
+                }
+            }
+
+            // ── Patch L: +0x2D5DB0 ──────────────────────────────────────
+            // Pointer read from structure — mov rbp, [rbx+0x20] then test rbp, rbp.
+            // RBX is corrupted. Safe default: xor ebp, ebp (zero rbp).
+            // Overwrite 7 bytes: 48 8B 6B 20 48 85 ED (mov + test).
+            // Cave executes both if valid. Continue at +0x2D5DB7.
+            {
+                auto* site = reinterpret_cast<std::uint8_t*>(base + 0x2D5DB0);
+
+                logger::info("PatchHotSpotL: bytes at +0x2D5DB0: "
+                    "{:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X}",
+                    site[0], site[1], site[2], site[3], site[4], site[5], site[6]);
+
+                // Expected: 48 8B 6B 20 48 85 ED
+                if (site[0] != 0x48 || site[1] != 0x8B || site[2] != 0x6B ||
+                    site[3] != 0x20 || site[4] != 0x48 || site[5] != 0x85 ||
+                    site[6] != 0xED) {
+                    logger::error("PatchHotSpotL: unexpected bytes — NOT patching");
+                } else {
+                    std::uint64_t continueAddr = static_cast<std::uint64_t>(base + 0x2D5DB7);
+
+                    auto* cave = static_cast<std::uint8_t*>(trampoline.allocate(48));
+                    int off = 0;
+
+                    // 64-bit validation: high dword == 0 → invalid
+                    // mov r10, rbx
+                    cave[off++] = 0x49; cave[off++] = 0x89; cave[off++] = 0xDA;
+                    // shr r10, 32
+                    cave[off++] = 0x49; cave[off++] = 0xC1; cave[off++] = 0xEA; cave[off++] = 0x20;
+                    // test r10d, r10d
+                    cave[off++] = 0x45; cave[off++] = 0x85; cave[off++] = 0xD2;
+                    // jz .invalid
+                    cave[off++] = 0x74;
+                    int jzInvalidOff = off;
+                    cave[off++] = 0x00;
+
+                    // .valid: original mov rbp, [rbx+0x20]
+                    cave[off++] = 0x48; cave[off++] = 0x8B; cave[off++] = 0x6B; cave[off++] = 0x20;
+                    // original test rbp, rbp
+                    cave[off++] = 0x48; cave[off++] = 0x85; cave[off++] = 0xED;
+                    // jmp [rip+0] → continueAddr
+                    cave[off++] = 0xFF; cave[off++] = 0x25;
+                    cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00;
+                    std::memcpy(&cave[off], &continueAddr, 8); off += 8;
+
+                    // .invalid: xor ebp, ebp (zero rbp) + test rbp, rbp (sets ZF=1)
+                    int invalidStart = off;
+                    cave[jzInvalidOff] = static_cast<std::uint8_t>(invalidStart - (jzInvalidOff + 1));
+                    cave[off++] = 0x31; cave[off++] = 0xED; // xor ebp, ebp
+                    cave[off++] = 0x48; cave[off++] = 0x85; cave[off++] = 0xED; // test rbp, rbp
+                    // jmp [rip+0] → continueAddr
+                    cave[off++] = 0xFF; cave[off++] = 0x25;
+                    cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00;
+                    std::memcpy(&cave[off], &continueAddr, 8); off += 8;
+
+                    logger::info("PatchHotSpotL: cave {} bytes at 0x{:X}", off,
+                        reinterpret_cast<std::uintptr_t>(cave));
+
+                    // Patch: JMP rel32 (5 bytes) + 2 NOPs (overwrite all 7 bytes)
+                    DWORD oldProt;
+                    VirtualProtect(site, 7, PAGE_EXECUTE_READWRITE, &oldProt);
+                    auto jmpTarget = reinterpret_cast<std::intptr_t>(cave);
+                    auto jmpFrom = reinterpret_cast<std::intptr_t>(site + 5);
+                    auto dist = jmpTarget - jmpFrom;
+                    if (dist > INT32_MAX || dist < INT32_MIN) {
+                        logger::error("PatchHotSpotL: JMP too far ({}) — NOT patching", dist);
+                        VirtualProtect(site, 7, oldProt, &oldProt);
+                    } else {
+                        auto rel32 = static_cast<std::int32_t>(dist);
+                        site[0] = 0xE9;
+                        std::memcpy(&site[1], &rel32, 4);
+                        site[5] = 0x90; site[6] = 0x90;
+                        FlushInstructionCache(GetCurrentProcess(), site, 7);
+                        RegisterCavePatch(cave, off, static_cast<std::uintptr_t>(continueAddr), "PatchL", site, 7);
+                        logger::info("PatchHotSpotL: +0x2D5DB0 patched (rel32={}) verify={:02X}",
+                            rel32, site[0]);
+                    }
+                }
+            }
+
+            // ── Patch M: +0x2D0C33 ──────────────────────────────────────
+            // Reading field — mov eax, [rsi+0x94]. RSI is corrupted.
+            // Safe default: xor eax, eax.
+            // Overwrite 6 bytes: 8B 86 94 00 00 00 (exact fit for JMP rel32 + NOP).
+            // Continue at +0x2D0C39.
+            {
+                auto* site = reinterpret_cast<std::uint8_t*>(base + 0x2D0C33);
+
+                logger::info("PatchHotSpotM: bytes at +0x2D0C33: "
+                    "{:02X} {:02X} {:02X} {:02X} {:02X} {:02X}",
+                    site[0], site[1], site[2], site[3], site[4], site[5]);
+
+                // Expected: 8B 86 94 00 00 00
+                if (site[0] != 0x8B || site[1] != 0x86 || site[2] != 0x94 ||
+                    site[3] != 0x00 || site[4] != 0x00 || site[5] != 0x00) {
+                    logger::error("PatchHotSpotM: unexpected bytes — NOT patching");
+                } else {
+                    std::uint64_t continueAddr = static_cast<std::uint64_t>(base + 0x2D0C39);
+
+                    auto* cave = static_cast<std::uint8_t*>(trampoline.allocate(48));
+                    int off = 0;
+
+                    // 64-bit validation: high dword == 0 → invalid
+                    // mov r10, rsi
+                    cave[off++] = 0x49; cave[off++] = 0x89; cave[off++] = 0xF2;
+                    // shr r10, 32
+                    cave[off++] = 0x49; cave[off++] = 0xC1; cave[off++] = 0xEA; cave[off++] = 0x20;
+                    // test r10d, r10d
+                    cave[off++] = 0x45; cave[off++] = 0x85; cave[off++] = 0xD2;
+                    // jz .invalid
+                    cave[off++] = 0x74;
+                    int jzInvalidOff = off;
+                    cave[off++] = 0x00;
+
+                    // .valid: original mov eax, [rsi+0x94]
+                    cave[off++] = 0x8B; cave[off++] = 0x86;
+                    cave[off++] = 0x94; cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00;
+                    // jmp [rip+0] → continueAddr
+                    cave[off++] = 0xFF; cave[off++] = 0x25;
+                    cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00;
+                    std::memcpy(&cave[off], &continueAddr, 8); off += 8;
+
+                    // .invalid: xor eax, eax (safe default)
+                    int invalidStart = off;
+                    cave[jzInvalidOff] = static_cast<std::uint8_t>(invalidStart - (jzInvalidOff + 1));
+                    cave[off++] = 0x31; cave[off++] = 0xC0;
+                    // jmp [rip+0] → continueAddr
+                    cave[off++] = 0xFF; cave[off++] = 0x25;
+                    cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00;
+                    std::memcpy(&cave[off], &continueAddr, 8); off += 8;
+
+                    logger::info("PatchHotSpotM: cave {} bytes at 0x{:X}", off,
+                        reinterpret_cast<std::uintptr_t>(cave));
+
+                    // Patch: JMP rel32 (5 bytes) + 1 NOP (overwrite all 6 bytes)
+                    DWORD oldProt;
+                    VirtualProtect(site, 6, PAGE_EXECUTE_READWRITE, &oldProt);
+                    auto jmpTarget = reinterpret_cast<std::intptr_t>(cave);
+                    auto jmpFrom = reinterpret_cast<std::intptr_t>(site + 5);
+                    auto dist = jmpTarget - jmpFrom;
+                    if (dist > INT32_MAX || dist < INT32_MIN) {
+                        logger::error("PatchHotSpotM: JMP too far ({}) — NOT patching", dist);
+                        VirtualProtect(site, 6, oldProt, &oldProt);
+                    } else {
+                        auto rel32 = static_cast<std::int32_t>(dist);
+                        site[0] = 0xE9;
+                        std::memcpy(&site[1], &rel32, 4);
+                        site[5] = 0x90;
+                        FlushInstructionCache(GetCurrentProcess(), site, 6);
+                        RegisterCavePatch(cave, off, static_cast<std::uintptr_t>(continueAddr), "PatchM", site, 6);
+                        logger::info("PatchHotSpotM: +0x2D0C33 patched (rel32={}) verify={:02X}",
+                            rel32, site[0]);
+                    }
+                }
+            }
 #endif
         }
 
