@@ -3720,6 +3720,43 @@ namespace Patches::FormCaching
             }
 
             logger::info("=== END ForceLoadAllForms (v1.22.36) ==="sv);
+
+            // v1.22.61: Dump unpacked .text section for offline RE.
+            // SkyrimSE.exe uses SteamStub DRM — the .text section is
+            // encrypted on disk but unpacked in memory at runtime.
+            // Write the live .text bytes to a file for capstone analysis.
+            {
+                auto imgBase = REL::Module::get().base();
+                const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(imgBase);
+                const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(imgBase + dos->e_lfanew);
+                const auto* sec = IMAGE_FIRST_SECTION(nt);
+
+                for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
+                    if (std::memcmp(sec[i].Name, ".text", 5) == 0 &&
+                        sec[i].VirtualAddress == 0x1000) {
+                        auto textVA = imgBase + sec[i].VirtualAddress;
+                        auto textSize = sec[i].Misc.VirtualSize;
+
+                        // Write to same directory as crash log
+                        std::string dumpPath(g_crashLogPath);
+                        auto lastSlash = dumpPath.find_last_of("\\/");
+                        if (lastSlash != std::string::npos)
+                            dumpPath = dumpPath.substr(0, lastSlash + 1);
+                        dumpPath += "SkyrimSE_text_dump.bin";
+
+                        FILE* df = nullptr;
+                        fopen_s(&df, dumpPath.c_str(), "wb");
+                        if (df) {
+                            fwrite(reinterpret_cast<const void*>(textVA), 1, textSize, df);
+                            fclose(df);
+                            logger::info("  .text dump: {} bytes → {}", textSize, dumpPath);
+                        } else {
+                            logger::warn("  .text dump: failed to open {}", dumpPath);
+                        }
+                        break;
+                    }
+                }
+            }
 #else
             logger::info("ForceLoadAllForms: SE build — skipping (AE-only fix)"sv);
 #endif
