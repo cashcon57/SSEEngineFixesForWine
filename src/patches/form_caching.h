@@ -1055,12 +1055,23 @@ namespace Patches::FormCaching
                 static std::atomic<int> s_extCount{ 0 };
                 auto cnt = s_extCount.fetch_add(1, std::memory_order_relaxed);
                 if (cnt < 10) {
+                    // Identify which module contains the faulting RIP
+                    char modName[MAX_PATH] = "<unknown>";
+                    HMODULE hMod = nullptr;
+                    if (GetModuleHandleExA(
+                            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            reinterpret_cast<LPCSTR>(rip), &hMod)) {
+                        GetModuleFileNameA(hMod, modName, MAX_PATH);
+                    }
+
                     const char* logPath = g_crashLogPath;
                     FILE* f = nullptr;
                     fopen_s(&f, logPath, "a");
                     if (f) {
-                        fprintf(f, "EXT-CRASH #%d: RIP=0x%llX (outside SkyrimSE.exe 0x%llX-0x%llX) target=0x%llX RAX=0x%llX\n",
-                            cnt + 1, rip, sImgBase, sImgEnd,
+                        fprintf(f, "EXT-CRASH #%d: RIP=0x%llX (module: %s) target=0x%llX RAX=0x%llX\n",
+                            cnt + 1, rip,
+                            modName,
                             (unsigned long long)targetAddr,
                             (unsigned long long)pep->ContextRecord->Rax);
                         fflush(f);
@@ -2277,11 +2288,17 @@ namespace Patches::FormCaching
                     auto* cave = static_cast<std::uint8_t*>(trampoline.allocate(48));
                     int off = 0;
 
-                    // cmp rax, 0x10000 (catch null and near-null like 0x7D00)
-                    cave[off++] = 0x48; cave[off++] = 0x3D;
-                    cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x01; cave[off++] = 0x00;
-                    // jb .return_zero
-                    cave[off++] = 0x72;
+                    // 64-bit validation: any 32-bit value (null, sentinel 0x7FD70000,
+                    // form-ID-as-pointer like 0x3C003C00) has high dword == 0.
+                    // Valid heap pointers are always > 4GB on x64.
+                    // mov r10, rax
+                    cave[off++] = 0x49; cave[off++] = 0x89; cave[off++] = 0xC2;
+                    // shr r10, 32
+                    cave[off++] = 0x49; cave[off++] = 0xC1; cave[off++] = 0xEA; cave[off++] = 0x20;
+                    // test r10d, r10d
+                    cave[off++] = 0x45; cave[off++] = 0x85; cave[off++] = 0xD2;
+                    // jz .return_zero
+                    cave[off++] = 0x74;
                     int jbRetZeroOff = off;
                     cave[off++] = 0x00;
 
@@ -2364,11 +2381,15 @@ namespace Patches::FormCaching
                     auto* cave = static_cast<std::uint8_t*>(trampoline.allocate(48));
                     int off = 0;
 
-                    // cmp rbp, 0x10000
-                    cave[off++] = 0x48; cave[off++] = 0x81; cave[off++] = 0xFD;
-                    cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x01; cave[off++] = 0x00;
-                    // jb .skip_form (null → take je path)
-                    cave[off++] = 0x72;
+                    // 64-bit validation: high dword == 0 → invalid (null, sentinel, form ID)
+                    // mov r10, rbp
+                    cave[off++] = 0x49; cave[off++] = 0x89; cave[off++] = 0xEA;
+                    // shr r10, 32
+                    cave[off++] = 0x49; cave[off++] = 0xC1; cave[off++] = 0xEA; cave[off++] = 0x20;
+                    // test r10d, r10d
+                    cave[off++] = 0x45; cave[off++] = 0x85; cave[off++] = 0xD2;
+                    // jz .skip_form (32-bit value → take je path)
+                    cave[off++] = 0x74;
                     int jbSkipOff = off;
                     cave[off++] = 0x00;
 
@@ -2449,11 +2470,15 @@ namespace Patches::FormCaching
                     auto* cave = static_cast<std::uint8_t*>(trampoline.allocate(48));
                     int off = 0;
 
-                    // cmp rdi, 0x10000
-                    cave[off++] = 0x48; cave[off++] = 0x81; cave[off++] = 0xFF;
-                    cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x01; cave[off++] = 0x00;
-                    // jb .null_path (rdi is near-null → skip to epilogue)
-                    cave[off++] = 0x72;
+                    // 64-bit validation: high dword == 0 → invalid (null, sentinel, form ID)
+                    // mov r10, rdi
+                    cave[off++] = 0x49; cave[off++] = 0x89; cave[off++] = 0xFA;
+                    // shr r10, 32
+                    cave[off++] = 0x49; cave[off++] = 0xC1; cave[off++] = 0xEA; cave[off++] = 0x20;
+                    // test r10d, r10d
+                    cave[off++] = 0x45; cave[off++] = 0x85; cave[off++] = 0xD2;
+                    // jz .null_path (32-bit value → skip to epilogue)
+                    cave[off++] = 0x74;
                     int jbNullOff = off;
                     cave[off++] = 0x00;
 
@@ -2538,14 +2563,18 @@ namespace Patches::FormCaching
                     // Normal path: test [rsi+0x40], cmovz, continue at +0x2EB965
                     std::uint64_t continueAddr = static_cast<std::uint64_t>(base + 0x2EB965);
 
-                    auto* cave = static_cast<std::uint8_t*>(trampoline.allocate(48));
+                    auto* cave = static_cast<std::uint8_t*>(trampoline.allocate(56));
                     int off = 0;
 
-                    // cmp rsi, 0x10000
-                    cave[off++] = 0x48; cave[off++] = 0x81; cave[off++] = 0xFE;
-                    cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x01; cave[off++] = 0x00;
-                    // jb .null_path (rsi near-null → force rsi=rbx)
-                    cave[off++] = 0x72;
+                    // 64-bit validation: high dword == 0 → invalid (null, sentinel, form ID)
+                    // mov r10, rsi
+                    cave[off++] = 0x49; cave[off++] = 0x89; cave[off++] = 0xF2;
+                    // shr r10, 32
+                    cave[off++] = 0x49; cave[off++] = 0xC1; cave[off++] = 0xEA; cave[off++] = 0x20;
+                    // test r10d, r10d
+                    cave[off++] = 0x45; cave[off++] = 0x85; cave[off++] = 0xD2;
+                    // jz .null_path (32-bit value → force rsi=rbx)
+                    cave[off++] = 0x74;
                     int jbNullOff = off;
                     cave[off++] = 0x00;
 
@@ -2631,11 +2660,15 @@ namespace Patches::FormCaching
                     auto* cave = static_cast<std::uint8_t*>(trampoline.allocate(80));
                     int off = 0;
 
-                    // 1. cmp rdi, 0x10000  — null/near-null guard
-                    cave[off++] = 0x48; cave[off++] = 0x81; cave[off++] = 0xFF;
-                    cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x01; cave[off++] = 0x00;
-                    // jb .exit_loop
-                    cave[off++] = 0x72;
+                    // 1. 64-bit validation: high dword == 0 → invalid (null, sentinel, form ID)
+                    // mov r10, rdi
+                    cave[off++] = 0x49; cave[off++] = 0x89; cave[off++] = 0xFA;
+                    // shr r10, 32
+                    cave[off++] = 0x49; cave[off++] = 0xC1; cave[off++] = 0xEA; cave[off++] = 0x20;
+                    // test r10d, r10d
+                    cave[off++] = 0x45; cave[off++] = 0x85; cave[off++] = 0xD2;
+                    // jz .exit_loop
+                    cave[off++] = 0x74;
                     int jbExitOff = off;
                     cave[off++] = 0x00;
 
