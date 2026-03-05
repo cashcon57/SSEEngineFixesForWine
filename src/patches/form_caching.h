@@ -1062,7 +1062,7 @@ namespace Patches::FormCaching
                     if (!IsBadReadPtr(rspPtr2, 8)) {
                         DWORD64 retAddr = *rspPtr2;
 
-                        // v1.22.63: Also accept return addresses inside our code caves.
+                        // v1.22.64: Also accept return addresses inside our code caves.
                         // PatchA's cave calls [rax+0x4B8] — if the function pointer is
                         // garbage, the CPU faults here with retAddr pointing back into
                         // the cave, not the game image. Redirect to the cave's null path.
@@ -1473,7 +1473,7 @@ namespace Patches::FormCaching
                     auto offset = rip - sImgBase;
                     bool inModule = true; // We already verified RIP is in SkyrimSE.exe
 
-                    fprintf(f, "\n=== SSEEngineFixesForWine CRASH LOG (v1.22.63) ===\n");
+                    fprintf(f, "\n=== SSEEngineFixesForWine CRASH LOG (v1.22.64) ===\n");
                     fprintf(f, "Exception: 0x%08lX at RIP=0x%llX (SkyrimSE.exe+0x%llX)\n",
                         code, rip, offset);
                     fprintf(f, "Target address: 0x%llX\n", (unsigned long long)targetAddr);
@@ -2884,6 +2884,107 @@ namespace Patches::FormCaching
                     }
                 }
             }
+
+            // ── Patch I: +0x2D5DE0 ──────────────────────────────────────
+            // Hash table chain traversal — linked list walk comparing
+            // node keys. This is the #1 crash site on New Game.
+            // Original bytes: 48 39 08 0F 84 FC 00 00 00 (9 bytes)
+            //   cmp [rax], rcx      ; compare node value with search key
+            //   je +0xFC            ; → +0x2D5EE5 (found handler)
+            // When rax = sentinel (0x7FD70000, PAGE_READWRITE), engine
+            // writes corrupt the sentinel data — [rax] reads garbage
+            // (0xFFFFFFFF etc.) which faults. The CATCH-ALL redirects
+            // to sentinel but [sentinel+8] (next ptr) is also garbage,
+            // creating an infinite fault loop (200+ events → crash).
+            // Fix: 64-bit validate rax before dereference. Invalid →
+            // exit loop to not-found path at +0x2D5DF3.
+            {
+                auto* site = reinterpret_cast<std::uint8_t*>(base + 0x2D5DE0);
+
+                logger::info("PatchHotSpotI: bytes at +0x2D5DE0: "
+                    "{:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X}",
+                    site[0], site[1], site[2], site[3], site[4],
+                    site[5], site[6], site[7], site[8]);
+
+                // Expected: 48 39 08 0F 84 FC 00 00 00
+                if (site[0] != 0x48 || site[1] != 0x39 || site[2] != 0x08 ||
+                    site[3] != 0x0F || site[4] != 0x84 || site[5] != 0xFC ||
+                    site[6] != 0x00 || site[7] != 0x00 || site[8] != 0x00) {
+                    logger::error("PatchHotSpotI: unexpected bytes — NOT patching");
+                } else {
+                    // Return sites:
+                    //   continue (after patched bytes): +0x2D5DE9 (mov rax, [rax+8])
+                    //   found handler:                  +0x2D5EE5 (je +0xFC target)
+                    //   not-found (loop exit):          +0x2D5DF3 (natural fall-through)
+                    std::uint64_t continueAddr  = static_cast<std::uint64_t>(base + 0x2D5DE9);
+                    std::uint64_t foundAddr     = static_cast<std::uint64_t>(base + 0x2D5EE5);
+                    std::uint64_t notFoundAddr  = static_cast<std::uint64_t>(base + 0x2D5DF3);
+
+                    auto* cave = static_cast<std::uint8_t*>(trampoline.allocate(64));
+                    int off = 0;
+
+                    // 1. 64-bit validation: high dword == 0 → invalid
+                    // mov r10, rax
+                    cave[off++] = 0x49; cave[off++] = 0x89; cave[off++] = 0xC2;
+                    // shr r10, 32
+                    cave[off++] = 0x49; cave[off++] = 0xC1; cave[off++] = 0xEA; cave[off++] = 0x20;
+                    // test r10d, r10d
+                    cave[off++] = 0x45; cave[off++] = 0x85; cave[off++] = 0xD2;
+                    // jz .not_found
+                    cave[off++] = 0x74;
+                    int jzNotFoundOff = off;
+                    cave[off++] = 0x00;
+
+                    // 2. Original: cmp [rax], rcx
+                    cave[off++] = 0x48; cave[off++] = 0x39; cave[off++] = 0x08;
+                    // je .found_handler
+                    cave[off++] = 0x74;
+                    int jeFoundOff = off;
+                    cave[off++] = 0x00;
+
+                    // 3. Fall-through (not equal): jmp → continueAddr (+0x2D5DE9)
+                    cave[off++] = 0xFF; cave[off++] = 0x25;
+                    cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00;
+                    std::memcpy(&cave[off], &continueAddr, 8); off += 8;
+
+                    // .found_handler:
+                    int foundStart = off;
+                    cave[jeFoundOff] = static_cast<std::uint8_t>(foundStart - (jeFoundOff + 1));
+                    cave[off++] = 0xFF; cave[off++] = 0x25;
+                    cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00;
+                    std::memcpy(&cave[off], &foundAddr, 8); off += 8;
+
+                    // .not_found: exit loop
+                    int notFoundStart = off;
+                    cave[jzNotFoundOff] = static_cast<std::uint8_t>(notFoundStart - (jzNotFoundOff + 1));
+                    cave[off++] = 0xFF; cave[off++] = 0x25;
+                    cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00;
+                    std::memcpy(&cave[off], &notFoundAddr, 8); off += 8;
+
+                    logger::info("PatchHotSpotI: cave {} bytes at 0x{:X}", off,
+                        reinterpret_cast<std::uintptr_t>(cave));
+
+                    // Patch: JMP rel32 (5 bytes) + 4 NOPs (overwrite all 9 bytes)
+                    DWORD oldProt;
+                    VirtualProtect(site, 9, PAGE_EXECUTE_READWRITE, &oldProt);
+                    auto jmpTarget = reinterpret_cast<std::intptr_t>(cave);
+                    auto jmpFrom = reinterpret_cast<std::intptr_t>(site + 5);
+                    auto dist = jmpTarget - jmpFrom;
+                    if (dist > INT32_MAX || dist < INT32_MIN) {
+                        logger::error("PatchHotSpotI: JMP too far ({}) — NOT patching", dist);
+                        VirtualProtect(site, 9, oldProt, &oldProt);
+                    } else {
+                        auto rel32 = static_cast<std::int32_t>(dist);
+                        site[0] = 0xE9;
+                        std::memcpy(&site[1], &rel32, 4);
+                        site[5] = 0x90; site[6] = 0x90; site[7] = 0x90; site[8] = 0x90;
+                        FlushInstructionCache(GetCurrentProcess(), site, 9);
+                        RegisterCavePatch(cave, off, static_cast<std::uintptr_t>(notFoundAddr), "PatchI", site, 9);
+                        logger::info("PatchHotSpotI: +0x2D5DE0 patched (rel32={}) verify={:02X}",
+                            rel32, site[0]);
+                    }
+                }
+            }
 #endif
         }
 
@@ -3615,7 +3716,7 @@ namespace Patches::FormCaching
                             ripSampling = true;
                         }
 
-                        // v1.22.63: Aggressively zero sentinel page to break garbage
+                        // v1.22.64: Aggressively zero sentinel page to break garbage
                         // pointer chains. Engine writes garbage to sentinel (it's RW),
                         // and code that reads a "next pointer" from sentinel gets a
                         // random value like 0x7D00000000 → second-hop fault → CATCH-ALL.
