@@ -2412,6 +2412,95 @@ namespace Patches::FormCaching
                 }
             }
 
+            // ── Patch E: +0x1AF7EF ──────────────────────────────────────
+            // Hot site in a form ref-counting function.
+            // Original bytes: 39 07 75 14 F0 FF 47 04 (8 bytes)
+            //   cmp [rdi], eax     ; compare form type
+            //   jne +0x14          ; if not equal, goto +0x1AF807
+            //   lock inc [rdi+4]   ; atomic refcount++
+            // When rdi is null/near-null (zero-paged form), this faults
+            // ~47K/sec causing 100% CPU freeze on New Game.
+            // Fix: inline null check → skip to function epilogue.
+            {
+                auto* site = reinterpret_cast<std::uint8_t*>(base + 0x1AF7EF);
+
+                logger::info("PatchHotSpotE: bytes at +0x1AF7EF: "
+                    "{:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X}",
+                    site[0], site[1], site[2], site[3], site[4], site[5], site[6], site[7]);
+
+                if (site[0] != 0x39 || site[1] != 0x07 || site[2] != 0x75 ||
+                    site[3] != 0x14 || site[4] != 0xF0 || site[5] != 0xFF ||
+                    site[6] != 0x47 || site[7] != 0x04) {
+                    logger::error("PatchHotSpotE: unexpected bytes — NOT patching");
+                } else {
+                    // Return sites:
+                    //   epilogue (null or equal path): +0x1AF7F7 (mov rbp, [rsp+0x40])
+                    //   jne target (not-equal path):   +0x1AF807
+                    std::uint64_t epilogueAddr  = static_cast<std::uint64_t>(base + 0x1AF7F7);
+                    std::uint64_t notEqualAddr  = static_cast<std::uint64_t>(base + 0x1AF807);
+
+                    auto* cave = static_cast<std::uint8_t*>(trampoline.allocate(48));
+                    int off = 0;
+
+                    // cmp rdi, 0x10000
+                    cave[off++] = 0x48; cave[off++] = 0x81; cave[off++] = 0xFF;
+                    cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x01; cave[off++] = 0x00;
+                    // jb .null_path (rdi is near-null → skip to epilogue)
+                    cave[off++] = 0x72;
+                    int jbNullOff = off;
+                    cave[off++] = 0x00;
+
+                    // Original: cmp [rdi], eax
+                    cave[off++] = 0x39; cave[off++] = 0x07;
+                    // jne .not_equal
+                    cave[off++] = 0x75;
+                    int jneOff = off;
+                    cave[off++] = 0x00;
+
+                    // Equal path: lock inc dword [rdi+4]
+                    cave[off++] = 0xF0; cave[off++] = 0xFF; cave[off++] = 0x47; cave[off++] = 0x04;
+
+                    // .null_path: (also equal-path falls through here)
+                    int nullStart = off;
+                    cave[jbNullOff] = static_cast<std::uint8_t>(nullStart - (jbNullOff + 1));
+                    // jmp [rip+0] → epilogueAddr
+                    cave[off++] = 0xFF; cave[off++] = 0x25;
+                    cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00;
+                    std::memcpy(&cave[off], &epilogueAddr, 8); off += 8;
+
+                    // .not_equal:
+                    int notEqStart = off;
+                    cave[jneOff] = static_cast<std::uint8_t>(notEqStart - (jneOff + 1));
+                    // jmp [rip+0] → notEqualAddr
+                    cave[off++] = 0xFF; cave[off++] = 0x25;
+                    cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00;
+                    std::memcpy(&cave[off], &notEqualAddr, 8); off += 8;
+
+                    logger::info("PatchHotSpotE: cave {} bytes at 0x{:X}", off,
+                        reinterpret_cast<std::uintptr_t>(cave));
+
+                    // Patch: JMP rel32 (5 bytes) + 3 NOPs (overwrite all 8 bytes)
+                    DWORD oldProt;
+                    VirtualProtect(site, 8, PAGE_EXECUTE_READWRITE, &oldProt);
+                    auto jmpTarget = reinterpret_cast<std::intptr_t>(cave);
+                    auto jmpFrom = reinterpret_cast<std::intptr_t>(site + 5);
+                    auto dist = jmpTarget - jmpFrom;
+                    if (dist > INT32_MAX || dist < INT32_MIN) {
+                        logger::error("PatchHotSpotE: JMP too far ({}) — NOT patching", dist);
+                        VirtualProtect(site, 8, oldProt, &oldProt);
+                    } else {
+                        auto rel32 = static_cast<std::int32_t>(dist);
+                        site[0] = 0xE9;
+                        std::memcpy(&site[1], &rel32, 4);
+                        site[5] = 0x90; site[6] = 0x90; site[7] = 0x90;
+                        VirtualProtect(site, 8, oldProt, &oldProt);
+                        FlushInstructionCache(GetCurrentProcess(), site, 8);
+                        RegisterCavePatch(cave, off, static_cast<std::uintptr_t>(epilogueAddr), "PatchE");
+                        logger::info("PatchHotSpotE: +0x1AF7EF patched (rel32={})", rel32);
+                    }
+                }
+            }
+
             logger::info("PatchHotSpotNullChecks: {} code caves registered", g_numCavePatches.load());
 #endif
         }
