@@ -2591,6 +2591,111 @@ namespace Patches::FormCaching
                     }
                 }
             }
+
+            // ── Patch G: +0x179337 ──────────────────────────────────────
+            // Linked list virtual call site. Iterates form nodes:
+            //   mov rax, [rdi]     ; load vtable from form object
+            //   mov rcx, rdi       ; this = rdi
+            //   call [rax+0x08]    ; virtual function call (vtable slot 1)
+            // When rdi = sentinel page (PAGE_READWRITE), engine writes
+            // corrupt the vtable pointer (offset +0x00) to 0xFFFFFFFF.
+            // call [0xFFFFFFFF+8] faults → CATCH-ALL flood → crash.
+            // Fix: validate vtable is in SkyrimSE.exe image (high dword=1)
+            // before calling. Invalid vtable → exit loop (not-found path).
+            {
+                auto* site = reinterpret_cast<std::uint8_t*>(base + 0x179337);
+
+                logger::info("PatchHotSpotG: bytes at +0x179337: "
+                    "{:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X}",
+                    site[0], site[1], site[2], site[3], site[4],
+                    site[5], site[6], site[7], site[8]);
+
+                // Expected: 48 8B 07 48 8B CF FF 50 08
+                //   mov rax, [rdi]; mov rcx, rdi; call [rax+0x08]
+                if (site[0] != 0x48 || site[1] != 0x8B || site[2] != 0x07 ||
+                    site[3] != 0x48 || site[4] != 0x8B || site[5] != 0xCF ||
+                    site[6] != 0xFF || site[7] != 0x50 || site[8] != 0x08) {
+                    logger::error("PatchHotSpotG: unexpected bytes — NOT patching");
+                } else {
+                    // After the 9 patched bytes, +0x179340:
+                    //   3B C5        cmp eax, ebp     ; compare result
+                    //   74 0B        je +0x0B         ; found → +0x17934F
+                    //   48 8B 7F 08  mov rdi,[rdi+8]  ; next node
+                    //   48 85 FF     test rdi, rdi    ; null check
+                    //   75 EA        jne → loop       ; +0x179337
+                    //   EB 43        jmp → +0x179392  ; not-found exit
+                    std::uint64_t continueAddr = static_cast<std::uint64_t>(base + 0x179340);
+                    // Loop exit (not-found): +0x17934D is "jmp +0x43" → +0x179392
+                    std::uint64_t exitLoopAddr = static_cast<std::uint64_t>(base + 0x17934D);
+
+                    auto* cave = static_cast<std::uint8_t*>(trampoline.allocate(80));
+                    int off = 0;
+
+                    // 1. cmp rdi, 0x10000  — null/near-null guard
+                    cave[off++] = 0x48; cave[off++] = 0x81; cave[off++] = 0xFF;
+                    cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x01; cave[off++] = 0x00;
+                    // jb .exit_loop
+                    cave[off++] = 0x72;
+                    int jbExitOff = off;
+                    cave[off++] = 0x00;
+
+                    // 2. mov rax, [rdi]  — load vtable
+                    cave[off++] = 0x48; cave[off++] = 0x8B; cave[off++] = 0x07;
+
+                    // 3. Validate vtable: high dword must be 1 (SkyrimSE.exe image = 0x14XXXXXXX)
+                    //    mov r10, rax
+                    cave[off++] = 0x49; cave[off++] = 0x89; cave[off++] = 0xC2;
+                    //    shr r10, 32
+                    cave[off++] = 0x49; cave[off++] = 0xC1; cave[off++] = 0xEA; cave[off++] = 0x20;
+                    //    cmp r10d, 1
+                    cave[off++] = 0x41; cave[off++] = 0x83; cave[off++] = 0xFA; cave[off++] = 0x01;
+                    //    jne .exit_loop
+                    cave[off++] = 0x75;
+                    int jneExitOff = off;
+                    cave[off++] = 0x00;
+
+                    // 4. Vtable valid — original code: mov rcx, rdi; call [rax+0x08]
+                    cave[off++] = 0x48; cave[off++] = 0x8B; cave[off++] = 0xCF;  // mov rcx, rdi
+                    cave[off++] = 0xFF; cave[off++] = 0x50; cave[off++] = 0x08;  // call [rax+0x08]
+
+                    // 5. jmp [rip+0] → continueAddr (+0x179340)
+                    cave[off++] = 0xFF; cave[off++] = 0x25;
+                    cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00;
+                    std::memcpy(&cave[off], &continueAddr, 8); off += 8;
+
+                    // .exit_loop:
+                    int exitStart = off;
+                    cave[jbExitOff] = static_cast<std::uint8_t>(exitStart - (jbExitOff + 1));
+                    cave[jneExitOff] = static_cast<std::uint8_t>(exitStart - (jneExitOff + 1));
+                    // jmp [rip+0] → exitLoopAddr (+0x17934D, which is "jmp +0x43" → not-found)
+                    cave[off++] = 0xFF; cave[off++] = 0x25;
+                    cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00;
+                    std::memcpy(&cave[off], &exitLoopAddr, 8); off += 8;
+
+                    logger::info("PatchHotSpotG: cave {} bytes at 0x{:X}", off,
+                        reinterpret_cast<std::uintptr_t>(cave));
+
+                    // Patch site: JMP rel32 (5 bytes) + 4 NOPs (overwrite all 9 bytes)
+                    DWORD oldProt;
+                    VirtualProtect(site, 9, PAGE_EXECUTE_READWRITE, &oldProt);
+                    auto jmpTarget = reinterpret_cast<std::intptr_t>(cave);
+                    auto jmpFrom = reinterpret_cast<std::intptr_t>(site + 5);
+                    auto dist = jmpTarget - jmpFrom;
+                    if (dist > INT32_MAX || dist < INT32_MIN) {
+                        logger::error("PatchHotSpotG: JMP too far ({}) — NOT patching", dist);
+                        VirtualProtect(site, 9, oldProt, &oldProt);
+                    } else {
+                        auto rel32 = static_cast<std::int32_t>(dist);
+                        site[0] = 0xE9;
+                        std::memcpy(&site[1], &rel32, 4);
+                        site[5] = 0x90; site[6] = 0x90; site[7] = 0x90; site[8] = 0x90;
+                        VirtualProtect(site, 9, oldProt, &oldProt);
+                        FlushInstructionCache(GetCurrentProcess(), site, 9);
+                        RegisterCavePatch(cave, off, static_cast<std::uintptr_t>(exitLoopAddr), "PatchG");
+                        logger::info("PatchHotSpotG: +0x179337 patched (rel32={})", rel32);
+                    }
+                }
+            }
 #endif
         }
 
