@@ -132,7 +132,7 @@ namespace Patches::FormCaching
             std::uintptr_t nullReturnAddr;  // game address to resume at (null/skip path)
             const char* name;               // for logging
         };
-        inline CavePatchInfo g_cavePatches[8] = {};
+        inline CavePatchInfo g_cavePatches[16] = {};
         inline std::atomic<int> g_numCavePatches{ 0 };
         inline std::atomic<std::uint64_t> g_caveFaultCount{ 0 };
         inline std::atomic<std::uint64_t> g_execRecoverCount{ 0 };
@@ -141,7 +141,7 @@ namespace Patches::FormCaching
                                       std::uintptr_t nullReturnAddr, const char* name)
         {
             int idx = g_numCavePatches.load(std::memory_order_relaxed);
-            if (idx < 8) {
+            if (idx < 16) {
                 g_cavePatches[idx].caveStart = reinterpret_cast<std::uintptr_t>(caveStart);
                 g_cavePatches[idx].caveEnd = reinterpret_cast<std::uintptr_t>(caveStart) + caveSize;
                 g_cavePatches[idx].nullReturnAddr = nullReturnAddr;
@@ -2693,6 +2693,97 @@ namespace Patches::FormCaching
                         FlushInstructionCache(GetCurrentProcess(), site, 9);
                         RegisterCavePatch(cave, off, static_cast<std::uintptr_t>(exitLoopAddr), "PatchG");
                         logger::info("PatchHotSpotG: +0x179337 patched (rel32={})", rel32);
+                    }
+                }
+            }
+
+            // ── Patch H: +0x1790A4 ──────────────────────────────────────
+            // Array indexed access in form processing code.
+            // Original bytes: 41 8B 04 C6  25 00 00 F0 03 (9 bytes)
+            //   mov eax, [r14 + rax*8]  ; load from array using r14 as base
+            //   and eax, 0x03F00000     ; mask upper bits
+            // When r14 = sentinel page (0x7FD70000, only 64KB), the index
+            // rax*8 exceeds the page boundary → fault at unmapped address.
+            // The CATCH-ALL handler can't fix this (wrong register gets
+            // redirected), leading to state corruption → later EXT-CRASH.
+            // Fix: check if r14 is a valid 64-bit heap pointer (high dword
+            // must be nonzero). Sentinel/null are 32-bit → skip with eax=0.
+            {
+                auto* site = reinterpret_cast<std::uint8_t*>(base + 0x1790A4);
+
+                logger::info("PatchHotSpotH: bytes at +0x1790A4: "
+                    "{:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X}",
+                    site[0], site[1], site[2], site[3], site[4],
+                    site[5], site[6], site[7], site[8]);
+
+                // Expected: 41 8B 04 C6 25 00 00 F0 03
+                if (site[0] != 0x41 || site[1] != 0x8B || site[2] != 0x04 ||
+                    site[3] != 0xC6 || site[4] != 0x25 || site[5] != 0x00 ||
+                    site[6] != 0x00 || site[7] != 0xF0 || site[8] != 0x03) {
+                    logger::error("PatchHotSpotH: unexpected bytes — NOT patching");
+                } else {
+                    // After the 9 patched bytes, code continues at +0x1790AD:
+                    //   0B C1        or eax, ecx
+                    //   89 03        mov [rbx], eax
+                    std::uint64_t continueAddr = static_cast<std::uint64_t>(base + 0x1790AD);
+
+                    auto* cave = static_cast<std::uint8_t*>(trampoline.allocate(64));
+                    int off = 0;
+
+                    // 1. Check r14 is a valid 64-bit pointer (high dword must be nonzero)
+                    //    mov r10, r14
+                    cave[off++] = 0x4D; cave[off++] = 0x89; cave[off++] = 0xF2;
+                    //    shr r10, 32
+                    cave[off++] = 0x49; cave[off++] = 0xC1; cave[off++] = 0xEA; cave[off++] = 0x20;
+                    //    test r10d, r10d
+                    cave[off++] = 0x45; cave[off++] = 0x85; cave[off++] = 0xD2;
+                    //    jz .skip (r14 is 32-bit address → sentinel or invalid)
+                    cave[off++] = 0x74;
+                    int jzSkipOff = off;
+                    cave[off++] = 0x00;
+
+                    // 2. R14 valid — original: mov eax, [r14 + rax*8]
+                    cave[off++] = 0x41; cave[off++] = 0x8B; cave[off++] = 0x04; cave[off++] = 0xC6;
+                    // Original: and eax, 0x03F00000
+                    cave[off++] = 0x25; cave[off++] = 0x00; cave[off++] = 0x00;
+                    cave[off++] = 0xF0; cave[off++] = 0x03;
+
+                    // 3. jmp [rip+0] → continueAddr (+0x1790AD)
+                    cave[off++] = 0xFF; cave[off++] = 0x25;
+                    cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00;
+                    std::memcpy(&cave[off], &continueAddr, 8); off += 8;
+
+                    // .skip: r14 is sentinel/invalid — return eax=0
+                    int skipStart = off;
+                    cave[jzSkipOff] = static_cast<std::uint8_t>(skipStart - (jzSkipOff + 1));
+                    //    xor eax, eax
+                    cave[off++] = 0x31; cave[off++] = 0xC0;
+                    //    jmp [rip+0] → continueAddr (+0x1790AD)
+                    cave[off++] = 0xFF; cave[off++] = 0x25;
+                    cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00;
+                    std::memcpy(&cave[off], &continueAddr, 8); off += 8;
+
+                    logger::info("PatchHotSpotH: cave {} bytes at 0x{:X}", off,
+                        reinterpret_cast<std::uintptr_t>(cave));
+
+                    // Patch site: JMP rel32 (5 bytes) + 4 NOPs (overwrite all 9 bytes)
+                    DWORD oldProt;
+                    VirtualProtect(site, 9, PAGE_EXECUTE_READWRITE, &oldProt);
+                    auto jmpTarget = reinterpret_cast<std::intptr_t>(cave);
+                    auto jmpFrom = reinterpret_cast<std::intptr_t>(site + 5);
+                    auto dist = jmpTarget - jmpFrom;
+                    if (dist > INT32_MAX || dist < INT32_MIN) {
+                        logger::error("PatchHotSpotH: JMP too far ({}) — NOT patching", dist);
+                        VirtualProtect(site, 9, oldProt, &oldProt);
+                    } else {
+                        auto rel32 = static_cast<std::int32_t>(dist);
+                        site[0] = 0xE9;
+                        std::memcpy(&site[1], &rel32, 4);
+                        site[5] = 0x90; site[6] = 0x90; site[7] = 0x90; site[8] = 0x90;
+                        VirtualProtect(site, 9, oldProt, &oldProt);
+                        FlushInstructionCache(GetCurrentProcess(), site, 9);
+                        RegisterCavePatch(cave, off, static_cast<std::uintptr_t>(continueAddr), "PatchH");
+                        logger::info("PatchHotSpotH: +0x1790A4 patched (rel32={})", rel32);
                     }
                 }
             }
