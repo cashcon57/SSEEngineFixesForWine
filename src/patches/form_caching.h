@@ -113,6 +113,35 @@ namespace Patches::FormCaching
         inline PVOID g_vehFormFixup = nullptr;
         inline PVOID g_vehCrashLogger = nullptr;
 
+        // v1.22.54: Code cave fault recovery.
+        // When a garbage form pointer (not null, not valid heap) causes a fault
+        // inside a code cave, the VEH redirects execution to the cave's null path.
+        // This handles the rare case where form pointers are corrupted data
+        // (e.g., XML strings 0x3C003C00 or non-canonical 0x9E50...) that pass
+        // the inline null check (cmp reg, 0x10000) but aren't valid memory.
+        struct CavePatchInfo {
+            std::uintptr_t caveStart;
+            std::uintptr_t caveEnd;
+            std::uintptr_t nullReturnAddr;  // game address to resume at (null/skip path)
+            const char* name;               // for logging
+        };
+        inline CavePatchInfo g_cavePatches[8] = {};
+        inline std::atomic<int> g_numCavePatches{ 0 };
+        inline std::atomic<std::uint64_t> g_caveFaultCount{ 0 };
+
+        inline void RegisterCavePatch(std::uint8_t* caveStart, int caveSize,
+                                      std::uintptr_t nullReturnAddr, const char* name)
+        {
+            int idx = g_numCavePatches.load(std::memory_order_relaxed);
+            if (idx < 8) {
+                g_cavePatches[idx].caveStart = reinterpret_cast<std::uintptr_t>(caveStart);
+                g_cavePatches[idx].caveEnd = reinterpret_cast<std::uintptr_t>(caveStart) + caveSize;
+                g_cavePatches[idx].nullReturnAddr = nullReturnAddr;
+                g_cavePatches[idx].name = name;
+                g_numCavePatches.store(idx + 1, std::memory_order_release);
+            }
+        }
+
         // v1.22.51: Dynamic log paths — resolved once at init from SKSE log dir.
         // Fixed-size char arrays are safe to read from VEH handlers (no allocation).
         inline char g_crashLogPath[MAX_PATH] = {};
@@ -948,6 +977,37 @@ namespace Patches::FormCaching
                             }
                         }
                         return EXCEPTION_CONTINUE_EXECUTION;
+                    }
+                }
+
+                // v1.22.54: Check if fault is inside one of our code caves.
+                // This happens when garbage form pointers (e.g., 0x3C003C00,
+                // 0x9E50...) pass the inline null check but aren't valid memory.
+                // Redirect to the cave's null/skip path.
+                {
+                    int numCaves = g_numCavePatches.load(std::memory_order_acquire);
+                    for (int i = 0; i < numCaves; ++i) {
+                        if (rip >= g_cavePatches[i].caveStart && rip < g_cavePatches[i].caveEnd) {
+                            pep->ContextRecord->Rip = g_cavePatches[i].nullReturnAddr;
+                            pep->ContextRecord->Rax = 0; // safe: null paths return 0 or ignore RAX
+
+                            auto count = g_caveFaultCount.fetch_add(1, std::memory_order_relaxed);
+                            if (count < 200) {
+                                const char* logPath = g_crashLogPath;
+                                FILE* f = nullptr;
+                                fopen_s(&f, logPath, "a");
+                                if (f) {
+                                    fprintf(f, "CAVE-FAULT #%llu: RIP=0x%llX (%s) target=0x%llX → redirect 0x%llX\n",
+                                        (unsigned long long)(count + 1), (unsigned long long)rip,
+                                        g_cavePatches[i].name,
+                                        (unsigned long long)targetAddr,
+                                        (unsigned long long)g_cavePatches[i].nullReturnAddr);
+                                    fflush(f);
+                                    fclose(f);
+                                }
+                            }
+                            return EXCEPTION_CONTINUE_EXECUTION;
+                        }
                     }
                 }
 
@@ -2075,6 +2135,7 @@ namespace Patches::FormCaching
                         site[5] = 0x90;
                         VirtualProtect(site, 6, oldProt, &oldProt);
                         FlushInstructionCache(GetCurrentProcess(), site, 6);
+                        RegisterCavePatch(cave, off, static_cast<std::uintptr_t>(returnAddr), "PatchA");
                         logger::info("PatchHotSpotA: +0x2ED880 patched (rel32={})", rel32);
                     }
                 }
@@ -2137,6 +2198,7 @@ namespace Patches::FormCaching
                         site[5] = 0x90; site[6] = 0x90; site[7] = 0x90;
                         VirtualProtect(site, 8, oldProt, &oldProt);
                         FlushInstructionCache(GetCurrentProcess(), site, 8);
+                        RegisterCavePatch(cave, off, static_cast<std::uintptr_t>(returnAddr), "PatchB");
                         logger::info("PatchHotSpotB: +0x32D146 patched (rel32={})", rel32);
                     }
                 }
@@ -2225,6 +2287,7 @@ namespace Patches::FormCaching
                         site[5] = 0x90;
                         VirtualProtect(site, 6, oldProt, &oldProt);
                         FlushInstructionCache(GetCurrentProcess(), site, 6);
+                        RegisterCavePatch(cave, off, static_cast<std::uintptr_t>(returnZeroAddr), "PatchC");
                         logger::info("PatchHotSpotC: +0x2ED88B patched (rel32={})", rel32);
                     }
                 }
@@ -2310,12 +2373,13 @@ namespace Patches::FormCaching
                         site[5] = 0x90;
                         VirtualProtect(site, 6, oldProt, &oldProt);
                         FlushInstructionCache(GetCurrentProcess(), site, 6);
+                        RegisterCavePatch(cave, off, static_cast<std::uintptr_t>(skipFormAddr), "PatchD");
                         logger::info("PatchHotSpotD: +0x664A0B patched (rel32={})", rel32);
                     }
                 }
             }
 
-            logger::info("PatchHotSpotNullChecks: done");
+            logger::info("PatchHotSpotNullChecks: {} code caves registered", g_numCavePatches.load());
 #endif
         }
 
@@ -2962,11 +3026,12 @@ namespace Patches::FormCaching
                         FILE* f = nullptr;
                         fopen_s(&f, g_crashLogPath, "a");
                         if (f) {
-                            fprintf(f, "WATCHDOG #%d (t=%ds): zp=%llu ws=%llu nc=%d fi=%d ca=%llu",
+                            fprintf(f, "WATCHDOG #%d (t=%ds): zp=%llu ws=%llu nc=%d fi=%d ca=%llu cf=%llu",
                                 tick, tick * 10,
                                 curZp, curWs,
                                 g_nullSkipCount.load(std::memory_order_relaxed),
-                                curFi, curCa);
+                                curFi, curCa,
+                                (unsigned long long)g_caveFaultCount.load(std::memory_order_relaxed));
 
                             // v1.22.46: Sample main thread RIP when frozen
                             if (ripSampling && g_mainThreadHandle) {

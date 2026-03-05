@@ -127,12 +127,13 @@ void MessageHandler(SKSE::MessagingInterface::Message* a_msg)
                 FILE* f = nullptr;
                 fopen_s(&f, Patches::FormCaching::detail::g_crashLogPath, "a");
                 if (f) {
-                    fprintf(f, "\n=== kNewGame (v1.22.53) === zpWritable=%d zpUse=%llu ws=%llu ca=%llu fi=%d\n",
+                    fprintf(f, "\n=== kNewGame (v1.22.54) === zpWritable=%d zpUse=%llu ws=%llu ca=%llu fi=%d cf=%llu\n",
                         Patches::FormCaching::detail::g_zpWritable.load(std::memory_order_relaxed) ? 1 : 0,
                         Patches::FormCaching::detail::g_zeroPageUseCount.load(std::memory_order_relaxed),
                         Patches::FormCaching::detail::g_zeroPageWriteSkips.load(std::memory_order_relaxed),
                         Patches::FormCaching::detail::g_catchAllCount.load(std::memory_order_relaxed),
-                        Patches::FormCaching::detail::g_formIdSkipCount.load(std::memory_order_relaxed));
+                        Patches::FormCaching::detail::g_formIdSkipCount.load(std::memory_order_relaxed),
+                        (unsigned long long)Patches::FormCaching::detail::g_caveFaultCount.load(std::memory_order_relaxed));
                     fflush(f);
                     fclose(f);
                 }
