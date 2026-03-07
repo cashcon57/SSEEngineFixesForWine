@@ -4236,8 +4236,6 @@ namespace Patches::FormCaching
                     std::uint64_t prevZp = 0, prevWs = 0, prevCa = 0;
                     int prevFi = 0;
                     int stableTicks = 0;     // how many ticks counters unchanged
-                    bool ripSampling = false; // once triggered, sample every tick
-
                     auto imgBase = REL::Module::get().base();
 
                     while (true) {
@@ -4249,22 +4247,8 @@ namespace Patches::FormCaching
                         auto curFi = g_formIdSkipCount.load(std::memory_order_relaxed);
                         auto curCa = g_catchAllCount.load(std::memory_order_relaxed);
 
-                        // Detect stable counters (potential freeze)
-                        if (curZp == prevZp && curWs == prevWs &&
-                            curFi == prevFi && curCa == prevCa &&
-                            (curZp + curWs + curFi + curCa) > 0) {
-                            stableTicks++;
-                        } else {
-                            stableTicks = 0;
-                        }
                         prevZp = curZp; prevWs = curWs;
                         prevFi = curFi; prevCa = curCa;
-
-                        // v1.22.47: Start RIP sampling after 1 stable tick (10s)
-                        // instead of 3 — catches freezes faster.
-                        if (stableTicks >= 1 && !ripSampling) {
-                            ripSampling = true;
-                        }
 
                         // v1.22.64: Aggressively zero sentinel page to break garbage
                         // pointer chains. Engine writes garbage to sentinel (it's RW),
@@ -4305,16 +4289,21 @@ namespace Patches::FormCaching
                                 (unsigned long long)g_caveFaultCount.load(std::memory_order_relaxed),
                                 (unsigned long long)g_execRecoverCount.load(std::memory_order_relaxed));
 
-                            // v1.22.46: Sample main thread RIP when frozen
-                            if (ripSampling && g_mainThreadHandle) {
+                            // v1.22.71: Always sample main thread RIP on every
+                            // watchdog tick. Previous versions only sampled when
+                            // counters were stable+nonzero, which missed freezes
+                            // that happen before any VEH activity (e.g., New Game
+                            // transition deadlock with zero exceptions).
+                            if (g_mainThreadHandle) {
                                 DWORD suspCount = SuspendThread(g_mainThreadHandle);
-                                if (suspCount != (DWORD)-1) {
+                                if (suspCount == (DWORD)-1) {
+                                    fprintf(f, " RIP=SUSPEND_FAIL(err=%lu)", GetLastError());
+                                } else {
                                     CONTEXT ctx = {};
                                     ctx.ContextFlags = CONTEXT_CONTROL;
                                     if (GetThreadContext(g_mainThreadHandle, &ctx)) {
                                         DWORD64 rip = ctx.Rip;
                                         DWORD64 rsp = ctx.Rsp;
-                                        // Log RIP as offset from image base if in SkyrimSE.exe
                                         if (rip >= (DWORD64)imgBase && rip < (DWORD64)imgBase + 0x4000000) {
                                             fprintf(f, " RIP=+0x%llX RSP=0x%llX",
                                                 (unsigned long long)(rip - imgBase),
@@ -4324,8 +4313,6 @@ namespace Patches::FormCaching
                                                 (unsigned long long)rip,
                                                 (unsigned long long)rsp);
                                         }
-
-                                        // Also read a few stack frames for context
                                         auto* rspPtr = reinterpret_cast<DWORD64*>(rsp);
                                         if (!IsBadReadPtr(rspPtr, 64)) {
                                             fprintf(f, " STK=[");
@@ -4339,9 +4326,13 @@ namespace Patches::FormCaching
                                             }
                                             fprintf(f, "]");
                                         }
+                                    } else {
+                                        fprintf(f, " RIP=GETCTX_FAIL(err=%lu)", GetLastError());
                                     }
                                     ResumeThread(g_mainThreadHandle);
                                 }
+                            } else {
+                                fprintf(f, " RIP=NO_HANDLE");
                             }
 
                             fprintf(f, "\n");
