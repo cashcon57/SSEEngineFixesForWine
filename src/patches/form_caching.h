@@ -3167,10 +3167,13 @@ namespace Patches::FormCaching
                     // Function epilogue: restores rbx/rbp/rsi from stack, returns al=1
                     std::uint64_t epilogueAddr = static_cast<std::uint64_t>(base + 0x2D5EE5);
 
-                    auto* cave = static_cast<std::uint8_t*>(trampoline.allocate(56));
+                    // Also need grow-table address for rbp==0 case
+                    std::uint64_t growTableAddr = static_cast<std::uint64_t>(base + 0x2D5E32);
+
+                    auto* cave = static_cast<std::uint8_t*>(trampoline.allocate(80));
                     int off = 0;
 
-                    // 64-bit validation: high dword == 0 → invalid
+                    // 1. Validate RBX (high dword == 0 → invalid)
                     // mov r10, rbx
                     cave[off++] = 0x49; cave[off++] = 0x89; cave[off++] = 0xDA;
                     // shr r10, 32
@@ -3179,21 +3182,50 @@ namespace Patches::FormCaching
                     cave[off++] = 0x45; cave[off++] = 0x85; cave[off++] = 0xD2;
                     // jz .invalid
                     cave[off++] = 0x74;
-                    int jzInvalidOff = off;
-                    cave[off++] = 0x00;
+                    int jzInvalid1Off = off;
+                    cave[off++] = 0x00; // patched below
 
-                    // .valid: original mov rbp, [rbx+0x20]
+                    // 2. Original: mov rbp, [rbx+0x20]
                     cave[off++] = 0x48; cave[off++] = 0x8B; cave[off++] = 0x6B; cave[off++] = 0x20;
-                    // original test rbp, rbp
+
+                    // 3. Check rbp == 0 → grow table
+                    // test rbp, rbp
                     cave[off++] = 0x48; cave[off++] = 0x85; cave[off++] = 0xED;
-                    // jmp [rip+0] → continueAddr (+0x2D5DB7, je check)
+                    // jz .growTable
+                    cave[off++] = 0x74;
+                    int jzGrowOff = off;
+                    cave[off++] = 0x00; // patched below
+
+                    // 4. Validate RBP (high dword == 0 → stale/sentinel pointer)
+                    // mov r10, rbp
+                    cave[off++] = 0x49; cave[off++] = 0x89; cave[off++] = 0xEA;
+                    // shr r10, 32
+                    cave[off++] = 0x49; cave[off++] = 0xC1; cave[off++] = 0xEA; cave[off++] = 0x20;
+                    // test r10d, r10d
+                    cave[off++] = 0x45; cave[off++] = 0x85; cave[off++] = 0xD2;
+                    // jz .invalid (RBP has no high dword → not a valid heap ptr)
+                    cave[off++] = 0x74;
+                    int jzInvalid2Off = off;
+                    cave[off++] = 0x00; // patched below
+
+                    // 5. RBP valid — ZF=0 from test r10d (nonzero high dword).
+                    //    je at +0x2D5DB7 won't take → continues into bucket scan.
+                    // jmp [rip+0] → continueAddr (+0x2D5DB7)
                     cave[off++] = 0xFF; cave[off++] = 0x25;
                     cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00;
                     std::memcpy(&cave[off], &continueAddr, 8); off += 8;
 
-                    // .invalid: jump directly to function epilogue (safe return)
+                    // .growTable: RBP is zero — jump to grow-table path (+0x2D5E32)
+                    int growStart = off;
+                    cave[jzGrowOff] = static_cast<std::uint8_t>(growStart - (jzGrowOff + 1));
+                    cave[off++] = 0xFF; cave[off++] = 0x25;
+                    cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00;
+                    std::memcpy(&cave[off], &growTableAddr, 8); off += 8;
+
+                    // .invalid: RBX or RBP failed validation → function epilogue
                     int invalidStart = off;
-                    cave[jzInvalidOff] = static_cast<std::uint8_t>(invalidStart - (jzInvalidOff + 1));
+                    cave[jzInvalid1Off] = static_cast<std::uint8_t>(invalidStart - (jzInvalid1Off + 1));
+                    cave[jzInvalid2Off] = static_cast<std::uint8_t>(invalidStart - (jzInvalid2Off + 1));
                     // jmp [rip+0] → epilogueAddr (+0x2D5EE5)
                     cave[off++] = 0xFF; cave[off++] = 0x25;
                     cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00;
@@ -3374,6 +3406,87 @@ namespace Patches::FormCaching
                         FlushInstructionCache(GetCurrentProcess(), site, 5);
                         RegisterCavePatch(cave, off, static_cast<std::uintptr_t>(epilogueAddr), "PatchN", site, 5);
                         logger::info("PatchHotSpotN: +0x2D5E15 patched (rel32={}) verify={:02X}",
+                            rel32, site[0]);
+                    }
+                }
+            }
+
+            // ── Patch O: +0x2D5DCD ──────────────────────────────────────
+            // Bucket occupancy check: cmp qword [rsi+8], 0.
+            // RSI = rbp + (hash & (cap-1)) * 16. If RBP was stale/corrupted
+            // (survived PatchL's validation but contained freed memory),
+            // RSI points to garbage → ACCESS_VIOLATION at [rsi+8].
+            // CATCH-ALL redirect makes it worse (redirects RSI to sentinel,
+            // sentinel+8 has engine-written garbage → cascading corruption).
+            // Fix: validate RSI high dword. Invalid → epilogue.
+            // Overwrite 5 bytes: 48 83 7E 08 00 (exact JMP rel32 fit).
+            {
+                auto* site = reinterpret_cast<std::uint8_t*>(base + 0x2D5DCD);
+
+                logger::info("PatchHotSpotO: bytes at +0x2D5DCD: "
+                    "{:02X} {:02X} {:02X} {:02X} {:02X}",
+                    site[0], site[1], site[2], site[3], site[4]);
+
+                // Expected: 48 83 7E 08 00
+                if (site[0] != 0x48 || site[1] != 0x83 || site[2] != 0x7E ||
+                    site[3] != 0x08 || site[4] != 0x00) {
+                    logger::error("PatchHotSpotO: unexpected bytes — NOT patching");
+                } else {
+                    // Continue after the 5-byte cmp: +0x2D5DD2 (the je instruction)
+                    std::uint64_t continueAddr = static_cast<std::uint64_t>(base + 0x2D5DD2);
+                    std::uint64_t epilogueAddr = static_cast<std::uint64_t>(base + 0x2D5EE5);
+
+                    auto* cave = static_cast<std::uint8_t*>(trampoline.allocate(48));
+                    int off = 0;
+
+                    // 1. Validate RSI high dword
+                    // mov r10, rsi
+                    cave[off++] = 0x49; cave[off++] = 0x89; cave[off++] = 0xF2;
+                    // shr r10, 32
+                    cave[off++] = 0x49; cave[off++] = 0xC1; cave[off++] = 0xEA; cave[off++] = 0x20;
+                    // test r10d, r10d
+                    cave[off++] = 0x45; cave[off++] = 0x85; cave[off++] = 0xD2;
+                    // jz .invalid
+                    cave[off++] = 0x74;
+                    int jzInvalidOff = off;
+                    cave[off++] = 0x00; // patched below
+
+                    // 2. Original instruction: cmp qword [rsi+8], 0
+                    cave[off++] = 0x48; cave[off++] = 0x83; cave[off++] = 0x7E;
+                    cave[off++] = 0x08; cave[off++] = 0x00;
+
+                    // 3. Continue at +0x2D5DD2 (je instruction uses ZF from cmp)
+                    // jmp [rip+0] → continueAddr
+                    cave[off++] = 0xFF; cave[off++] = 0x25;
+                    cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00;
+                    std::memcpy(&cave[off], &continueAddr, 8); off += 8;
+
+                    // .invalid: RSI is bogus → bail to epilogue
+                    int invalidStart = off;
+                    cave[jzInvalidOff] = static_cast<std::uint8_t>(invalidStart - (jzInvalidOff + 1));
+                    cave[off++] = 0xFF; cave[off++] = 0x25;
+                    cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00;
+                    std::memcpy(&cave[off], &epilogueAddr, 8); off += 8;
+
+                    logger::info("PatchHotSpotO: cave {} bytes at 0x{:X}", off,
+                        reinterpret_cast<std::uintptr_t>(cave));
+
+                    // Patch: JMP rel32 (5 bytes) — exact fit
+                    DWORD oldProt;
+                    VirtualProtect(site, 5, PAGE_EXECUTE_READWRITE, &oldProt);
+                    auto jmpTarget = reinterpret_cast<std::intptr_t>(cave);
+                    auto jmpFrom = reinterpret_cast<std::intptr_t>(site + 5);
+                    auto dist = jmpTarget - jmpFrom;
+                    if (dist > INT32_MAX || dist < INT32_MIN) {
+                        logger::error("PatchHotSpotO: JMP too far ({}) — NOT patching", dist);
+                        VirtualProtect(site, 5, oldProt, &oldProt);
+                    } else {
+                        auto rel32 = static_cast<std::int32_t>(dist);
+                        site[0] = 0xE9;
+                        std::memcpy(&site[1], &rel32, 4);
+                        FlushInstructionCache(GetCurrentProcess(), site, 5);
+                        RegisterCavePatch(cave, off, static_cast<std::uintptr_t>(epilogueAddr), "PatchO", site, 5);
+                        logger::info("PatchHotSpotO: +0x2D5DCD patched (rel32={}) verify={:02X}",
                             rel32, site[0]);
                     }
                 }
