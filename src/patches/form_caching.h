@@ -4217,15 +4217,26 @@ namespace Patches::FormCaching
                 g_crashLoggerActive.store(true, std::memory_order_release);
                 logger::info("  Installed CrashLoggerVEH (first-chance, writes to SKSE log dir)");
 
-                // v1.22.46: Capture main thread handle for RIP sampling
+                // v1.22.72: Capture main thread handle via DuplicateHandle on
+                // pseudo-handle. OpenThread works initially but Wine revokes
+                // THREAD_SUSPEND_RESUME access after the first call (err=5).
+                // DuplicateHandle on GetCurrentThread() inherits full access.
                 g_mainThreadId = GetCurrentThreadId();
-                g_mainThreadHandle = OpenThread(
-                    THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
-                    FALSE, g_mainThreadId);
-                if (g_mainThreadHandle) {
-                    logger::info("  Captured main thread handle (tid={})", g_mainThreadId);
+                if (DuplicateHandle(GetCurrentProcess(), GetCurrentThread(),
+                                    GetCurrentProcess(), &g_mainThreadHandle,
+                                    THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
+                                    FALSE, 0)) {
+                    logger::info("  Captured main thread handle via DuplicateHandle (tid={})", g_mainThreadId);
                 } else {
-                    logger::warn("  Failed to capture main thread handle (err={})", GetLastError());
+                    // Fallback to OpenThread
+                    g_mainThreadHandle = OpenThread(
+                        THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
+                        FALSE, g_mainThreadId);
+                    if (g_mainThreadHandle) {
+                        logger::info("  Captured main thread handle via OpenThread (tid={})", g_mainThreadId);
+                    } else {
+                        logger::warn("  Failed to capture main thread handle (err={})", GetLastError());
+                    }
                 }
 
                 // v1.22.36: Watchdog thread — logs VEH counters every 10 seconds.
