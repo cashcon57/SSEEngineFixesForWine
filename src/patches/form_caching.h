@@ -4300,48 +4300,51 @@ namespace Patches::FormCaching
                                 (unsigned long long)g_caveFaultCount.load(std::memory_order_relaxed),
                                 (unsigned long long)g_execRecoverCount.load(std::memory_order_relaxed));
 
-                            // v1.22.71: Always sample main thread RIP on every
-                            // watchdog tick. Previous versions only sampled when
-                            // counters were stable+nonzero, which missed freezes
-                            // that happen before any VEH activity (e.g., New Game
-                            // transition deadlock with zero exceptions).
+                            // v1.22.72: Sample main thread RIP on every tick.
+                            // Try SuspendThread first; if Wine blocks it (err=5),
+                            // fall back to GetThreadContext without suspend (racy
+                            // but still useful for detecting tight loops/deadlocks).
                             if (g_mainThreadHandle) {
+                                bool suspended = false;
                                 DWORD suspCount = SuspendThread(g_mainThreadHandle);
-                                if (suspCount == (DWORD)-1) {
-                                    fprintf(f, " RIP=SUSPEND_FAIL(err=%lu)", GetLastError());
-                                } else {
-                                    CONTEXT ctx = {};
-                                    ctx.ContextFlags = CONTEXT_CONTROL;
-                                    if (GetThreadContext(g_mainThreadHandle, &ctx)) {
-                                        DWORD64 rip = ctx.Rip;
-                                        DWORD64 rsp = ctx.Rsp;
-                                        if (rip >= (DWORD64)imgBase && rip < (DWORD64)imgBase + 0x4000000) {
-                                            fprintf(f, " RIP=+0x%llX RSP=0x%llX",
-                                                (unsigned long long)(rip - imgBase),
-                                                (unsigned long long)rsp);
-                                        } else {
-                                            fprintf(f, " RIP=0x%llX RSP=0x%llX",
-                                                (unsigned long long)rip,
-                                                (unsigned long long)rsp);
-                                        }
-                                        auto* rspPtr = reinterpret_cast<DWORD64*>(rsp);
-                                        if (!IsBadReadPtr(rspPtr, 64)) {
-                                            fprintf(f, " STK=[");
-                                            for (int i = 0; i < 8; ++i) {
-                                                DWORD64 val = rspPtr[i];
-                                                if (val >= (DWORD64)imgBase &&
-                                                    val < (DWORD64)imgBase + 0x4000000) {
-                                                    fprintf(f, "+0x%llX ",
-                                                        (unsigned long long)(val - imgBase));
-                                                }
-                                            }
-                                            fprintf(f, "]");
-                                        }
-                                    } else {
-                                        fprintf(f, " RIP=GETCTX_FAIL(err=%lu)", GetLastError());
-                                    }
-                                    ResumeThread(g_mainThreadHandle);
+                                if (suspCount != (DWORD)-1) {
+                                    suspended = true;
                                 }
+
+                                CONTEXT ctx = {};
+                                ctx.ContextFlags = CONTEXT_CONTROL;
+                                if (GetThreadContext(g_mainThreadHandle, &ctx)) {
+                                    DWORD64 rip = ctx.Rip;
+                                    DWORD64 rsp = ctx.Rsp;
+                                    if (rip >= (DWORD64)imgBase && rip < (DWORD64)imgBase + 0x4000000) {
+                                        fprintf(f, " RIP=+0x%llX RSP=0x%llX",
+                                            (unsigned long long)(rip - imgBase),
+                                            (unsigned long long)rsp);
+                                    } else {
+                                        fprintf(f, " RIP=0x%llX RSP=0x%llX",
+                                            (unsigned long long)rip,
+                                            (unsigned long long)rsp);
+                                    }
+                                    if (!suspended) fprintf(f, "(unsuspended)");
+                                    auto* rspPtr = reinterpret_cast<DWORD64*>(rsp);
+                                    if (!IsBadReadPtr(rspPtr, 64)) {
+                                        fprintf(f, " STK=[");
+                                        for (int i = 0; i < 8; ++i) {
+                                            DWORD64 val = rspPtr[i];
+                                            if (val >= (DWORD64)imgBase &&
+                                                val < (DWORD64)imgBase + 0x4000000) {
+                                                fprintf(f, "+0x%llX ",
+                                                    (unsigned long long)(val - imgBase));
+                                            }
+                                        }
+                                        fprintf(f, "]");
+                                    }
+                                } else {
+                                    fprintf(f, " RIP=FAIL(susp=%d,err=%lu)",
+                                        suspended ? 1 : 0, GetLastError());
+                                }
+
+                                if (suspended) ResumeThread(g_mainThreadHandle);
                             } else {
                                 fprintf(f, " RIP=NO_HANDLE");
                             }
