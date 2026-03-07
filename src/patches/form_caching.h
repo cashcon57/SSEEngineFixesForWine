@@ -1031,6 +1031,27 @@ namespace Patches::FormCaching
                             pep->ContextRecord->Rip = g_cavePatches[i].nullReturnAddr;
                             pep->ContextRecord->Rax = 0; // safe: null paths return 0 or ignore RAX
 
+                            // v1.22.69: Zero sentinel page on every cave-fault recovery.
+                            // Engine writes garbage to sentinel (RW page) which persists as
+                            // corrupted "next" pointers (0x574E4D454D414C43 = ASCII text),
+                            // causing infinite loops and cascading crashes. By zeroing
+                            // sentinel here, the NEXT read of sentinel sees clean NULL
+                            // pointers, terminating link-chasing loops.
+                            if (g_zeroPage) {
+                                auto* page = reinterpret_cast<std::uint8_t*>(g_zeroPage);
+                                memset(page, 0, 0x500);
+                                if (g_stubVtable) {
+                                    auto vtAddr = reinterpret_cast<DWORD64>(g_stubVtable);
+                                    memcpy(page + 0x00, &vtAddr, 8);
+                                }
+                                auto kDeleted = static_cast<std::uint32_t>(0x20);
+                                memcpy(page + 0x10, &kDeleted, 4);
+                                if (g_stubFuncPage) {
+                                    auto stubAddr = reinterpret_cast<DWORD64>(g_stubFuncPage);
+                                    memcpy(page + 0x4B8, &stubAddr, 8);
+                                }
+                            }
+
                             auto count = g_caveFaultCount.fetch_add(1, std::memory_order_relaxed);
                             if (count < 200) {
                                 const char* logPath = g_crashLogPath;
@@ -3170,19 +3191,24 @@ namespace Patches::FormCaching
                     // Also need grow-table address for rbp==0 case
                     std::uint64_t growTableAddr = static_cast<std::uint64_t>(base + 0x2D5E32);
 
-                    auto* cave = static_cast<std::uint8_t*>(trampoline.allocate(80));
+                    auto* cave = static_cast<std::uint8_t*>(trampoline.allocate(96));
                     int off = 0;
 
-                    // 1. Validate RBX (high dword == 0 → invalid)
+                    // 1. Validate RBX — canonical range check.
+                    //    high dword must be 1-128 (valid user-mode heap/image).
+                    //    Rejects: 0 (null/sentinel), >128 (non-canonical/garbage text).
+                    //    Catches ASCII text like 0x574E4D454D414C43 that old check missed.
                     // mov r10, rbx
                     cave[off++] = 0x49; cave[off++] = 0x89; cave[off++] = 0xDA;
                     // shr r10, 32
                     cave[off++] = 0x49; cave[off++] = 0xC1; cave[off++] = 0xEA; cave[off++] = 0x20;
-                    // test r10d, r10d
-                    cave[off++] = 0x45; cave[off++] = 0x85; cave[off++] = 0xD2;
-                    // jz .invalid
-                    cave[off++] = 0x74;
-                    int jzInvalid1Off = off;
+                    // dec r10d  (0→0xFFFFFFFF, 1→0, 0x574E4D45→0x574E4D44)
+                    cave[off++] = 0x41; cave[off++] = 0xFF; cave[off++] = 0xCA;
+                    // cmp r10d, 0x7F  (valid range [1..128] → dec'd [0..127])
+                    cave[off++] = 0x41; cave[off++] = 0x83; cave[off++] = 0xFA; cave[off++] = 0x7F;
+                    // ja .invalid
+                    cave[off++] = 0x77;
+                    int jaInvalid1Off = off;
                     cave[off++] = 0x00; // patched below
 
                     // 2. Original: mov rbp, [rbx+0x20]
@@ -3196,20 +3222,22 @@ namespace Patches::FormCaching
                     int jzGrowOff = off;
                     cave[off++] = 0x00; // patched below
 
-                    // 4. Validate RBP (high dword == 0 → stale/sentinel pointer)
+                    // 4. Validate RBP — same canonical range check
                     // mov r10, rbp
                     cave[off++] = 0x49; cave[off++] = 0x89; cave[off++] = 0xEA;
                     // shr r10, 32
                     cave[off++] = 0x49; cave[off++] = 0xC1; cave[off++] = 0xEA; cave[off++] = 0x20;
-                    // test r10d, r10d
-                    cave[off++] = 0x45; cave[off++] = 0x85; cave[off++] = 0xD2;
-                    // jz .invalid (RBP has no high dword → not a valid heap ptr)
-                    cave[off++] = 0x74;
-                    int jzInvalid2Off = off;
+                    // dec r10d
+                    cave[off++] = 0x41; cave[off++] = 0xFF; cave[off++] = 0xCA;
+                    // cmp r10d, 0x7F
+                    cave[off++] = 0x41; cave[off++] = 0x83; cave[off++] = 0xFA; cave[off++] = 0x7F;
+                    // ja .invalid
+                    cave[off++] = 0x77;
+                    int jaInvalid2Off = off;
                     cave[off++] = 0x00; // patched below
 
-                    // 5. RBP valid — ZF=0 from test r10d (nonzero high dword).
-                    //    je at +0x2D5DB7 won't take → continues into bucket scan.
+                    // 5. RBP valid. Need ZF=0 for je at +0x2D5DB7 to NOT take.
+                    //    After cmp r10d,0x7F where r10d<128, CF=1 but ZF=0. Good.
                     // jmp [rip+0] → continueAddr (+0x2D5DB7)
                     cave[off++] = 0xFF; cave[off++] = 0x25;
                     cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00;
@@ -3222,10 +3250,12 @@ namespace Patches::FormCaching
                     cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00;
                     std::memcpy(&cave[off], &growTableAddr, 8); off += 8;
 
-                    // .invalid: RBX or RBP failed validation → function epilogue
+                    // .invalid: RBX or RBP failed canonical check → xor rax,rax + epilogue
                     int invalidStart = off;
-                    cave[jzInvalid1Off] = static_cast<std::uint8_t>(invalidStart - (jzInvalid1Off + 1));
-                    cave[jzInvalid2Off] = static_cast<std::uint8_t>(invalidStart - (jzInvalid2Off + 1));
+                    cave[jaInvalid1Off] = static_cast<std::uint8_t>(invalidStart - (jaInvalid1Off + 1));
+                    cave[jaInvalid2Off] = static_cast<std::uint8_t>(invalidStart - (jaInvalid2Off + 1));
+                    // xor eax, eax (zero RAX — signal "not found" to caller)
+                    cave[off++] = 0x31; cave[off++] = 0xC0;
                     // jmp [rip+0] → epilogueAddr (+0x2D5EE5)
                     cave[off++] = 0xFF; cave[off++] = 0x25;
                     cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00;
@@ -3355,18 +3385,20 @@ namespace Patches::FormCaching
                     // Function epilogue — safe bail-out if bucket walk is hopeless
                     std::uint64_t epilogueAddr = static_cast<std::uint64_t>(base + 0x2D5EE5);
 
-                    auto* cave = static_cast<std::uint8_t*>(trampoline.allocate(56));
+                    auto* cave = static_cast<std::uint8_t*>(trampoline.allocate(64));
                     int off = 0;
 
-                    // 64-bit validation: high dword == 0 → invalid
+                    // Canonical range check: high dword must be 1-128
                     // mov r10, rcx
                     cave[off++] = 0x49; cave[off++] = 0x89; cave[off++] = 0xCA;
                     // shr r10, 32
                     cave[off++] = 0x49; cave[off++] = 0xC1; cave[off++] = 0xEA; cave[off++] = 0x20;
-                    // test r10d, r10d
-                    cave[off++] = 0x45; cave[off++] = 0x85; cave[off++] = 0xD2;
-                    // jz .invalid
-                    cave[off++] = 0x74;
+                    // dec r10d
+                    cave[off++] = 0x41; cave[off++] = 0xFF; cave[off++] = 0xCA;
+                    // cmp r10d, 0x7F
+                    cave[off++] = 0x41; cave[off++] = 0x83; cave[off++] = 0xFA; cave[off++] = 0x7F;
+                    // ja .invalid
+                    cave[off++] = 0x77;
                     int jzInvalidOff = off;
                     cave[off++] = 0x00;
 
@@ -3436,18 +3468,20 @@ namespace Patches::FormCaching
                     std::uint64_t continueAddr = static_cast<std::uint64_t>(base + 0x2D5DD2);
                     std::uint64_t epilogueAddr = static_cast<std::uint64_t>(base + 0x2D5EE5);
 
-                    auto* cave = static_cast<std::uint8_t*>(trampoline.allocate(48));
+                    auto* cave = static_cast<std::uint8_t*>(trampoline.allocate(56));
                     int off = 0;
 
-                    // 1. Validate RSI high dword
+                    // 1. Validate RSI — canonical range check
                     // mov r10, rsi
                     cave[off++] = 0x49; cave[off++] = 0x89; cave[off++] = 0xF2;
                     // shr r10, 32
                     cave[off++] = 0x49; cave[off++] = 0xC1; cave[off++] = 0xEA; cave[off++] = 0x20;
-                    // test r10d, r10d
-                    cave[off++] = 0x45; cave[off++] = 0x85; cave[off++] = 0xD2;
-                    // jz .invalid
-                    cave[off++] = 0x74;
+                    // dec r10d
+                    cave[off++] = 0x41; cave[off++] = 0xFF; cave[off++] = 0xCA;
+                    // cmp r10d, 0x7F
+                    cave[off++] = 0x41; cave[off++] = 0x83; cave[off++] = 0xFA; cave[off++] = 0x7F;
+                    // ja .invalid
+                    cave[off++] = 0x77;
                     int jzInvalidOff = off;
                     cave[off++] = 0x00; // patched below
 
