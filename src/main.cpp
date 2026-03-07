@@ -127,7 +127,7 @@ void MessageHandler(SKSE::MessagingInterface::Message* a_msg)
                 FILE* f = nullptr;
                 fopen_s(&f, Patches::FormCaching::detail::g_crashLogPath, "a");
                 if (f) {
-                    fprintf(f, "\n=== kNewGame (v1.22.65) === zpWritable=%d zpUse=%llu ws=%llu ca=%llu fi=%d cf=%llu er=%llu\n",
+                    fprintf(f, "\n=== kNewGame (v1.22.66) === zpWritable=%d zpUse=%llu ws=%llu ca=%llu fi=%d cf=%llu er=%llu\n",
                         Patches::FormCaching::detail::g_zpWritable.load(std::memory_order_relaxed) ? 1 : 0,
                         Patches::FormCaching::detail::g_zeroPageUseCount.load(std::memory_order_relaxed),
                         Patches::FormCaching::detail::g_zeroPageWriteSkips.load(std::memory_order_relaxed),
@@ -224,7 +224,7 @@ extern "C" __declspec(dllexport) bool SKSEAPI SKSEPlugin_Load(const SKSE::LoadIn
     }
 
     auto& trampoline = SKSE::GetTrampoline();
-    trampoline.create(1 << 11);
+    trampoline.create(1 << 13);  // 8KB — needed for 13+ code caves + other patches
 
     Settings::Load();
 
