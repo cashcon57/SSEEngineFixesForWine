@@ -3144,9 +3144,12 @@ namespace Patches::FormCaching
 
             // ── Patch L: +0x2D5DB0 ──────────────────────────────────────
             // Pointer read from structure — mov rbp, [rbx+0x20] then test rbp, rbp.
-            // RBX is corrupted. Safe default: xor ebp, ebp (zero rbp).
+            // RBX may be corrupted (sentinel-like 0x7D000000XX passes 64-bit check
+            // but [rbx+0x20] faults). VEH CAVE-FAULT then redirects with wrong flags.
+            // Fix: invalid path and VEH fallback both jump to function epilogue
+            // at +0x2D5EE5 (restores regs from stack, returns al=1) — safe regardless
+            // of register/flag state.
             // Overwrite 7 bytes: 48 8B 6B 20 48 85 ED (mov + test).
-            // Cave executes both if valid. Continue at +0x2D5DB7.
             {
                 auto* site = reinterpret_cast<std::uint8_t*>(base + 0x2D5DB0);
 
@@ -3161,8 +3164,10 @@ namespace Patches::FormCaching
                     logger::error("PatchHotSpotL: unexpected bytes — NOT patching");
                 } else {
                     std::uint64_t continueAddr = static_cast<std::uint64_t>(base + 0x2D5DB7);
+                    // Function epilogue: restores rbx/rbp/rsi from stack, returns al=1
+                    std::uint64_t epilogueAddr = static_cast<std::uint64_t>(base + 0x2D5EE5);
 
-                    auto* cave = static_cast<std::uint8_t*>(trampoline.allocate(48));
+                    auto* cave = static_cast<std::uint8_t*>(trampoline.allocate(56));
                     int off = 0;
 
                     // 64-bit validation: high dword == 0 → invalid
@@ -3181,20 +3186,18 @@ namespace Patches::FormCaching
                     cave[off++] = 0x48; cave[off++] = 0x8B; cave[off++] = 0x6B; cave[off++] = 0x20;
                     // original test rbp, rbp
                     cave[off++] = 0x48; cave[off++] = 0x85; cave[off++] = 0xED;
-                    // jmp [rip+0] → continueAddr
+                    // jmp [rip+0] → continueAddr (+0x2D5DB7, je check)
                     cave[off++] = 0xFF; cave[off++] = 0x25;
                     cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00;
                     std::memcpy(&cave[off], &continueAddr, 8); off += 8;
 
-                    // .invalid: xor ebp, ebp (zero rbp) + test rbp, rbp (sets ZF=1)
+                    // .invalid: jump directly to function epilogue (safe return)
                     int invalidStart = off;
                     cave[jzInvalidOff] = static_cast<std::uint8_t>(invalidStart - (jzInvalidOff + 1));
-                    cave[off++] = 0x31; cave[off++] = 0xED; // xor ebp, ebp
-                    cave[off++] = 0x48; cave[off++] = 0x85; cave[off++] = 0xED; // test rbp, rbp
-                    // jmp [rip+0] → continueAddr
+                    // jmp [rip+0] → epilogueAddr (+0x2D5EE5)
                     cave[off++] = 0xFF; cave[off++] = 0x25;
                     cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00;
-                    std::memcpy(&cave[off], &continueAddr, 8); off += 8;
+                    std::memcpy(&cave[off], &epilogueAddr, 8); off += 8;
 
                     logger::info("PatchHotSpotL: cave {} bytes at 0x{:X}", off,
                         reinterpret_cast<std::uintptr_t>(cave));
@@ -3214,7 +3217,8 @@ namespace Patches::FormCaching
                         std::memcpy(&site[1], &rel32, 4);
                         site[5] = 0x90; site[6] = 0x90;
                         FlushInstructionCache(GetCurrentProcess(), site, 7);
-                        RegisterCavePatch(cave, off, static_cast<std::uintptr_t>(continueAddr), "PatchL", site, 7);
+                        // VEH CAVE-FAULT fallback also goes to epilogue (safe regardless of flags)
+                        RegisterCavePatch(cave, off, static_cast<std::uintptr_t>(epilogueAddr), "PatchL", site, 7);
                         logger::info("PatchHotSpotL: +0x2D5DB0 patched (rel32={}) verify={:02X}",
                             rel32, site[0]);
                     }
@@ -3292,6 +3296,84 @@ namespace Patches::FormCaching
                         FlushInstructionCache(GetCurrentProcess(), site, 6);
                         RegisterCavePatch(cave, off, static_cast<std::uintptr_t>(continueAddr), "PatchM", site, 6);
                         logger::info("PatchHotSpotM: +0x2D0C33 patched (rel32={}) verify={:02X}",
+                            rel32, site[0]);
+                    }
+                }
+            }
+            // ── Patch N: +0x2D5E15 ──────────────────────────────────────
+            // Hash table bucket probe: cmp qword [rcx+8], 0.
+            // RCX = rbp + index*16 where rbp may be stale/corrupted (stack addr
+            // or sentinel). Causes CATCH-ALL flood (200 events → CTD).
+            // If RCX high dword == 0 → treat bucket as empty (skip cmp,
+            // set ZF=1 so cmovne at +0x2D5E1A doesn't fire).
+            // Overwrite 5 bytes: 48 83 79 08 00. Continue at +0x2D5E1A.
+            {
+                auto* site = reinterpret_cast<std::uint8_t*>(base + 0x2D5E15);
+
+                logger::info("PatchHotSpotN: bytes at +0x2D5E15: "
+                    "{:02X} {:02X} {:02X} {:02X} {:02X}",
+                    site[0], site[1], site[2], site[3], site[4]);
+
+                // Expected: 48 83 79 08 00
+                if (site[0] != 0x48 || site[1] != 0x83 || site[2] != 0x79 ||
+                    site[3] != 0x08 || site[4] != 0x00) {
+                    logger::error("PatchHotSpotN: unexpected bytes — NOT patching");
+                } else {
+                    std::uint64_t continueAddr = static_cast<std::uint64_t>(base + 0x2D5E1A);
+                    // Function epilogue — safe bail-out if bucket walk is hopeless
+                    std::uint64_t epilogueAddr = static_cast<std::uint64_t>(base + 0x2D5EE5);
+
+                    auto* cave = static_cast<std::uint8_t*>(trampoline.allocate(56));
+                    int off = 0;
+
+                    // 64-bit validation: high dword == 0 → invalid
+                    // mov r10, rcx
+                    cave[off++] = 0x49; cave[off++] = 0x89; cave[off++] = 0xCA;
+                    // shr r10, 32
+                    cave[off++] = 0x49; cave[off++] = 0xC1; cave[off++] = 0xEA; cave[off++] = 0x20;
+                    // test r10d, r10d
+                    cave[off++] = 0x45; cave[off++] = 0x85; cave[off++] = 0xD2;
+                    // jz .invalid
+                    cave[off++] = 0x74;
+                    int jzInvalidOff = off;
+                    cave[off++] = 0x00;
+
+                    // .valid: original cmp qword [rcx+8], 0
+                    cave[off++] = 0x48; cave[off++] = 0x83; cave[off++] = 0x79;
+                    cave[off++] = 0x08; cave[off++] = 0x00;
+                    // jmp [rip+0] → continueAddr (+0x2D5E1A)
+                    cave[off++] = 0xFF; cave[off++] = 0x25;
+                    cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00;
+                    std::memcpy(&cave[off], &continueAddr, 8); off += 8;
+
+                    // .invalid: xor rcx, rcx (null → cmovne won't fire, test rcx,rcx → jz exits loop)
+                    int invalidStart = off;
+                    cave[jzInvalidOff] = static_cast<std::uint8_t>(invalidStart - (jzInvalidOff + 1));
+                    cave[off++] = 0x48; cave[off++] = 0x31; cave[off++] = 0xC9; // xor rcx, rcx
+                    // jmp [rip+0] → epilogueAddr (bail out of function entirely)
+                    cave[off++] = 0xFF; cave[off++] = 0x25;
+                    cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00;
+                    std::memcpy(&cave[off], &epilogueAddr, 8); off += 8;
+
+                    logger::info("PatchHotSpotN: cave {} bytes at 0x{:X}", off,
+                        reinterpret_cast<std::uintptr_t>(cave));
+
+                    // Patch: JMP rel32 (5 bytes) — exact fit
+                    DWORD oldProt;
+                    VirtualProtect(site, 5, PAGE_EXECUTE_READWRITE, &oldProt);
+                    auto jmpTarget = reinterpret_cast<std::intptr_t>(cave);
+                    auto jmpFrom = reinterpret_cast<std::intptr_t>(site + 5);
+                    auto dist = jmpTarget - jmpFrom;
+                    if (dist > INT32_MAX || dist < INT32_MIN) {
+                        logger::error("PatchHotSpotN: JMP too far ({}) — NOT patching", dist);
+                        VirtualProtect(site, 5, oldProt, &oldProt);
+                    } else {
+                        auto rel32 = static_cast<std::int32_t>(dist);
+                        site[0] = 0xE9;
+                        std::memcpy(&site[1], &rel32, 4);
+                        FlushInstructionCache(GetCurrentProcess(), site, 5);
+                        RegisterCavePatch(cave, off, static_cast<std::uintptr_t>(epilogueAddr), "PatchN", site, 5);
+                        logger::info("PatchHotSpotN: +0x2D5E15 patched (rel32={}) verify={:02X}",
                             rel32, site[0]);
                     }
                 }
