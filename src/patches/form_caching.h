@@ -2169,9 +2169,19 @@ namespace Patches::FormCaching
             // ── Patch A: +0x2ED880 — null check before call [rax+0x4B8] ──
             // Original: FF 90 B8 04 00 00 (6 bytes)
             // If RAX is null or in sentinel page, skip the call and return 0.
+            // The containing function's layout:
+            //   +0x2ED880: call [rax+0x4B8]     ← PatchA (6 bytes)
+            //   +0x2ED886: ...5 bytes...
+            //   +0x2ED88B: test byte [rax+0x40], 0x01  ← PatchC (6 bytes)
+            //   +0x2ED891: xor eax,eax; add rsp,0x28; ret  ← "return 0" epilogue
+            // When the call fails (null RAX or bad call target), we must skip
+            // to +0x2ED891 to return 0 from the function, NOT to +0x2ED886
+            // which would execute with RAX=0 and freeze in an infinite loop.
             {
                 auto* site = reinterpret_cast<std::uint8_t*>(base + 0x2ED880);
                 auto returnAddr = reinterpret_cast<std::uint64_t>(site + 6);
+                // "return 0" epilogue: xor eax,eax; add rsp,0x28; ret
+                auto nullAddr = static_cast<std::uint64_t>(base + 0x2ED891);
 
                 logger::info("PatchHotSpotA: bytes at +0x2ED880: "
                     "{:02X} {:02X} {:02X} {:02X} {:02X} {:02X}",
@@ -2243,12 +2253,12 @@ namespace Patches::FormCaching
                         cave[jzOff] = static_cast<std::uint8_t>(nullStart - (jzOff + 1));
                     }
 
-                    // xor eax, eax
+                    // xor eax, eax  (null path — skip entire function, return 0)
                     cave[off++] = 0x31; cave[off++] = 0xC0;
-                    // jmp [rip+0] → returnSite
+                    // jmp [rip+0] → nullAddr (+0x2ED891: xor eax,eax; add rsp,0x28; ret)
                     cave[off++] = 0xFF; cave[off++] = 0x25;
                     cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00;
-                    std::memcpy(&cave[off], &returnAddr, 8); off += 8;
+                    std::memcpy(&cave[off], &nullAddr, 8); off += 8;
 
                     logger::info("PatchHotSpotA: cave {} bytes at 0x{:X}", off,
                         reinterpret_cast<std::uintptr_t>(cave));
@@ -2270,7 +2280,7 @@ namespace Patches::FormCaching
                         // NOTE: Do NOT restore original page protection — Wine reverts
                         // file-backed code pages when protection is restored, undoing patches.
                         FlushInstructionCache(GetCurrentProcess(), site, 6);
-                        RegisterCavePatch(cave, off, static_cast<std::uintptr_t>(returnAddr), "PatchA", site, 6);
+                        RegisterCavePatch(cave, off, static_cast<std::uintptr_t>(nullAddr), "PatchA", site, 6);
                         logger::info("PatchHotSpotA: +0x2ED880 patched (rel32={}) verify={:02X}",
                             rel32, site[0]);
                     }
