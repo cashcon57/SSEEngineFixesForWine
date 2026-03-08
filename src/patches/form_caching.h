@@ -1251,7 +1251,7 @@ namespace Patches::FormCaching
                 // Every access will fault and be logged. After 500 faults,
                 // restore to PAGE_READWRITE to let the game continue.
                 static std::atomic<bool> s_noaccessActive{ false };
-                if (count == 10 && !s_noaccessActive.load(std::memory_order_relaxed)) {
+                if (count == 5 && !s_noaccessActive.load(std::memory_order_relaxed)) {
                     DWORD oldProt;
                     if (VirtualProtect(reinterpret_cast<void*>(zp), 0x10000,
                                        PAGE_NOACCESS, &oldProt)) {
