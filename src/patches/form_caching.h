@@ -155,6 +155,28 @@ namespace Patches::FormCaching
             }
         }
 
+        // v1.22.76: INT3 probing for freeze detection.
+        // When the watchdog detects a freeze (counters stable for 30+ seconds),
+        // it writes INT3 (0xCC) at candidate loop entry points. When the VEH
+        // catches EXCEPTION_BREAKPOINT, it logs the RIP and registers, restores
+        // the original byte, and continues. This reveals which loop is stuck.
+        struct ProbeInfo {
+            std::uintptr_t offset;      // offset from image base
+            std::uint8_t origByte;
+            std::atomic<bool> active{false};
+            std::atomic<bool> fired{false};
+        };
+        // Candidate loop entry points identified via backward-jump analysis:
+        inline ProbeInfo g_probes[] = {
+            { 0x179218 },  // refcount release loop (back-edge at +0x17923E)
+            { 0x179420 },  // linked list loop 1 in form type processing (back-edge at +0x1794B7)
+            { 0x1794D3 },  // linked list loop 2 in form type processing (back-edge at +0x1795C3)
+            { 0x179548 },  // hash chain inner loop (back-edge at +0x179556)
+            { 0x1AF612 },  // hash chain in form ref lookup (back-edge at +0x1AF61E)
+        };
+        constexpr int g_numProbes = sizeof(g_probes) / sizeof(g_probes[0]);
+        inline std::atomic<bool> g_probesInstalled{false};
+
         // Verify all code cave patches still have JMP opcode at their sites.
         // Wine may revert file-backed code pages; re-apply if needed.
         inline void VerifyAndRepairCavePatches()
@@ -185,7 +207,6 @@ namespace Patches::FormCaching
         // v1.22.51: Dynamic log paths — resolved once at init from SKSE log dir.
         // Fixed-size char arrays are safe to read from VEH handlers (no allocation).
         inline char g_crashLogPath[MAX_PATH] = {};
-        inline char g_autoNewgameFlagPath[MAX_PATH] = {};
 
         inline void InitPaths()
         {
@@ -193,13 +214,6 @@ namespace Patches::FormCaching
             if (logDir) {
                 auto crashPath = *logDir / "SSEEngineFixesForWine_crash.log";
                 strncpy_s(g_crashLogPath, crashPath.string().c_str(), _TRUNCATE);
-
-                auto flagPath = *logDir / "auto_newgame.flag";
-                strncpy_s(g_autoNewgameFlagPath, flagPath.string().c_str(), _TRUNCATE);
-            } else {
-                // Fallback if SKSE log dir unavailable (shouldn't happen in practice)
-                strncpy_s(g_crashLogPath, g_crashLogPath, _TRUNCATE);
-                strncpy_s(g_autoNewgameFlagPath, g_autoNewgameFlagPath, _TRUNCATE);
             }
             logger::info("Crash log path: {}", g_crashLogPath);
         }
@@ -889,6 +903,61 @@ namespace Patches::FormCaching
 
             auto code = pep->ExceptionRecord->ExceptionCode;
 
+            // v1.22.76: INT3 probe handler — catch breakpoints from freeze detection.
+            if (code == EXCEPTION_BREAKPOINT) {
+                auto rip = pep->ContextRecord->Rip;
+                static auto sImgBase2 = REL::Module::get().base();
+                for (int i = 0; i < g_numProbes; ++i) {
+                    if (g_probes[i].active.load(std::memory_order_acquire) &&
+                        rip == sImgBase2 + g_probes[i].offset) {
+                        // Log the probe hit with full register context
+                        FILE* f = nullptr;
+                        fopen_s(&f, g_crashLogPath, "a");
+                        if (f) {
+                            fprintf(f, "PROBE-HIT: +0x%llX",
+                                (unsigned long long)g_probes[i].offset);
+                            fprintf(f, " RAX=0x%llX RCX=0x%llX RDX=0x%llX RDI=0x%llX RSI=0x%llX R14=0x%llX RBP=0x%llX R8=0x%llX R9=0x%llX R15=0x%llX",
+                                (unsigned long long)pep->ContextRecord->Rax,
+                                (unsigned long long)pep->ContextRecord->Rcx,
+                                (unsigned long long)pep->ContextRecord->Rdx,
+                                (unsigned long long)pep->ContextRecord->Rdi,
+                                (unsigned long long)pep->ContextRecord->Rsi,
+                                (unsigned long long)pep->ContextRecord->R14,
+                                (unsigned long long)pep->ContextRecord->Rbp,
+                                (unsigned long long)pep->ContextRecord->R8,
+                                (unsigned long long)pep->ContextRecord->R9,
+                                (unsigned long long)pep->ContextRecord->R15);
+                            // Log return address from stack
+                            auto* rspPtr = reinterpret_cast<DWORD64*>(pep->ContextRecord->Rsp);
+                            if (!IsBadReadPtr(rspPtr, 64)) {
+                                fprintf(f, " STK=[");
+                                for (int s = 0; s < 8; ++s) {
+                                    DWORD64 val = rspPtr[s];
+                                    if (val >= (DWORD64)sImgBase2 &&
+                                        val < (DWORD64)sImgBase2 + 0x4000000) {
+                                        fprintf(f, "+0x%llX ", (unsigned long long)(val - sImgBase2));
+                                    }
+                                }
+                                fprintf(f, "]");
+                            }
+                            fprintf(f, "\n");
+                            fflush(f);
+                            fclose(f);
+                        }
+                        // Restore original byte and mark as fired
+                        auto* site = reinterpret_cast<std::uint8_t*>(sImgBase2 + g_probes[i].offset);
+                        *site = g_probes[i].origByte;
+                        FlushInstructionCache(GetCurrentProcess(), site, 1);
+                        g_probes[i].active.store(false, std::memory_order_release);
+                        g_probes[i].fired.store(true, std::memory_order_release);
+                        // Re-execute the original instruction (RIP stays at breakpoint addr)
+                        return EXCEPTION_CONTINUE_EXECUTION;
+                    }
+                }
+                // Not our probe — pass to other handlers
+                return EXCEPTION_CONTINUE_SEARCH;
+            }
+
             // Log non-AV exceptions (stack overflow, illegal instruction, etc.)
             if (code != EXCEPTION_ACCESS_VIOLATION) {
                 static std::atomic<int> s_nonAvCount{ 0 };
@@ -1245,25 +1314,6 @@ namespace Patches::FormCaching
                 // so the sentinel data (vtable, flags, stubs) is immutable.
 
                 auto count = g_zeroPageUseCount.fetch_add(1, std::memory_order_relaxed);
-
-                // v1.22.74: After 10 zero-page hits, temporarily flip sentinel
-                // to PAGE_NOACCESS to catch the tight loop's access pattern.
-                // Every access will fault and be logged. After 500 faults,
-                // restore to PAGE_READWRITE to let the game continue.
-                static std::atomic<bool> s_noaccessActive{ false };
-                if (count == 5 && !s_noaccessActive.load(std::memory_order_relaxed)) {
-                    DWORD oldProt;
-                    if (VirtualProtect(reinterpret_cast<void*>(zp), 0x10000,
-                                       PAGE_NOACCESS, &oldProt)) {
-                        s_noaccessActive.store(true, std::memory_order_release);
-                    }
-                }
-                if (count > 500 && s_noaccessActive.load(std::memory_order_acquire)) {
-                    DWORD oldProt;
-                    VirtualProtect(reinterpret_cast<void*>(zp), 0x10000,
-                                   PAGE_READWRITE, &oldProt);
-                    s_noaccessActive.store(false, std::memory_order_release);
-                }
 
                 if (count < 600) {
                     const char* logPath = g_crashLogPath;
@@ -4278,8 +4328,46 @@ namespace Patches::FormCaching
                         auto curFi = g_formIdSkipCount.load(std::memory_order_relaxed);
                         auto curCa = g_catchAllCount.load(std::memory_order_relaxed);
 
+                        // v1.22.76: Track stable ticks for freeze detection.
+                        // Counters stable AND non-zero = game is frozen in a tight loop.
+                        if (curZp == prevZp && curWs == prevWs &&
+                            curFi == prevFi && curCa == prevCa &&
+                            (curZp > 0 || curFi > 0)) {
+                            stableTicks++;
+                        } else {
+                            stableTicks = 0;
+                        }
+
                         prevZp = curZp; prevWs = curWs;
                         prevFi = curFi; prevCa = curCa;
+
+                        // v1.22.76: Install INT3 probes after 3 stable ticks (30s freeze).
+                        // Writes 0xCC at candidate loop entry points. VEH catches the
+                        // breakpoint and logs which loop the main thread is stuck in.
+                        if (stableTicks >= 3 && !g_probesInstalled.load(std::memory_order_acquire)) {
+                            int installed = 0;
+                            for (int i = 0; i < g_numProbes; ++i) {
+                                auto* site = reinterpret_cast<std::uint8_t*>(imgBase + g_probes[i].offset);
+                                DWORD oldProt;
+                                if (VirtualProtect(site, 1, PAGE_EXECUTE_READWRITE, &oldProt)) {
+                                    g_probes[i].origByte = *site;
+                                    *site = 0xCC;  // INT3
+                                    FlushInstructionCache(GetCurrentProcess(), site, 1);
+                                    g_probes[i].active.store(true, std::memory_order_release);
+                                    installed++;
+                                    // Do NOT restore protection (Wine page reversion)
+                                }
+                            }
+                            g_probesInstalled.store(true, std::memory_order_release);
+                            FILE* pf = nullptr;
+                            fopen_s(&pf, g_crashLogPath, "a");
+                            if (pf) {
+                                fprintf(pf, "PROBES: installed %d/%d INT3 probes at tick %d (stable=%d)\n",
+                                    installed, g_numProbes, tick, stableTicks);
+                                fflush(pf);
+                                fclose(pf);
+                            }
+                        }
 
                         // v1.22.64: Aggressively zero sentinel page to break garbage
                         // pointer chains. Engine writes garbage to sentinel (it's RW),
@@ -4377,74 +4465,9 @@ namespace Patches::FormCaching
                 }).detach();
                 logger::info("  Started watchdog thread (10s interval, RIP sampling enabled)");
 
-                // ==========================================================
-                // Auto-New-Game for automated testing
-                // If auto_newgame.flag exists in SKSE log dir, inject Enter key directly
-                // into the main menu's Scaleform movie via GFx HandleEvent.
-                // This bypasses Win32 input (unreliable under Wine).
-                // ==========================================================
-                {
-                    FILE* flagFile = nullptr;
-                    fopen_s(&flagFile, g_autoNewgameFlagPath, "r");
-                    if (flagFile) {
-                        fclose(flagFile);
-                        logger::info("  auto_newgame.flag found — polling for Main Menu (up to 180s)");
-                        std::thread([]() {
-                            FILE* f = nullptr;
-                            fopen_s(&f, g_crashLogPath, "a");
-
-                            // Poll every 2s for up to 180s until Main Menu opens
-                            bool found = false;
-                            for (int attempt = 0; attempt < 90; ++attempt) {
-                                Sleep(2000);
-                                auto* ui = RE::UI::GetSingleton();
-                                if (ui && ui->IsMenuOpen("Main Menu")) {
-                                    if (f) {
-                                        fprintf(f, "AUTO-NEWGAME: Main Menu detected after %ds\n",
-                                            (attempt + 1) * 2);
-                                        fflush(f);
-                                    }
-                                    // Wait 2s for menu to fully initialize
-                                    Sleep(2000);
-                                    found = true;
-                                    break;
-                                }
-                                if (attempt % 15 == 0 && f) {
-                                    fprintf(f, "AUTO-NEWGAME: waiting for Main Menu (%ds)...\n",
-                                        (attempt + 1) * 2);
-                                    fflush(f);
-                                }
-                            }
-
-                            if (!found) {
-                                if (f) {
-                                    fprintf(f, "AUTO-NEWGAME: timeout — Main Menu never opened\n");
-                                    fflush(f); fclose(f);
-                                }
-                                return;
-                            }
-
-                            // Bypass UI entirely — set engine reset flags directly
-                            auto* main = RE::Main::GetSingleton();
-                            if (main) {
-                                main->resetGame = true;
-                                main->fullReset = true;
-                                if (f) {
-                                    fprintf(f, "AUTO-NEWGAME: set resetGame=true fullReset=true on Main@%p\n",
-                                        (void*)main);
-                                    fflush(f);
-                                }
-                            } else {
-                                if (f) {
-                                    fprintf(f, "AUTO-NEWGAME: RE::Main::GetSingleton() returned null\n");
-                                    fflush(f);
-                                }
-                            }
-
-                            if (f) fclose(f);
-                        }).detach();
-                    }
-                }
+                // v1.22.76: Auto-New-Game REMOVED — the resetGame/fullReset path
+                // triggers ClearData which is a DIFFERENT code path from manual
+                // UI New Game and causes different freezes. Testing must be manual.
 
                 logger::info("=== END InitItemImpl Phase (v1.22.36) ==="sv);
             }
