@@ -1245,7 +1245,27 @@ namespace Patches::FormCaching
                 // so the sentinel data (vtable, flags, stubs) is immutable.
 
                 auto count = g_zeroPageUseCount.fetch_add(1, std::memory_order_relaxed);
-                if (count < 200) {
+
+                // v1.22.74: After 10 zero-page hits, temporarily flip sentinel
+                // to PAGE_NOACCESS to catch the tight loop's access pattern.
+                // Every access will fault and be logged. After 500 faults,
+                // restore to PAGE_READWRITE to let the game continue.
+                static std::atomic<bool> s_noaccessActive{ false };
+                if (count == 10 && !s_noaccessActive.load(std::memory_order_relaxed)) {
+                    DWORD oldProt;
+                    if (VirtualProtect(reinterpret_cast<void*>(zp), 0x10000,
+                                       PAGE_NOACCESS, &oldProt)) {
+                        s_noaccessActive.store(true, std::memory_order_release);
+                    }
+                }
+                if (count > 500 && s_noaccessActive.load(std::memory_order_acquire)) {
+                    DWORD oldProt;
+                    VirtualProtect(reinterpret_cast<void*>(zp), 0x10000,
+                                   PAGE_READWRITE, &oldProt);
+                    s_noaccessActive.store(false, std::memory_order_release);
+                }
+
+                if (count < 600) {
                     const char* logPath = g_crashLogPath;
                     FILE* f2 = nullptr;
                     fopen_s(&f2, logPath, "a");
