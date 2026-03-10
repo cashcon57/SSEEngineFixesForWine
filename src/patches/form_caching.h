@@ -313,6 +313,61 @@ namespace Patches::FormCaching
                 cc.files.size(), cc.smallFiles.size(), a_self->loadingFiles);
         }
 
+        // ================================================================
+        // v1.22.82: BSTHashMap::SetAt serialization
+        //
+        // Root cause of the New Game freeze: BSTHashMap::SetAt (the insert
+        // function) has ZERO synchronization around chain pointer writes.
+        // Under Wine's more aggressive thread scheduling, concurrent inserts
+        // to the same bucket create circular linked lists, causing infinite
+        // traversal loops in the find functions.
+        //
+        // Fix: wrap both SetAt template variants with a global spinlock.
+        // The grow/rehash function (+0x198390) is called FROM SetAt, so
+        // it's automatically protected while the lock is held.
+        //
+        // SetAt variant A: +0x1945D0 (414 bytes)
+        // SetAt variant B: +0x1947C0 (template duplicate)
+        // ================================================================
+        inline std::atomic_flag g_hashMapSetAtLock = ATOMIC_FLAG_INIT;
+        inline std::atomic<std::uint64_t> g_setAtCallCount{ 0 };
+        inline std::atomic<std::uint64_t> g_setAtContentionCount{ 0 };
+
+        inline SafetyHookInline g_hk_SetAtA{};
+        inline SafetyHookInline g_hk_SetAtB{};
+
+        // SetAt signature: __fastcall(this, key_ptr, value_ptr_or_functor)
+        // We use a generic 4-arg signature to forward all register args.
+        // Return value is in RAX (varies by template: bool, iterator pair, etc.)
+        inline std::uint64_t __fastcall BSTHashMap_SetAt_A(
+            void* a_this, void* a_key, void* a_value, void* a_extra)
+        {
+            g_setAtCallCount.fetch_add(1, std::memory_order_relaxed);
+            if (g_hashMapSetAtLock.test_and_set(std::memory_order_acquire)) {
+                // Contended — spin with pause
+                g_setAtContentionCount.fetch_add(1, std::memory_order_relaxed);
+                do { _mm_pause(); }
+                while (g_hashMapSetAtLock.test_and_set(std::memory_order_acquire));
+            }
+            auto result = g_hk_SetAtA.call<std::uint64_t>(a_this, a_key, a_value, a_extra);
+            g_hashMapSetAtLock.clear(std::memory_order_release);
+            return result;
+        }
+
+        inline std::uint64_t __fastcall BSTHashMap_SetAt_B(
+            void* a_this, void* a_key, void* a_value, void* a_extra)
+        {
+            g_setAtCallCount.fetch_add(1, std::memory_order_relaxed);
+            if (g_hashMapSetAtLock.test_and_set(std::memory_order_acquire)) {
+                g_setAtContentionCount.fetch_add(1, std::memory_order_relaxed);
+                do { _mm_pause(); }
+                while (g_hashMapSetAtLock.test_and_set(std::memory_order_acquire));
+            }
+            auto result = g_hk_SetAtB.call<std::uint64_t>(a_this, a_key, a_value, a_extra);
+            g_hashMapSetAtLock.clear(std::memory_order_release);
+            return result;
+        }
+
         struct ShardedCache
         {
             mutable std::shared_mutex mutex;
@@ -1922,6 +1977,18 @@ namespace Patches::FormCaching
             //   AE 13753 at 0x1B96E0: 2 OpenTES calls = LOADING ORCHESTRATION
             //   AE 13785 at 0x1BE460: 3 OpenTES calls = HotLoadPlugin (irrelevant)
             // See ForceLoadAllForms() for the actual fix.
+
+            // v1.22.82: BSTHashMap::SetAt serialization — prevents circular bucket chains
+            // under Wine's threading model. Both template variants share a single spinlock.
+            {
+                auto base = REL::Module::get().base();
+                g_hk_SetAtA = safetyhook::create_inline(
+                    reinterpret_cast<void*>(base + 0x1945D0), BSTHashMap_SetAt_A);
+                g_hk_SetAtB = safetyhook::create_inline(
+                    reinterpret_cast<void*>(base + 0x1947C0), BSTHashMap_SetAt_B);
+            }
+            logger::info("form caching: BSTHashMap::SetAt spinlock hooks installed at +0x1945D0, +0x1947C0 (A={}, B={})"sv,
+                static_cast<bool>(g_hk_SetAtA), static_cast<bool>(g_hk_SetAtB));
         }
 
         // Cached plugins.txt data (parsed once, reused across idempotent calls)

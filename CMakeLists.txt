@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 set(NAME "SSEEngineFixesForWine" CACHE STRING "")
-set(VERSION 1.22.81 CACHE STRING "")
+set(VERSION 1.22.82 CACHE STRING "")
 
 # ---- Options ----
 option(COPY_BUILD "Copy the build output to the Skyrim directory." TRUE)
