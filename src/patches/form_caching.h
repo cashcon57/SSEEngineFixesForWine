@@ -134,7 +134,7 @@ namespace Patches::FormCaching
             std::uint8_t* patchSite;        // original code address (for watchdog verification)
             int patchSize;                   // number of bytes overwritten
         };
-        inline CavePatchInfo g_cavePatches[16] = {};
+        inline CavePatchInfo g_cavePatches[20] = {};
         inline std::atomic<int> g_numCavePatches{ 0 };
         inline std::atomic<std::uint64_t> g_caveFaultCount{ 0 };
         inline std::atomic<std::uint64_t> g_execRecoverCount{ 0 };
@@ -144,7 +144,7 @@ namespace Patches::FormCaching
                                       std::uint8_t* patchSite = nullptr, int patchSize = 0)
         {
             int idx = g_numCavePatches.load(std::memory_order_relaxed);
-            if (idx < 16) {
+            if (idx < 20) {
                 g_cavePatches[idx].caveStart = reinterpret_cast<std::uintptr_t>(caveStart);
                 g_cavePatches[idx].caveEnd = reinterpret_cast<std::uintptr_t>(caveStart) + caveSize;
                 g_cavePatches[idx].nullReturnAddr = nullReturnAddr;
@@ -176,6 +176,31 @@ namespace Patches::FormCaching
         };
         constexpr int g_numProbes = sizeof(g_probes) / sizeof(g_probes[0]);
         inline std::atomic<bool> g_probesInstalled{false};
+
+        // v1.22.77: Sentinel repair helper — zeroes first 0x500 bytes and
+        // restores vtable, kDeleted flag, and stub function pointer.
+        // Called from VEH redirect paths to prevent corrupted sentinel data
+        // from cascading into subsequent engine reads. VEH-safe (no heap allocs).
+        inline void RepairSentinel()
+        {
+            if (!g_zeroPage) return;
+            auto* page = reinterpret_cast<std::uint8_t*>(g_zeroPage);
+            memset(page, 0, 0x500);
+            if (g_stubVtable) {
+                auto vtAddr = reinterpret_cast<DWORD64>(g_stubVtable);
+                memcpy(page + 0x00, &vtAddr, 8);
+            }
+            auto kDeleted = static_cast<std::uint32_t>(0x20);
+            memcpy(page + 0x10, &kDeleted, 4);
+            if (g_stubFuncPage) {
+                auto stubAddr = reinterpret_cast<DWORD64>(g_stubFuncPage);
+                memcpy(page + 0x4B8, &stubAddr, 8);
+            }
+        }
+
+        // v1.22.77: Cached DLL module range for fault recovery.
+        inline DWORD64 g_dllBase = 0;
+        inline DWORD64 g_dllEnd = 0;
 
         // Verify all code cave patches still have JMP opcode at their sites.
         // Wine may revert file-backed code pages; re-apply if needed.
@@ -1100,26 +1125,8 @@ namespace Patches::FormCaching
                             pep->ContextRecord->Rip = g_cavePatches[i].nullReturnAddr;
                             pep->ContextRecord->Rax = 0; // safe: null paths return 0 or ignore RAX
 
-                            // v1.22.69: Zero sentinel page on every cave-fault recovery.
-                            // Engine writes garbage to sentinel (RW page) which persists as
-                            // corrupted "next" pointers (0x574E4D454D414C43 = ASCII text),
-                            // causing infinite loops and cascading crashes. By zeroing
-                            // sentinel here, the NEXT read of sentinel sees clean NULL
-                            // pointers, terminating link-chasing loops.
-                            if (g_zeroPage) {
-                                auto* page = reinterpret_cast<std::uint8_t*>(g_zeroPage);
-                                memset(page, 0, 0x500);
-                                if (g_stubVtable) {
-                                    auto vtAddr = reinterpret_cast<DWORD64>(g_stubVtable);
-                                    memcpy(page + 0x00, &vtAddr, 8);
-                                }
-                                auto kDeleted = static_cast<std::uint32_t>(0x20);
-                                memcpy(page + 0x10, &kDeleted, 4);
-                                if (g_stubFuncPage) {
-                                    auto stubAddr = reinterpret_cast<DWORD64>(g_stubFuncPage);
-                                    memcpy(page + 0x4B8, &stubAddr, 8);
-                                }
-                            }
+                            // v1.22.69→v1.22.77: Repair sentinel on every cave-fault.
+                            RepairSentinel();
 
                             auto count = g_caveFaultCount.fetch_add(1, std::memory_order_relaxed);
                             if (count < 200) {
@@ -1200,6 +1207,39 @@ namespace Patches::FormCaching
                             }
                             return EXCEPTION_CONTINUE_EXECUTION;
                         }
+                    }
+                }
+
+                // v1.22.77: Faults in our own DLL — game jumped here via
+                // corrupted sentinel vtable/function pointer, or our hook
+                // received garbage data. Recover by popping return address
+                // (like a failed CALL) and returning 0 to caller.
+                if (g_dllBase && rip >= g_dllBase && rip < g_dllEnd) {
+                    auto* rspPtr = reinterpret_cast<DWORD64*>(pep->ContextRecord->Rsp);
+                    if (!IsBadReadPtr(rspPtr, 8)) {
+                        DWORD64 retAddr = *rspPtr;
+                        pep->ContextRecord->Rip = retAddr;
+                        pep->ContextRecord->Rsp += 8;
+                        pep->ContextRecord->Rax = 0;
+                        RepairSentinel();
+
+                        static std::atomic<int> s_dllFaultCount{ 0 };
+                        auto cnt = s_dllFaultCount.fetch_add(1, std::memory_order_relaxed);
+                        if (cnt < 50) {
+                            const char* logPath = g_crashLogPath;
+                            FILE* f = nullptr;
+                            fopen_s(&f, logPath, "a");
+                            if (f) {
+                                fprintf(f, "DLL-FAULT-RECOVER #%d: RIP=0x%llX target=0x%llX RAX=0x%llX → returning to 0x%llX\n",
+                                    cnt + 1, rip,
+                                    (unsigned long long)targetAddr,
+                                    (unsigned long long)pep->ContextRecord->Rax,
+                                    (unsigned long long)retAddr);
+                                fflush(f);
+                                fclose(f);
+                            }
+                        }
+                        return EXCEPTION_CONTINUE_EXECUTION;
                     }
                 }
 
@@ -1310,8 +1350,10 @@ namespace Patches::FormCaching
                     patched = true;
                 }
 
-                // v1.22.43: No auto-repair needed — page is PAGE_READONLY,
-                // so the sentinel data (vtable, flags, stubs) is immutable.
+                // v1.22.77: Repair sentinel on every redirect. Sentinel is
+                // PAGE_READWRITE so engine freely corrupts it with ASCII data;
+                // zeroing here ensures the retried instruction sees clean fields.
+                RepairSentinel();
 
                 auto count = g_zeroPageUseCount.fetch_add(1, std::memory_order_relaxed);
 
@@ -1415,17 +1457,8 @@ namespace Patches::FormCaching
                         auto offset = static_cast<std::int64_t>(targetAddr) - static_cast<std::int64_t>(val);
                         *regs[i] = zp; // Point to zero page
 
-                        // v1.22.52: REMOVED PAGE_READWRITE switch.
-                        // This was added in v1.22.49 to reduce VEH write-skip
-                        // floods during loading, but CrashLoggerVEH is only
-                        // installed AFTER ForceLoadAllForms completes — so this
-                        // switch could only fire during gameplay (New Game, cell
-                        // loading). Making the sentinel writable during gameplay
-                        // lets the engine overwrite the vtable at offset 0x00,
-                        // causing infinite loops through corrupted virtual calls.
-                        // The sentinel stays PAGE_READONLY; writes are safely
-                        // caught by CASE W (write-skip) with minimal overhead
-                        // during gameplay (writes are infrequent outside loading).
+                        // v1.22.77: Repair sentinel before retry
+                        RepairSentinel();
 
                         auto count = g_formIdSkipCount.fetch_add(1, std::memory_order_relaxed);
                         if (count < 50) {
@@ -1515,6 +1548,9 @@ namespace Patches::FormCaching
                         patched = true;
                     }
                 }
+
+                // v1.22.77: Repair sentinel before retry
+                RepairSentinel();
 
                 auto count = g_catchAllCount.fetch_add(1, std::memory_order_relaxed);
                 if (count < 200) {
@@ -3605,6 +3641,96 @@ namespace Patches::FormCaching
                     }
                 }
             }
+
+            // ── Patch P: +0x2D0B90 — call [rax+0x120] ──────────────────────
+            // Virtual function call where RAX can be corrupted sentinel data
+            // (engine wrote ASCII text to sentinel vtable area). Validates
+            // RAX is in canonical heap range before the call; if not, skip
+            // the call and jump past it (the next instruction at +0x2D0B96
+            // is a jmp that exits the block).
+            // Original bytes: FF 90 20 01 00 00 (6 bytes)
+            {
+                auto* site = reinterpret_cast<std::uint8_t*>(base + 0x2D0B90);
+
+                logger::info("PatchHotSpotP: bytes at +0x2D0B90: "
+                    "{:02X} {:02X} {:02X} {:02X} {:02X} {:02X}",
+                    site[0], site[1], site[2], site[3], site[4], site[5]);
+
+                // Expected: FF 90 20 01 00 00  (call [rax+0x120])
+                if (site[0] != 0xFF || site[1] != 0x90 || site[2] != 0x20 ||
+                    site[3] != 0x01 || site[4] != 0x00 || site[5] != 0x00) {
+                    logger::error("PatchHotSpotP: unexpected bytes — NOT patching");
+                } else {
+                    // After the 6-byte call: +0x2D0B96 is the next instruction
+                    // (jmp +0x2D11B7 per disasm). Skip to there on bad RAX.
+                    std::uint64_t continueAddr = static_cast<std::uint64_t>(base + 0x2D0B96);
+                    // The call returns to +0x2D0B96, so on skip we go there too.
+                    std::uint64_t skipAddr = continueAddr;
+
+                    auto* cave = static_cast<std::uint8_t*>(trampoline.allocate(64));
+                    int off = 0;
+
+                    // 1. Validate RAX — canonical range check (high dword in [1, 0x7F])
+                    // push r10
+                    cave[off++] = 0x41; cave[off++] = 0x52;
+                    // mov r10, rax
+                    cave[off++] = 0x49; cave[off++] = 0x89; cave[off++] = 0xC2;
+                    // shr r10, 32
+                    cave[off++] = 0x49; cave[off++] = 0xC1; cave[off++] = 0xEA; cave[off++] = 0x20;
+                    // dec r10d
+                    cave[off++] = 0x41; cave[off++] = 0xFF; cave[off++] = 0xCA;
+                    // cmp r10d, 0x7F
+                    cave[off++] = 0x41; cave[off++] = 0x83; cave[off++] = 0xFA; cave[off++] = 0x7F;
+                    // pop r10
+                    cave[off++] = 0x41; cave[off++] = 0x5A;
+                    // ja .invalid (skip call)
+                    cave[off++] = 0x77;
+                    int jaOffset = off;
+                    cave[off++] = 0x00; // patched below
+
+                    // 2. Valid RAX — execute original: call [rax+0x120]
+                    cave[off++] = 0xFF; cave[off++] = 0x90;
+                    cave[off++] = 0x20; cave[off++] = 0x01; cave[off++] = 0x00; cave[off++] = 0x00;
+
+                    // 3. Jump to continuation (+0x2D0B96)
+                    cave[off++] = 0xFF; cave[off++] = 0x25;
+                    cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00;
+                    std::memcpy(&cave[off], &continueAddr, 8); off += 8;
+
+                    // .invalid: RAX is bogus — skip call, xor eax,eax (return 0)
+                    int invalidStart = off;
+                    cave[jaOffset] = static_cast<std::uint8_t>(invalidStart - (jaOffset + 1));
+                    // xor eax, eax
+                    cave[off++] = 0x31; cave[off++] = 0xC0;
+                    // jmp to continuation (+0x2D0B96)
+                    cave[off++] = 0xFF; cave[off++] = 0x25;
+                    cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00;
+                    std::memcpy(&cave[off], &skipAddr, 8); off += 8;
+
+                    logger::info("PatchHotSpotP: cave {} bytes at 0x{:X}", off,
+                        reinterpret_cast<std::uintptr_t>(cave));
+
+                    // Patch: JMP rel32 + NOP (5+1 = 6 bytes — exact fit)
+                    DWORD oldProt;
+                    VirtualProtect(site, 6, PAGE_EXECUTE_READWRITE, &oldProt);
+                    auto jmpTarget = reinterpret_cast<std::intptr_t>(cave);
+                    auto jmpFrom = reinterpret_cast<std::intptr_t>(site + 5);
+                    auto dist = jmpTarget - jmpFrom;
+                    if (dist > INT32_MAX || dist < INT32_MIN) {
+                        logger::error("PatchHotSpotP: JMP too far ({}) — NOT patching", dist);
+                        VirtualProtect(site, 6, oldProt, &oldProt);
+                    } else {
+                        auto rel32 = static_cast<std::int32_t>(dist);
+                        site[0] = 0xE9;
+                        std::memcpy(&site[1], &rel32, 4);
+                        site[5] = 0x90; // NOP pad
+                        FlushInstructionCache(GetCurrentProcess(), site, 6);
+                        RegisterCavePatch(cave, off, static_cast<std::uintptr_t>(skipAddr), "PatchP", site, 6);
+                        logger::info("PatchHotSpotP: +0x2D0B90 patched (rel32={}) verify={:02X}",
+                            rel32, site[0]);
+                    }
+                }
+            }
 #endif
         }
 
@@ -4286,6 +4412,24 @@ namespace Patches::FormCaching
                 g_vehCrashLogger = AddVectoredExceptionHandler(1, CrashLoggerVEH);
                 g_crashLoggerActive.store(true, std::memory_order_release);
                 logger::info("  Installed CrashLoggerVEH (first-chance, writes to SKSE log dir)");
+
+                // v1.22.77: Cache our DLL module range for fault recovery.
+                // If game jumps into our DLL via corrupted sentinel vtable,
+                // we can recover by popping the return address.
+                {
+                    HMODULE hSelf = nullptr;
+                    if (GetModuleHandleExA(
+                            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            reinterpret_cast<LPCSTR>(&CrashLoggerVEH), &hSelf)) {
+                        g_dllBase = reinterpret_cast<DWORD64>(hSelf);
+                        const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(hSelf);
+                        const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(
+                            g_dllBase + dos->e_lfanew);
+                        g_dllEnd = g_dllBase + nt->OptionalHeader.SizeOfImage;
+                        logger::info("  DLL module range: 0x{:X} - 0x{:X}", g_dllBase, g_dllEnd);
+                    }
+                }
 
                 // v1.22.72: Capture main thread handle via DuplicateHandle on
                 // pseudo-handle. OpenThread works initially but Wine revokes
