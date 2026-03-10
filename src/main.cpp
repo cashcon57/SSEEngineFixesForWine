@@ -127,7 +127,7 @@ void MessageHandler(SKSE::MessagingInterface::Message* a_msg)
                 FILE* f = nullptr;
                 fopen_s(&f, Patches::FormCaching::detail::g_crashLogPath, "a");
                 if (f) {
-                    fprintf(f, "\n=== kNewGame (v1.22.77) === zpWritable=%d zpUse=%llu ws=%llu ca=%llu fi=%d cf=%llu er=%llu\n",
+                    fprintf(f, "\n=== kNewGame (v1.22.78) === zpWritable=%d zpUse=%llu ws=%llu ca=%llu fi=%d cf=%llu er=%llu\n",
                         Patches::FormCaching::detail::g_zpWritable.load(std::memory_order_relaxed) ? 1 : 0,
                         Patches::FormCaching::detail::g_zeroPageUseCount.load(std::memory_order_relaxed),
                         Patches::FormCaching::detail::g_zeroPageWriteSkips.load(std::memory_order_relaxed),
@@ -137,6 +137,41 @@ void MessageHandler(SKSE::MessagingInterface::Message* a_msg)
                         (unsigned long long)Patches::FormCaching::detail::g_execRecoverCount.load(std::memory_order_relaxed));
                     fflush(f);
                     fclose(f);
+                }
+            }
+
+            // v1.22.78: Install INT3 probes immediately at kNewGame.
+            // The freeze happens within seconds of New Game — waiting for
+            // watchdog freeze detection (30s) is too slow. By installing
+            // probes now, the breakpoints are in place BEFORE the tight
+            // loop starts, catching it on the very first iteration.
+            if (!Patches::FormCaching::detail::g_probesInstalled.load(std::memory_order_acquire)) {
+                auto imgBase = REL::Module::get().base();
+                int installed = 0;
+                for (int i = 0; i < Patches::FormCaching::detail::g_numProbes; ++i) {
+                    auto* site = reinterpret_cast<std::uint8_t*>(
+                        imgBase + Patches::FormCaching::detail::g_probes[i].offset);
+                    DWORD oldProt;
+                    if (VirtualProtect(site, 1, PAGE_EXECUTE_READWRITE, &oldProt)) {
+                        Patches::FormCaching::detail::g_probes[i].origByte = *site;
+                        *site = 0xCC;  // INT3
+                        FlushInstructionCache(GetCurrentProcess(), site, 1);
+                        Patches::FormCaching::detail::g_probes[i].active.store(true, std::memory_order_release);
+                        installed++;
+                    }
+                }
+                Patches::FormCaching::detail::g_probesInstalled.store(true, std::memory_order_release);
+                logger::info("kNewGame: installed {}/{} INT3 probes for freeze detection",
+                    installed, Patches::FormCaching::detail::g_numProbes);
+                {
+                    FILE* f2 = nullptr;
+                    fopen_s(&f2, Patches::FormCaching::detail::g_crashLogPath, "a");
+                    if (f2) {
+                        fprintf(f2, "PROBES: installed %d/%d INT3 probes at kNewGame\n",
+                            installed, Patches::FormCaching::detail::g_numProbes);
+                        fflush(f2);
+                        fclose(f2);
+                    }
                 }
             }
 
