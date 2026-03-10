@@ -1009,6 +1009,38 @@ namespace Patches::FormCaching
                 targetAddr = pep->ExceptionRecord->ExceptionInformation[1];
             }
 
+            // v1.22.79: Install INT3 probes on the first post-loading AV.
+            // kNewGame fires AFTER the engine freeze, so we can't wait for it.
+            // Instead, install probes at the very first access violation that
+            // happens in the game image after the counters were all zero (i.e.,
+            // after the main menu was stable). This catches the freeze on its
+            // first iteration through any probed loop.
+            if (!g_probesInstalled.load(std::memory_order_acquire) &&
+                g_formFixupActive.load(std::memory_order_acquire)) {
+                auto imgBase2 = REL::Module::get().base();
+                int installed = 0;
+                for (int i = 0; i < g_numProbes; ++i) {
+                    auto* site = reinterpret_cast<std::uint8_t*>(imgBase2 + g_probes[i].offset);
+                    DWORD oldProt;
+                    if (VirtualProtect(site, 1, PAGE_EXECUTE_READWRITE, &oldProt)) {
+                        g_probes[i].origByte = *site;
+                        *site = 0xCC;
+                        FlushInstructionCache(GetCurrentProcess(), site, 1);
+                        g_probes[i].active.store(true, std::memory_order_release);
+                        installed++;
+                    }
+                }
+                g_probesInstalled.store(true, std::memory_order_release);
+                FILE* pf = nullptr;
+                fopen_s(&pf, g_crashLogPath, "a");
+                if (pf) {
+                    fprintf(pf, "PROBES: installed %d/%d INT3 probes on first VEH event\n",
+                        installed, g_numProbes);
+                    fflush(pf);
+                    fclose(pf);
+                }
+            }
+
             // ─────────────────────────────────────────────────────────────
             // CASE W: Write to zero page — skip the instruction.
             // v1.22.43: Sentinel page is PAGE_READONLY to prevent vtable
