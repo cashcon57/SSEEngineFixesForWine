@@ -3764,130 +3764,206 @@ namespace Patches::FormCaching
                 }
             }
 
-            // ── Patch Q: +0x1AF607 — Bounded hash-chain traversal ─────────────
-            // The function at +0x1AF5C0 is a hash-map find() that walks a
-            // linked list in a bucket.  Under Wine, the chain can become
-            // circular (next ptr loops back) causing an infinite tight loop
-            // with zero exceptions — this is THE New Game freeze.
+            // ── Patch Q (x6): Bounded hash-chain traversal ─────────────────
+            // All 6 BSTHashMap::find() instances walk a linked list in a
+            // bucket chain.  Under Wine, chains can become circular (next
+            // pointer loops back) causing an infinite tight loop with zero
+            // exceptions — this is THE New Game freeze.
             //
-            // Original 19 bytes (+0x1AF607 to +0x1AF61F):
-            //   48 39 74 CA 10        cmp  [rdx+rcx*8+0x10], rsi
-            //   48 8D 0C CA           lea  rcx, [rdx+rcx*8]
-            //   74 0E                 je   +0x1AF620    (return null)
-            //   39 19                 cmp  [rcx], ebx
-            //   74 1D                 je   +0x1AF633    (found)
-            //   48 8B 49 10           mov  rcx, [rcx+0x10]
-            //   48 3B 4F 70           cmp  rcx, [rdi+0x70]
-            //   75 F2                 jne  +0x1AF612    (loop)
+            // Loop pattern (identical in all 6):
+            //   cmp  [rcx], ebx         ; key match?
+            //   je   <found>
+            //   mov  rcx, [rcx+0x10]    ; next node
+            //   cmp  rcx, [rdi+0x70]    ; sentinel check
+            //   jne  <loop>
             //
-            // Cave: reproduces the above with r11d as a 65536 iteration bound.
-            // If the chain exceeds 65536 nodes, we bail to the "not found" path.
-            // R11 is volatile (Windows x64) and unused in this function.
+            // Each cave reproduces the pre-loop + loop with r11d as a
+            // 65536 iteration bound.  R11 is volatile (Windows x64 ABI).
+            //
+            // Sites found by binary scan of identical loop pattern:
+            //   +0x1AF612 (in func +0x1AF5C0) — original freeze site
+            //   +0x1A0EF1 (in func +0x1A0E80)
+            //   +0x30C385, +0x30C4B2, +0x30C5D5, +0x30C702 (in func +0x30C2E0)
             {
-                auto* site = reinterpret_cast<std::uint8_t*>(base + 0x1AF607);
-                auto returnNullAddr = static_cast<std::uint64_t>(base + 0x1AF620);
-                auto foundAddr      = static_cast<std::uint64_t>(base + 0x1AF633);
+                // All 6 loop sites: { loopRVA, preLoopStartRVA, patchSize,
+                //                     notFoundRVA, foundRVA, preLoopBytes, name }
+                struct HashChainSite {
+                    std::uint32_t preLoopRVA;     // start of pre-loop check
+                    std::uint32_t patchSize;      // bytes to overwrite
+                    std::uint32_t notFoundRVA;    // "return null" target
+                    std::uint32_t foundRVA;       // "found" target
+                    const std::uint8_t* preLoopVerify;  // bytes to verify
+                    int preLoopVerifyLen;
+                    const char* name;
+                };
 
-                // Verify original bytes (first 5 of the 19-byte region)
-                logger::info("PatchHotSpotQ: bytes at +0x1AF607: "
-                    "{:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X}",
-                    site[0], site[1], site[2], site[3], site[4],
-                    site[5], site[6], site[7], site[8], site[9]);
+                // Verification bytes at each pre-loop start
+                // +0x1AF607: 48 39 74 CA 10 (cmp [rdx+rcx*8+0x10], rsi)
+                static const std::uint8_t verify_1AF[] = { 0x48, 0x39, 0x74, 0xCA, 0x10 };
+                // +0x1A0EE5: 48 83 7C C2 10 00 (cmp qword [rdx+rax*8+0x10], 0)
+                static const std::uint8_t verify_1A0[] = { 0x48, 0x83, 0x7C, 0xC2, 0x10 };
+                // +0x30C375: 48 83 7C C2 10 00 (same pattern for all 4 in the big func)
+                static const std::uint8_t verify_30C[] = { 0x48, 0x83, 0x7C, 0xC2, 0x10 };
 
-                if (site[0] != 0x48 || site[1] != 0x39 || site[2] != 0x74 ||
-                    site[3] != 0xCA || site[4] != 0x10) {
-                    logger::error("PatchHotSpotQ: unexpected bytes at +0x1AF607 — NOT patching");
-                } else {
+                // Each site: pre-loop bytes + lea + je/jz + loop body (cmp/je/mov/cmp/jne)
+                // We patch from the initial bucket-empty check through the loop back-edge.
+                HashChainSite sites[] = {
+                    // +0x1AF607: 19 bytes (cmp rsi variant, short je)
+                    { 0x1AF607, 19, 0x1AF620, 0x1AF633, verify_1AF, 5, "Q1" },
+                    // +0x1A0EE5: 26 bytes (cmp 0 variant, short je, loop + jmp after)
+                    { 0x1A0EE5, 26, 0x1A0F50, 0x1A0F01, verify_1A0, 5, "Q2" },
+                    // +0x30C375: 30 bytes (cmp 0 variant, near je, loop + jmp after)
+                    { 0x30C375, 30, 0x30C440, 0x30C398, verify_30C, 5, "Q3" },
+                    // +0x30C4A2: 30 bytes
+                    { 0x30C4A2, 30, 0x30C56D, 0x30C4C5, verify_30C, 5, "Q4" },
+                    // +0x30C5C5: 30 bytes
+                    { 0x30C5C5, 30, 0x30C690, 0x30C5E8, verify_30C, 5, "Q5" },
+                    // +0x30C6F2: 30 bytes
+                    { 0x30C6F2, 30, 0x30C7B9, 0x30C715, verify_30C, 5, "Q6" },
+                };
+
+                for (auto& s : sites) {
+                    auto* site = reinterpret_cast<std::uint8_t*>(base + s.preLoopRVA);
+
+                    logger::info("PatchHashChain-{}: bytes at +0x{:X}: "
+                        "{:02X} {:02X} {:02X} {:02X} {:02X}",
+                        s.name, s.preLoopRVA,
+                        site[0], site[1], site[2], site[3], site[4]);
+
+                    if (std::memcmp(site, s.preLoopVerify, s.preLoopVerifyLen) != 0) {
+                        logger::error("PatchHashChain-{}: unexpected bytes — NOT patching", s.name);
+                        continue;
+                    }
+
+                    auto returnNullAddr = static_cast<std::uint64_t>(base + s.notFoundRVA);
+                    auto foundAddr      = static_cast<std::uint64_t>(base + s.foundRVA);
+
+                    // Build the cave: copy the original pre-loop bytes into
+                    // the cave, then add the bounded loop.
                     auto* cave = static_cast<std::uint8_t*>(trampoline.allocate(128));
                     int off = 0;
 
-                    // -- Pre-loop: initial bucket check (original code) --
-                    // cmp [rdx+rcx*8+0x10], rsi    ; empty bucket?
-                    cave[off++] = 0x48; cave[off++] = 0x39; cave[off++] = 0x74;
-                    cave[off++] = 0xCA; cave[off++] = 0x10;
-                    // lea rcx, [rdx+rcx*8]          ; rcx = bucket entry
-                    cave[off++] = 0x48; cave[off++] = 0x8D; cave[off++] = 0x0C;
-                    cave[off++] = 0xCA;
-                    // je return_null                 ; empty bucket → not found
-                    cave[off++] = 0x74;
-                    int jeNullOff1 = off;
-                    cave[off++] = 0x00; // placeholder
+                    // -- Pre-loop: copy original bytes up to the loop start --
+                    // All variants have: bucket-empty-check + lea rcx + je/jz not-found
+                    // We encode the cave generically: the loop body is always the same,
+                    // and we emit the pre-loop as the original bytes minus the loop itself.
+                    //
+                    // For all variants, the last 12 bytes before patchEnd are the loop:
+                    //   39 19              cmp [rcx], ebx
+                    //   74 XX              je  found
+                    //   48 8B 49 10        mov rcx, [rcx+0x10]
+                    //   48 3B 4F 70        cmp rcx, [rdi+0x70]
+                    //   75 F2              jne loop
+                    // Some also have a trailing jmp/jne after the loop (2-5 bytes).
+                    // We skip those since the cave handles not-found via jmp [rip].
+
+                    int preLoopSize = s.patchSize - 12;
+                    // For the 30-byte variants, there's a 5-byte jmp at the end
+                    // (e9 XX XX XX XX) after the jne. For the 26-byte variant,
+                    // there's a 2-byte jmp (eb XX). Subtract those too.
+                    if (s.patchSize == 30) preLoopSize -= 5;  // trailing jmp rel32
+                    else if (s.patchSize == 26) preLoopSize -= 2;  // trailing jmp rel8
+                    // Now preLoopSize = bytes before 'cmp [rcx], ebx'
+
+                    // Copy pre-loop bytes verbatim into cave
+                    std::memcpy(&cave[off], site, preLoopSize);
+                    off += preLoopSize;
+
+                    // The last pre-loop instruction is a conditional jump to not-found.
+                    // We need to fixup that jump target to point to our return_null label.
+                    // For the short-je variant (patchSize=19): byte at off-1 is the rel8
+                    // For the cmp-0 + short-je variant (patchSize=26): byte at off-1
+                    // For the cmp-0 + near-jz variant (patchSize=30): bytes at off-4..off-1
+
+                    // Mark where the initial "not found" je/jz needs to jump:
+                    int jeNullFixupOff;
+                    bool nearJump = false;
+                    if (s.patchSize == 30) {
+                        // near jz (0F 84 XX XX XX XX) — the last 6 bytes of pre-loop
+                        // are the jz, so the rel32 is at off-4
+                        jeNullFixupOff = off - 4;
+                        nearJump = true;
+                    } else {
+                        // short je (74 XX) — rel8 is at off-1
+                        jeNullFixupOff = off - 1;
+                    }
 
                     // -- NEW: set iteration bound in r11d --
-                    // mov r11d, 0x10000              ; 65536 max iterations
-                    cave[off++] = 0x41; cave[off++] = 0xB8 + 3; // 0xBB = mov r11d, imm32
+                    // mov r11d, 0x10000
+                    cave[off++] = 0x41; cave[off++] = 0xBB;
                     cave[off++] = 0x00; cave[off++] = 0x00;
                     cave[off++] = 0x01; cave[off++] = 0x00;
 
                     // -- Loop body --
                     int loopTop = off;
-                    // cmp [rcx], ebx                 ; key match?
+                    // cmp [rcx], ebx
                     cave[off++] = 0x39; cave[off++] = 0x19;
                     // je found
                     cave[off++] = 0x74;
                     int jeFoundOff = off;
-                    cave[off++] = 0x00; // placeholder
-
-                    // mov rcx, [rcx+0x10]            ; next in chain
-                    cave[off++] = 0x48; cave[off++] = 0x8B; cave[off++] = 0x49;
-                    cave[off++] = 0x10;
-                    // cmp rcx, [rdi+0x70]             ; sentinel check
-                    cave[off++] = 0x48; cave[off++] = 0x3B; cave[off++] = 0x4F;
-                    cave[off++] = 0x70;
-                    // je return_null                   ; end of chain
+                    cave[off++] = 0x00;
+                    // mov rcx, [rcx+0x10]
+                    cave[off++] = 0x48; cave[off++] = 0x8B; cave[off++] = 0x49; cave[off++] = 0x10;
+                    // cmp rcx, [rdi+0x70]
+                    cave[off++] = 0x48; cave[off++] = 0x3B; cave[off++] = 0x4F; cave[off++] = 0x70;
+                    // je return_null
                     cave[off++] = 0x74;
                     int jeNullOff2 = off;
-                    cave[off++] = 0x00; // placeholder
-
-                    // -- NEW: bounded iteration --
+                    cave[off++] = 0x00;
                     // dec r11d
                     cave[off++] = 0x41; cave[off++] = 0xFF; cave[off++] = 0xCB;
                     // jnz loop_top
                     cave[off++] = 0x75;
                     int loopBackOff = off;
-                    cave[off++] = 0x00; // placeholder
-                    // Fix up loop-back relative offset
+                    cave[off++] = 0x00;
                     cave[loopBackOff] = static_cast<std::uint8_t>(
                         static_cast<std::int8_t>(loopTop - (loopBackOff + 1)));
 
-                    // -- Fall through: hit iteration limit → return null --
+                    // -- return_null label --
                     int returnNullStart = off;
-                    // Fix up je placeholders for return_null
-                    cave[jeNullOff1] = static_cast<std::uint8_t>(returnNullStart - (jeNullOff1 + 1));
+                    // Fix up in-loop je to return_null
                     cave[jeNullOff2] = static_cast<std::uint8_t>(returnNullStart - (jeNullOff2 + 1));
+                    // Fix up pre-loop je/jz to return_null
+                    if (nearJump) {
+                        auto rel32 = static_cast<std::int32_t>(returnNullStart - (jeNullFixupOff + 4));
+                        std::memcpy(&cave[jeNullFixupOff], &rel32, 4);
+                    } else {
+                        cave[jeNullFixupOff] = static_cast<std::uint8_t>(returnNullStart - (jeNullFixupOff + 1));
+                    }
 
-                    // jmp [rip+0] → returnNullAddr (+0x1AF620)
+                    // jmp [rip+0] → returnNullAddr
                     cave[off++] = 0xFF; cave[off++] = 0x25;
                     cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00;
                     std::memcpy(&cave[off], &returnNullAddr, 8); off += 8;
 
-                    // -- Found path --
+                    // -- found label --
                     int foundStart = off;
                     cave[jeFoundOff] = static_cast<std::uint8_t>(foundStart - (jeFoundOff + 1));
-                    // jmp [rip+0] → foundAddr (+0x1AF633)
+                    // jmp [rip+0] → foundAddr
                     cave[off++] = 0xFF; cave[off++] = 0x25;
                     cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00;
                     std::memcpy(&cave[off], &foundAddr, 8); off += 8;
 
-                    logger::info("PatchHotSpotQ: cave {} bytes at 0x{:X}", off,
+                    logger::info("PatchHashChain-{}: cave {} bytes at 0x{:X}", s.name, off,
                         reinterpret_cast<std::uintptr_t>(cave));
 
-                    // Patch: JMP rel32 (5 bytes) + 14 NOPs (19 bytes total)
+                    // Patch original site with JMP rel32 + NOPs
                     DWORD oldProt;
-                    VirtualProtect(site, 19, PAGE_EXECUTE_READWRITE, &oldProt);
+                    VirtualProtect(site, s.patchSize, PAGE_EXECUTE_READWRITE, &oldProt);
                     auto jmpTarget = reinterpret_cast<std::intptr_t>(cave);
                     auto jmpFrom = reinterpret_cast<std::intptr_t>(site + 5);
                     auto dist = jmpTarget - jmpFrom;
                     if (dist > INT32_MAX || dist < INT32_MIN) {
-                        logger::error("PatchHotSpotQ: JMP too far ({}) — NOT patching", dist);
+                        logger::error("PatchHashChain-{}: JMP too far ({}) — NOT patching", s.name, dist);
                     } else {
                         auto rel32 = static_cast<std::int32_t>(dist);
                         site[0] = 0xE9;
                         std::memcpy(&site[1], &rel32, 4);
-                        for (int i = 5; i < 19; i++) site[i] = 0x90;
-                        FlushInstructionCache(GetCurrentProcess(), site, 19);
-                        RegisterCavePatch(cave, off, static_cast<std::uintptr_t>(returnNullAddr), "PatchQ", site, 19);
-                        logger::info("PatchHotSpotQ: +0x1AF607 patched — bounded hash-chain loop (max 65536)");
+                        for (std::uint32_t i = 5; i < s.patchSize; i++) site[i] = 0x90;
+                        FlushInstructionCache(GetCurrentProcess(), site, s.patchSize);
+                        RegisterCavePatch(cave, off, static_cast<std::uintptr_t>(returnNullAddr), s.name, site, s.patchSize);
+                        logger::info("PatchHashChain-{}: +0x{:X} patched — bounded hash-chain (max 65536)",
+                            s.name, s.preLoopRVA);
                     }
                 }
             }
