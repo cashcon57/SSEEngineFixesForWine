@@ -181,13 +181,19 @@ namespace Patches::FormCaching
         constexpr int g_numProbes = sizeof(g_probes) / sizeof(g_probes[0]);
         inline std::atomic<bool> g_probesInstalled{false};
 
-        // v1.22.85: Lazy cache invalidation for New Game.
-        // Manual "New Game" from the UI does NOT call ClearData or
-        // InitializeFormDataStructures, so g_formCache retains stale
-        // pointers to forms that the engine may have freed/repurposed.
-        // The VEH handler sets this flag on the first post-loading event
-        // (same trigger as probe installation).  GetFormByNumericId checks
-        // the flag and clears all 256 shards before the next lookup.
+        // v1.22.86: Authoritative cache flag.  After kDataLoaded fires,
+        // our cache contains all forms from ESM loading + SetAt hooks.
+        // From this point, cache misses return nullptr instead of falling
+        // through to the native BSTHashMap::find, which has corrupted
+        // bucket chains from grow/rehash races under Wine.
+        // Manual "New Game" does NOT call ClearData, so ESM forms persist
+        // and the cache remains valid across sessions.
+        inline std::atomic<bool> g_cacheAuthoritative{false};
+
+        // v1.22.85: Lazy cache invalidation for New Game (DISABLED in v1.22.86).
+        // Kept for reference.  ESM forms persist across New Game — clearing
+        // the cache forces 900+ lookups to fall through to the corrupted
+        // native map, causing the freeze.
         inline std::atomic<bool> g_needsCacheClear{false};
 
         // v1.22.77: Sentinel repair helper — zeroes first 0x500 bytes and
@@ -434,26 +440,6 @@ namespace Patches::FormCaching
 
         inline RE::TESForm* TESForm_GetFormByNumericId(RE::FormID a_formId)
         {
-            // v1.22.85: Lazy cache invalidation — clear all shards once when
-            // flagged by the VEH handler (first post-loading event = New Game).
-            // This runs in normal code context so heap operations are safe.
-            if (g_needsCacheClear.exchange(false, std::memory_order_acq_rel)) {
-                for (auto& s : g_formCache) {
-                    std::unique_lock lock(s.mutex);
-                    s.map.clear();
-                }
-                // Also reset g_formMapInner so it gets recaptured fresh
-                g_formMapInner.store(nullptr, std::memory_order_release);
-
-                FILE* cf = nullptr;
-                fopen_s(&cf, g_crashLogPath, "a");
-                if (cf) {
-                    fprintf(cf, "CACHE-CLEAR: invalidated all 256 shards (New Game detected)\n");
-                    fflush(cf);
-                    fclose(cf);
-                }
-            }
-
             const std::uint8_t  masterId = (a_formId & 0xFF000000) >> 24;
             const std::uint32_t baseId = (a_formId & 0x00FFFFFF);
 
@@ -466,6 +452,17 @@ namespace Patches::FormCaching
                 if (it != shard.map.end()) {
                     return it->second;
                 }
+            }
+
+            // v1.22.86: After kDataLoaded, the cache is authoritative.
+            // All ESM forms were cached during loading (AddFormToDataHandler).
+            // New forms from New Game come through SetAt hooks.
+            // NEVER fall through to native BSTHashMap::find — its bucket chains
+            // are corrupted by grow/rehash races under Wine (freed bucket arrays
+            // get reused for string allocations → ASCII data read as pointers →
+            // infinite loop in unpatched find sites → freeze).
+            if (g_cacheAuthoritative.load(std::memory_order_acquire)) {
+                return nullptr;
             }
 
             // v1.22.84: Lazily capture the form map inner pointer so SetAt
@@ -489,9 +486,7 @@ namespace Patches::FormCaching
                 }
             }
 
-            // Call the GAME's native GetFormByNumericId via trampoline.
-            // This uses the game's actual BSTHashMap code with the correct struct
-            // layout, bypassing CommonLibSSE-NG's broken BSTHashMap template.
+            // During loading only: fall through to native GetFormByNumericId.
             RE::TESForm* formPointer = g_hk_GetFormByNumericId.call<RE::TESForm*>(a_formId);
 
             if (formPointer != nullptr) {
@@ -1183,10 +1178,9 @@ namespace Patches::FormCaching
                 }
                 g_probesInstalled.store(true, std::memory_order_release);
 
-                // v1.22.85: Signal cache invalidation — the next
-                // GetFormByNumericId call will clear all 256 shards before
-                // performing the lookup.  Safe: just an atomic store.
-                g_needsCacheClear.store(true, std::memory_order_release);
+                // v1.22.86: Cache invalidation on New Game REMOVED.
+                // ESM forms persist — clearing the cache caused 900+ native
+                // map lookups → freeze on corrupted bucket chains.
 
                 FILE* pf = nullptr;
                 fopen_s(&pf, g_crashLogPath, "a");

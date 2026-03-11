@@ -64,6 +64,14 @@ void MessageHandler(SKSE::MessagingInterface::Message* a_msg)
                 }
             }
 
+            // v1.22.86: Make form cache authoritative — from this point, cache
+            // misses return nullptr instead of falling through to the native
+            // BSTHashMap::find (which has corrupted bucket chains under Wine).
+            if (Settings::Patches::bFormCaching.GetValue()) {
+                Patches::FormCaching::detail::g_cacheAuthoritative.store(true, std::memory_order_release);
+                logger::info("v1.22.86: Form cache is now AUTHORITATIVE — no native map fallback");
+            }
+
             // Editor ID cache: populate NOW at kDataLoaded, BEFORE other plugins.
             // Our handler fires first (alphabetical: 0_ < C < p), so we MUST
             // populate before CoreImpactFramework (C) tries LookupByEditorID.
@@ -115,10 +123,11 @@ void MessageHandler(SKSE::MessagingInterface::Message* a_msg)
         }
     case SKSE::MessagingInterface::kNewGame:
         {
-            // v1.22.85: Clear form cache on New Game.  The lazy flag in VEH
-            // should have already triggered this, but clear again defensively
-            // in case kNewGame fires on a path where VEH didn't trigger first.
-            Patches::FormCaching::detail::g_needsCacheClear.store(true, std::memory_order_release);
+            // v1.22.86: Do NOT clear form cache on New Game.
+            // Manual New Game does NOT call ClearData — ESM forms persist in memory
+            // at the same addresses. Clearing the cache forced 900+ lookups to fall
+            // through to the native BSTHashMap (corrupted under Wine) → freeze.
+            // New forms from New Game come through SetAt hooks → cache updated.
 
             logger::info(">>> kNewGame fired — sentinel zpWritable={} zeroPageUse={} writeSkips={} catchAll={} formIdSkips={} <<<",
                 Patches::FormCaching::detail::g_zpWritable.load(std::memory_order_relaxed),
@@ -132,7 +141,7 @@ void MessageHandler(SKSE::MessagingInterface::Message* a_msg)
                 FILE* f = nullptr;
                 fopen_s(&f, Patches::FormCaching::detail::g_crashLogPath, "a");
                 if (f) {
-                    fprintf(f, "\n=== kNewGame (v1.22.85) === zpWritable=%d zpUse=%llu ws=%llu ca=%llu fi=%d cf=%llu er=%llu setAt=%llu contention=%llu\n",
+                    fprintf(f, "\n=== kNewGame (v1.22.86) === zpWritable=%d zpUse=%llu ws=%llu ca=%llu fi=%d cf=%llu er=%llu setAt=%llu contention=%llu cacheAuth=%d\n",
                         Patches::FormCaching::detail::g_zpWritable.load(std::memory_order_relaxed) ? 1 : 0,
                         Patches::FormCaching::detail::g_zeroPageUseCount.load(std::memory_order_relaxed),
                         Patches::FormCaching::detail::g_zeroPageWriteSkips.load(std::memory_order_relaxed),
@@ -141,7 +150,8 @@ void MessageHandler(SKSE::MessagingInterface::Message* a_msg)
                         (unsigned long long)Patches::FormCaching::detail::g_caveFaultCount.load(std::memory_order_relaxed),
                         (unsigned long long)Patches::FormCaching::detail::g_execRecoverCount.load(std::memory_order_relaxed),
                         (unsigned long long)Patches::FormCaching::detail::g_setAtCallCount.load(std::memory_order_relaxed),
-                        (unsigned long long)Patches::FormCaching::detail::g_setAtContentionCount.load(std::memory_order_relaxed));
+                        (unsigned long long)Patches::FormCaching::detail::g_setAtContentionCount.load(std::memory_order_relaxed),
+                        Patches::FormCaching::detail::g_cacheAuthoritative.load(std::memory_order_relaxed) ? 1 : 0);
                     fflush(f);
                     fclose(f);
                 }
