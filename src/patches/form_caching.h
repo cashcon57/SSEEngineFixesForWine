@@ -336,6 +336,13 @@ namespace Patches::FormCaching
         inline std::atomic_flag g_hashMapSetAtLock = ATOMIC_FLAG_INIT;
         inline std::atomic<std::uint64_t> g_setAtCallCount{ 0 };
         inline std::atomic<std::uint64_t> g_setAtContentionCount{ 0 };
+        inline std::atomic<std::uint64_t> g_setAtCacheUpdates{ 0 };
+
+        // v1.22.84: Captured form map inner pointer for cache-update-on-SetAt.
+        // The global form map pointer is at RVA +0x20FBB88 (from GetFormByNumericId).
+        // SetAt receives this+8 (inner struct past vtable/header). Set lazily on
+        // first GetFormByNumericId call that sees a non-null form map.
+        inline std::atomic<void*> g_formMapInner{ nullptr };
 
         inline SafetyHookInline g_hk_SetAtA{};
         inline SafetyHookInline g_hk_SetAtB{};
@@ -355,6 +362,23 @@ namespace Patches::FormCaching
             }
             auto result = g_hk_SetAtA.call<std::uint64_t>(a_this, a_key, a_value, a_extra);
             g_hashMapSetAtLock.clear(std::memory_order_release);
+
+            // v1.22.84: If this SetAt targets the global form map, update our
+            // sharded cache so GetFormByNumericId never falls through to the
+            // native unbounded find loop for newly-inserted forms.
+            void* expectedInner = g_formMapInner.load(std::memory_order_acquire);
+            if (expectedInner != nullptr && a_this == expectedInner) {
+                auto formId = *reinterpret_cast<std::uint32_t*>(a_key);
+                auto* formPtr = *reinterpret_cast<RE::TESForm**>(a_value);
+                if (formPtr != nullptr) {
+                    const std::uint8_t  masterId = (formId & 0xFF000000) >> 24;
+                    const std::uint32_t baseId   = (formId & 0x00FFFFFF);
+                    std::unique_lock lock(g_formCache[masterId].mutex);
+                    g_formCache[masterId].map.insert_or_assign(baseId, formPtr);
+                    g_setAtCacheUpdates.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+
             return result;
         }
 
@@ -369,6 +393,21 @@ namespace Patches::FormCaching
             }
             auto result = g_hk_SetAtB.call<std::uint64_t>(a_this, a_key, a_value, a_extra);
             g_hashMapSetAtLock.clear(std::memory_order_release);
+
+            // v1.22.84: Same form-map cache update as SetAt_A above.
+            void* expectedInner = g_formMapInner.load(std::memory_order_acquire);
+            if (expectedInner != nullptr && a_this == expectedInner) {
+                auto formId = *reinterpret_cast<std::uint32_t*>(a_key);
+                auto* formPtr = *reinterpret_cast<RE::TESForm**>(a_value);
+                if (formPtr != nullptr) {
+                    const std::uint8_t  masterId = (formId & 0xFF000000) >> 24;
+                    const std::uint32_t baseId   = (formId & 0x00FFFFFF);
+                    std::unique_lock lock(g_formCache[masterId].mutex);
+                    g_formCache[masterId].map.insert_or_assign(baseId, formPtr);
+                    g_setAtCacheUpdates.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+
             return result;
         }
 
@@ -394,6 +433,27 @@ namespace Patches::FormCaching
                 auto it = shard.map.find(baseId);
                 if (it != shard.map.end()) {
                     return it->second;
+                }
+            }
+
+            // v1.22.84: Lazily capture the form map inner pointer so SetAt
+            // cache-update can identify calls targeting the global form map.
+            // The global form map pointer lives at RVA +0x20FBB88.  SetAt
+            // receives (formMap + 8) — the inner struct past the vtable header.
+            if (g_formMapInner.load(std::memory_order_acquire) == nullptr) {
+                auto fmBase = REL::Module::get().base();
+                auto* formMapGlobal = reinterpret_cast<void**>(fmBase + 0x20FBB88);
+                void* formMap = *formMapGlobal;
+                if (formMap) {
+                    void* inner = reinterpret_cast<std::uint8_t*>(formMap) + 8;
+                    void* expected = nullptr;
+                    if (g_formMapInner.compare_exchange_strong(expected, inner,
+                            std::memory_order_release, std::memory_order_relaxed)) {
+                        logger::info("v1.22.84: Captured g_formMapInner = 0x{:X} "
+                            "(formMap=0x{:X})",
+                            reinterpret_cast<std::uintptr_t>(inner),
+                            reinterpret_cast<std::uintptr_t>(formMap));
+                    }
                 }
             }
 
@@ -4035,6 +4095,126 @@ namespace Patches::FormCaching
                         RegisterCavePatch(cave, off, static_cast<std::uintptr_t>(returnNullAddr), s.name, site, s.patchSize);
                         logger::info("PatchHashChain-{}: +0x{:X} patched — bounded hash-chain (max 65536)",
                             s.name, s.preLoopRVA);
+                    }
+                }
+            }
+
+            // ── Patch Q7: Bounded find loop in GetFormByNumericId ────────
+            // The native GetFormByNumericId at +0x1E01A0 has an unbounded
+            // find loop at +0x1E020C that walks bucket chains in the global
+            // form map (Layout B: sentinel at [rbx+0x18]).  When our sharded
+            // cache misses (new forms not yet cached), control falls through
+            // to this native loop.  On corrupted chains → infinite loop →
+            // freeze.  This is the LAST unbounded find loop that can trap
+            // the main thread during New Game.
+            //
+            // Patch site: +0x1E0205 (21 bytes, through +0x1E0219)
+            //   +0x1E0205: cmp qword [rax+0x10], 0    ; empty bucket?
+            //   +0x1E020A: je +0x1E0220                ; → not found
+            //   +0x1E020C: cmp [rax], edi              ; key match?
+            //   +0x1E020E: je +0x1E021A                ; → found
+            //   +0x1E0210: mov rax, [rax+0x10]         ; next node
+            //   +0x1E0214: cmp rax, [rbx+0x18]         ; sentinel
+            //   +0x1E0218: jne -0x0E                   ; → loop top
+            //
+            // Cave reproduces pre-loop + loop with r11d = 65536 bound.
+            {
+                auto* site = reinterpret_cast<std::uint8_t*>(base + 0x1E0205);
+                static const std::uint8_t verify_Q7[] = { 0x48, 0x83, 0x78, 0x10, 0x00 };
+                constexpr std::uint32_t patchSize = 21;
+
+                logger::info("PatchHashChain-Q7: bytes at +0x1E0205: "
+                    "{:02X} {:02X} {:02X} {:02X} {:02X}",
+                    site[0], site[1], site[2], site[3], site[4]);
+
+                if (std::memcmp(site, verify_Q7, 5) != 0) {
+                    logger::error("PatchHashChain-Q7: unexpected bytes — NOT patching");
+                } else {
+                    auto returnNullAddr = static_cast<std::uint64_t>(base + 0x1E0220);
+                    auto foundAddr      = static_cast<std::uint64_t>(base + 0x1E021A);
+
+                    auto* cave = static_cast<std::uint8_t*>(trampoline.allocate(128));
+                    int off = 0;
+
+                    // Pre-loop: cmp qword [rax+0x10], 0  (48 83 78 10 00)
+                    cave[off++] = 0x48; cave[off++] = 0x83;
+                    cave[off++] = 0x78; cave[off++] = 0x10; cave[off++] = 0x00;
+                    // je return_null (short, fixup later)
+                    cave[off++] = 0x74;
+                    int jeNullFixup1 = off;
+                    cave[off++] = 0x00;
+
+                    // mov r11d, 0x10000  (iteration bound)
+                    cave[off++] = 0x41; cave[off++] = 0xBB;
+                    cave[off++] = 0x00; cave[off++] = 0x00;
+                    cave[off++] = 0x01; cave[off++] = 0x00;
+
+                    // Loop body:
+                    int loopTop = off;
+                    // cmp [rax], edi  (39 38)
+                    cave[off++] = 0x39; cave[off++] = 0x38;
+                    // je found (short, fixup later)
+                    cave[off++] = 0x74;
+                    int jeFoundFixup = off;
+                    cave[off++] = 0x00;
+                    // mov rax, [rax+0x10]  (48 8B 40 10)
+                    cave[off++] = 0x48; cave[off++] = 0x8B;
+                    cave[off++] = 0x40; cave[off++] = 0x10;
+                    // cmp rax, [rbx+0x18]  (48 3B 43 18)
+                    cave[off++] = 0x48; cave[off++] = 0x3B;
+                    cave[off++] = 0x43; cave[off++] = 0x18;
+                    // je return_null (short, fixup later)
+                    cave[off++] = 0x74;
+                    int jeNullFixup2 = off;
+                    cave[off++] = 0x00;
+                    // dec r11d  (41 FF CB)
+                    cave[off++] = 0x41; cave[off++] = 0xFF; cave[off++] = 0xCB;
+                    // jnz loop_top
+                    cave[off++] = 0x75;
+                    int loopBackOff = off;
+                    cave[off++] = 0x00;
+                    cave[loopBackOff] = static_cast<std::uint8_t>(
+                        static_cast<std::int8_t>(loopTop - (loopBackOff + 1)));
+
+                    // return_null label:
+                    int returnNullStart = off;
+                    cave[jeNullFixup1] = static_cast<std::uint8_t>(returnNullStart - (jeNullFixup1 + 1));
+                    cave[jeNullFixup2] = static_cast<std::uint8_t>(returnNullStart - (jeNullFixup2 + 1));
+                    // jmp [rip+0] → returnNullAddr
+                    cave[off++] = 0xFF; cave[off++] = 0x25;
+                    cave[off++] = 0x00; cave[off++] = 0x00;
+                    cave[off++] = 0x00; cave[off++] = 0x00;
+                    std::memcpy(&cave[off], &returnNullAddr, 8); off += 8;
+
+                    // found label:
+                    int foundStart = off;
+                    cave[jeFoundFixup] = static_cast<std::uint8_t>(foundStart - (jeFoundFixup + 1));
+                    // jmp [rip+0] → foundAddr
+                    cave[off++] = 0xFF; cave[off++] = 0x25;
+                    cave[off++] = 0x00; cave[off++] = 0x00;
+                    cave[off++] = 0x00; cave[off++] = 0x00;
+                    std::memcpy(&cave[off], &foundAddr, 8); off += 8;
+
+                    logger::info("PatchHashChain-Q7: cave {} bytes at 0x{:X}", off,
+                        reinterpret_cast<std::uintptr_t>(cave));
+
+                    // Patch original site
+                    DWORD oldProt;
+                    VirtualProtect(site, patchSize, PAGE_EXECUTE_READWRITE, &oldProt);
+                    auto jmpTarget = reinterpret_cast<std::intptr_t>(cave);
+                    auto jmpFrom   = reinterpret_cast<std::intptr_t>(site + 5);
+                    auto dist = jmpTarget - jmpFrom;
+                    if (dist > INT32_MAX || dist < INT32_MIN) {
+                        logger::error("PatchHashChain-Q7: JMP too far ({}) — NOT patching", dist);
+                    } else {
+                        auto rel32 = static_cast<std::int32_t>(dist);
+                        site[0] = 0xE9;
+                        std::memcpy(&site[1], &rel32, 4);
+                        for (std::uint32_t i = 5; i < patchSize; i++) site[i] = 0x90;
+                        FlushInstructionCache(GetCurrentProcess(), site, patchSize);
+                        RegisterCavePatch(cave, off, static_cast<std::uintptr_t>(returnNullAddr),
+                            "Q7", site, patchSize);
+                        logger::info("PatchHashChain-Q7: +0x1E0205 patched — bounded form-map find (max 65536)");
                     }
                 }
             }
