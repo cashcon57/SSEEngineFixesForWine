@@ -134,7 +134,7 @@ namespace Patches::FormCaching
             std::uint8_t* patchSite;        // original code address (for watchdog verification)
             int patchSize;                   // number of bytes overwritten
         };
-        inline CavePatchInfo g_cavePatches[20] = {};
+        inline CavePatchInfo g_cavePatches[32] = {};
         inline std::atomic<int> g_numCavePatches{ 0 };
         inline std::atomic<std::uint64_t> g_caveFaultCount{ 0 };
         inline std::atomic<std::uint64_t> g_execRecoverCount{ 0 };
@@ -143,8 +143,9 @@ namespace Patches::FormCaching
                                       std::uintptr_t nullReturnAddr, const char* name,
                                       std::uint8_t* patchSite = nullptr, int patchSize = 0)
         {
+            constexpr int kMaxCavePatches = static_cast<int>(sizeof(g_cavePatches) / sizeof(g_cavePatches[0]));
             int idx = g_numCavePatches.load(std::memory_order_relaxed);
-            if (idx < 20) {
+            if (idx < kMaxCavePatches) {
                 g_cavePatches[idx].caveStart = reinterpret_cast<std::uintptr_t>(caveStart);
                 g_cavePatches[idx].caveEnd = reinterpret_cast<std::uintptr_t>(caveStart) + caveSize;
                 g_cavePatches[idx].nullReturnAddr = nullReturnAddr;
@@ -152,6 +153,9 @@ namespace Patches::FormCaching
                 g_cavePatches[idx].patchSite = patchSite;
                 g_cavePatches[idx].patchSize = patchSize;
                 g_numCavePatches.store(idx + 1, std::memory_order_release);
+            } else {
+                logger::error("RegisterCavePatch: OVERFLOW — {} not registered (idx={}, max={})",
+                    name, idx, kMaxCavePatches);
             }
         }
 
