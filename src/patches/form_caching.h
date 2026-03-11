@@ -181,6 +181,15 @@ namespace Patches::FormCaching
         constexpr int g_numProbes = sizeof(g_probes) / sizeof(g_probes[0]);
         inline std::atomic<bool> g_probesInstalled{false};
 
+        // v1.22.85: Lazy cache invalidation for New Game.
+        // Manual "New Game" from the UI does NOT call ClearData or
+        // InitializeFormDataStructures, so g_formCache retains stale
+        // pointers to forms that the engine may have freed/repurposed.
+        // The VEH handler sets this flag on the first post-loading event
+        // (same trigger as probe installation).  GetFormByNumericId checks
+        // the flag and clears all 256 shards before the next lookup.
+        inline std::atomic<bool> g_needsCacheClear{false};
+
         // v1.22.77: Sentinel repair helper — zeroes first 0x500 bytes and
         // restores vtable, kDeleted flag, and stub function pointer.
         // Called from VEH redirect paths to prevent corrupted sentinel data
@@ -425,6 +434,26 @@ namespace Patches::FormCaching
 
         inline RE::TESForm* TESForm_GetFormByNumericId(RE::FormID a_formId)
         {
+            // v1.22.85: Lazy cache invalidation — clear all shards once when
+            // flagged by the VEH handler (first post-loading event = New Game).
+            // This runs in normal code context so heap operations are safe.
+            if (g_needsCacheClear.exchange(false, std::memory_order_acq_rel)) {
+                for (auto& s : g_formCache) {
+                    std::unique_lock lock(s.mutex);
+                    s.map.clear();
+                }
+                // Also reset g_formMapInner so it gets recaptured fresh
+                g_formMapInner.store(nullptr, std::memory_order_release);
+
+                FILE* cf = nullptr;
+                fopen_s(&cf, g_crashLogPath, "a");
+                if (cf) {
+                    fprintf(cf, "CACHE-CLEAR: invalidated all 256 shards (New Game detected)\n");
+                    fflush(cf);
+                    fclose(cf);
+                }
+            }
+
             const std::uint8_t  masterId = (a_formId & 0xFF000000) >> 24;
             const std::uint32_t baseId = (a_formId & 0x00FFFFFF);
 
@@ -1153,10 +1182,17 @@ namespace Patches::FormCaching
                     }
                 }
                 g_probesInstalled.store(true, std::memory_order_release);
+
+                // v1.22.85: Signal cache invalidation — the next
+                // GetFormByNumericId call will clear all 256 shards before
+                // performing the lookup.  Safe: just an atomic store.
+                g_needsCacheClear.store(true, std::memory_order_release);
+
                 FILE* pf = nullptr;
                 fopen_s(&pf, g_crashLogPath, "a");
                 if (pf) {
-                    fprintf(pf, "PROBES: installed %d/%d INT3 probes on first VEH event\n",
+                    fprintf(pf, "PROBES: installed %d/%d INT3 probes on first VEH event\n"
+                                "CACHE-CLEAR: flagged for lazy invalidation\n",
                         installed, g_numProbes);
                     fflush(pf);
                     fclose(pf);

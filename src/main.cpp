@@ -115,6 +115,11 @@ void MessageHandler(SKSE::MessagingInterface::Message* a_msg)
         }
     case SKSE::MessagingInterface::kNewGame:
         {
+            // v1.22.85: Clear form cache on New Game.  The lazy flag in VEH
+            // should have already triggered this, but clear again defensively
+            // in case kNewGame fires on a path where VEH didn't trigger first.
+            Patches::FormCaching::detail::g_needsCacheClear.store(true, std::memory_order_release);
+
             logger::info(">>> kNewGame fired — sentinel zpWritable={} zeroPageUse={} writeSkips={} catchAll={} formIdSkips={} <<<",
                 Patches::FormCaching::detail::g_zpWritable.load(std::memory_order_relaxed),
                 Patches::FormCaching::detail::g_zeroPageUseCount.load(std::memory_order_relaxed),
@@ -127,7 +132,7 @@ void MessageHandler(SKSE::MessagingInterface::Message* a_msg)
                 FILE* f = nullptr;
                 fopen_s(&f, Patches::FormCaching::detail::g_crashLogPath, "a");
                 if (f) {
-                    fprintf(f, "\n=== kNewGame (v1.22.82) === zpWritable=%d zpUse=%llu ws=%llu ca=%llu fi=%d cf=%llu er=%llu setAt=%llu contention=%llu\n",
+                    fprintf(f, "\n=== kNewGame (v1.22.85) === zpWritable=%d zpUse=%llu ws=%llu ca=%llu fi=%d cf=%llu er=%llu setAt=%llu contention=%llu\n",
                         Patches::FormCaching::detail::g_zpWritable.load(std::memory_order_relaxed) ? 1 : 0,
                         Patches::FormCaching::detail::g_zeroPageUseCount.load(std::memory_order_relaxed),
                         Patches::FormCaching::detail::g_zeroPageWriteSkips.load(std::memory_order_relaxed),
