@@ -5316,6 +5316,47 @@ namespace Patches::FormCaching
         detail::InitPaths();
         detail::ReplaceFormMapFunctions();
 
+        // v1.22.87: NOP out ScrapHeap::Free calls in BSTHashMap::grow.
+        // Root cause of ALL BSTHashMap corruption under Wine:
+        // grow/rehash allocates a new bucket array, rehashes entries, then
+        // FREES the old array. On native Windows, this is fine (single-threaded
+        // grow with synchronized access). Under Wine, concurrent readers still
+        // hold pointers into the old array. When it's freed and reused for
+        // string allocations, readers see ASCII data as bucket chain pointers
+        // → circular/invalid chains → infinite find loops → freeze.
+        //
+        // Fix: leak the old bucket array (RCU-style). A few hundred KB of
+        // leaked arrays is a small price for eliminating ALL BSTHashMap
+        // corruption across every hash map instance in the engine.
+        //
+        // grow_A: free call at +0x1985F8 (5 bytes: E8 xx xx xx xx)
+        // grow_B: free call at +0x198878 (5 bytes: E8 xx xx xx xx)
+        {
+            auto imgBase = REL::Module::get().base();
+            constexpr std::uintptr_t growFreeOffsets[] = { 0x1985F8, 0x198878 };
+            const char* names[] = { "grow_A", "grow_B" };
+
+            for (int i = 0; i < 2; ++i) {
+                auto* site = reinterpret_cast<std::uint8_t*>(imgBase + growFreeOffsets[i]);
+                DWORD oldProt;
+                if (VirtualProtect(site, 5, PAGE_EXECUTE_READWRITE, &oldProt)) {
+                    // Verify it's actually a CALL instruction (0xE8)
+                    if (site[0] == 0xE8) {
+                        memset(site, 0x90, 5);  // 5x NOP
+                        FlushInstructionCache(GetCurrentProcess(), site, 5);
+                        logger::info("v1.22.87: NOP'd ScrapHeap::Free in {} at +0x{:X}",
+                            names[i], growFreeOffsets[i]);
+                    } else {
+                        logger::warn("v1.22.87: {} at +0x{:X} is 0x{:02X}, expected 0xE8 — SKIPPING",
+                            names[i], growFreeOffsets[i], site[0]);
+                    }
+                } else {
+                    logger::warn("v1.22.87: VirtualProtect failed for {} at +0x{:X}",
+                        names[i], growFreeOffsets[i]);
+                }
+            }
+        }
+
         logger::info("installed form caching patch"sv);
     }
 }
