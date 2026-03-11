@@ -363,6 +363,43 @@ namespace Patches::FormCaching
         inline std::atomic<std::uint64_t> g_setAtContentionCount{ 0 };
         inline std::atomic<std::uint64_t> g_setAtCacheUpdates{ 0 };
 
+        // v1.22.88: grow/rehash hooks — skip grow after initial allocation.
+        // BSTHashMap::grow is NOT thread-safe: it rehashes entries by modifying
+        // chain links in the old bucket array while concurrent find() threads
+        // iterate those same links. Even without freeing the old array, the
+        // modified next pointers create cross-array cycles → infinite loops.
+        // Fix: allow the initial allocation (buckets == nullptr) but skip all
+        // subsequent grows. Chains get longer but stay valid.
+        inline SafetyHookInline g_hk_growA{};
+        inline SafetyHookInline g_hk_growB{};
+        inline std::atomic<std::uint64_t> g_growSkipCount{ 0 };
+
+        // grow signature: __fastcall(this) — rcx = BSTHashMap inner struct
+        // Layout: +0x04 = capacity (uint32), +0x20 = buckets pointer
+        inline void __fastcall BSTHashMap_grow_A(void* a_this)
+        {
+            auto* buckets = *reinterpret_cast<void**>(
+                reinterpret_cast<std::uint8_t*>(a_this) + 0x20);
+            if (buckets != nullptr) {
+                // Already allocated — skip grow to prevent rehash corruption.
+                g_growSkipCount.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+            // Initial allocation — call original.
+            g_hk_growA.call<void>(a_this);
+        }
+
+        inline void __fastcall BSTHashMap_grow_B(void* a_this)
+        {
+            auto* buckets = *reinterpret_cast<void**>(
+                reinterpret_cast<std::uint8_t*>(a_this) + 0x20);
+            if (buckets != nullptr) {
+                g_growSkipCount.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+            g_hk_growB.call<void>(a_this);
+        }
+
         // v1.22.84: Captured form map inner pointer for cache-update-on-SetAt.
         // The global form map pointer is at RVA +0x20FBB88 (from GetFormByNumericId).
         // SetAt receives this+8 (inner struct past vtable/header). Set lazily on
@@ -5316,45 +5353,22 @@ namespace Patches::FormCaching
         detail::InitPaths();
         detail::ReplaceFormMapFunctions();
 
-        // v1.22.87: NOP out ScrapHeap::Free calls in BSTHashMap::grow.
-        // Root cause of ALL BSTHashMap corruption under Wine:
-        // grow/rehash allocates a new bucket array, rehashes entries, then
-        // FREES the old array. On native Windows, this is fine (single-threaded
-        // grow with synchronized access). Under Wine, concurrent readers still
-        // hold pointers into the old array. When it's freed and reused for
-        // string allocations, readers see ASCII data as bucket chain pointers
-        // → circular/invalid chains → infinite find loops → freeze.
-        //
-        // Fix: leak the old bucket array (RCU-style). A few hundred KB of
-        // leaked arrays is a small price for eliminating ALL BSTHashMap
-        // corruption across every hash map instance in the engine.
-        //
-        // grow_A: free call at +0x1985F8 (5 bytes: E8 xx xx xx xx)
-        // grow_B: free call at +0x198878 (5 bytes: E8 xx xx xx xx)
+        // v1.22.88: Hook grow_A and grow_B to skip rehash after initial alloc.
+        // BSTHashMap::grow is NOT thread-safe: it rehashes entries by modifying
+        // chain links in the old bucket array while concurrent find() iterates
+        // those same links. This creates cross-array cycles → infinite loops.
+        // Fix: allow initial allocation (buckets == null) but skip all resizes.
+        // Chains get longer but stay valid and corruption-free.
         {
             auto imgBase = REL::Module::get().base();
-            constexpr std::uintptr_t growFreeOffsets[] = { 0x1985F8, 0x198878 };
-            const char* names[] = { "grow_A", "grow_B" };
+            auto* growA = reinterpret_cast<void*>(imgBase + 0x198390);
+            auto* growB = reinterpret_cast<void*>(imgBase + 0x198610);
 
-            for (int i = 0; i < 2; ++i) {
-                auto* site = reinterpret_cast<std::uint8_t*>(imgBase + growFreeOffsets[i]);
-                DWORD oldProt;
-                if (VirtualProtect(site, 5, PAGE_EXECUTE_READWRITE, &oldProt)) {
-                    // Verify it's actually a CALL instruction (0xE8)
-                    if (site[0] == 0xE8) {
-                        memset(site, 0x90, 5);  // 5x NOP
-                        FlushInstructionCache(GetCurrentProcess(), site, 5);
-                        logger::info("v1.22.87: NOP'd ScrapHeap::Free in {} at +0x{:X}",
-                            names[i], growFreeOffsets[i]);
-                    } else {
-                        logger::warn("v1.22.87: {} at +0x{:X} is 0x{:02X}, expected 0xE8 — SKIPPING",
-                            names[i], growFreeOffsets[i], site[0]);
-                    }
-                } else {
-                    logger::warn("v1.22.87: VirtualProtect failed for {} at +0x{:X}",
-                        names[i], growFreeOffsets[i]);
-                }
-            }
+            detail::g_hk_growA = safetyhook::create_inline(growA, detail::BSTHashMap_grow_A);
+            detail::g_hk_growB = safetyhook::create_inline(growB, detail::BSTHashMap_grow_B);
+
+            logger::info("v1.22.88: BSTHashMap::grow hooks installed — "
+                "grow_A=+0x198390, grow_B=+0x198610 (skip rehash after initial alloc)");
         }
 
         logger::info("installed form caching patch"sv);
