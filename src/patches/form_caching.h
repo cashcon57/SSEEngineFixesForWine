@@ -1570,6 +1570,82 @@ namespace Patches::FormCaching
                                 for (int b = 0; b < 32; ++b) fprintf(f2, " %02X", ripBytes[b]);
                             fprintf(f2, "\n");
                         }
+
+                        // v1.22.85: Enhanced diagnostics for high-invalid
+                        // targets — dump full register state + memory around
+                        // corrupted pointer to identify corruption source.
+                        if (isHighInvalid && count < 50) {
+                            fprintf(f2, "  REGS: RAX=%016llX RBX=%016llX RCX=%016llX RDX=%016llX\n",
+                                (unsigned long long)pep->ContextRecord->Rax,
+                                (unsigned long long)pep->ContextRecord->Rbx,
+                                (unsigned long long)pep->ContextRecord->Rcx,
+                                (unsigned long long)pep->ContextRecord->Rdx);
+                            fprintf(f2, "        RSI=%016llX RDI=%016llX RBP=%016llX RSP=%016llX\n",
+                                (unsigned long long)pep->ContextRecord->Rsi,
+                                (unsigned long long)pep->ContextRecord->Rdi,
+                                (unsigned long long)pep->ContextRecord->Rbp,
+                                (unsigned long long)pep->ContextRecord->Rsp);
+                            fprintf(f2, "        R8 =%016llX R9 =%016llX R10=%016llX R11=%016llX\n",
+                                (unsigned long long)pep->ContextRecord->R8,
+                                (unsigned long long)pep->ContextRecord->R9,
+                                (unsigned long long)pep->ContextRecord->R10,
+                                (unsigned long long)pep->ContextRecord->R11);
+                            fprintf(f2, "        R12=%016llX R13=%016llX R14=%016llX R15=%016llX\n",
+                                (unsigned long long)pep->ContextRecord->R12,
+                                (unsigned long long)pep->ContextRecord->R13,
+                                (unsigned long long)pep->ContextRecord->R14,
+                                (unsigned long long)pep->ContextRecord->R15);
+
+                            // Dump stack (return addresses)
+                            auto* stk = reinterpret_cast<DWORD64*>(pep->ContextRecord->Rsp);
+                            if (!IsBadReadPtr(stk, 64)) {
+                                fprintf(f2, "  STACK:");
+                                for (int s = 0; s < 8; ++s)
+                                    fprintf(f2, " %016llX", (unsigned long long)stk[s]);
+                                fprintf(f2, "\n");
+                            }
+
+                            // For each register that looks like a valid
+                            // pointer, dump 64 bytes at that address so we
+                            // can see the data structure it points to.
+                            const char* regNames[] = {
+                                "RAX","RBX","RCX","RDX","RSI","RDI",
+                                "R8","R9","R10","R11","R12","R13","R14","R15"
+                            };
+                            DWORD64 regVals[] = {
+                                pep->ContextRecord->Rax, pep->ContextRecord->Rbx,
+                                pep->ContextRecord->Rcx, pep->ContextRecord->Rdx,
+                                pep->ContextRecord->Rsi, pep->ContextRecord->Rdi,
+                                pep->ContextRecord->R8,  pep->ContextRecord->R9,
+                                pep->ContextRecord->R10, pep->ContextRecord->R11,
+                                pep->ContextRecord->R12, pep->ContextRecord->R13,
+                                pep->ContextRecord->R14, pep->ContextRecord->R15
+                            };
+                            for (int r = 0; r < 14; ++r) {
+                                DWORD64 rv = regVals[r];
+                                // Valid user-mode heap pointer?
+                                if (rv > 0x10000 && rv <= 0x00007FFFFFFFFFFFULL) {
+                                    auto* mem = reinterpret_cast<std::uint8_t*>(rv);
+                                    if (!IsBadReadPtr(mem, 64)) {
+                                        fprintf(f2, "  MEM[%s=%016llX]:", regNames[r],
+                                            (unsigned long long)rv);
+                                        for (int b = 0; b < 64; ++b) {
+                                            if (b % 16 == 0 && b > 0)
+                                                fprintf(f2, "\n                              ");
+                                            fprintf(f2, " %02X", mem[b]);
+                                        }
+                                        // Also print as ASCII for string detection
+                                        fprintf(f2, "\n  ASCII: \"");
+                                        for (int b = 0; b < 64; ++b) {
+                                            char c = (char)mem[b];
+                                            fprintf(f2, "%c", (c >= 32 && c < 127) ? c : '.');
+                                        }
+                                        fprintf(f2, "\"\n");
+                                    }
+                                }
+                            }
+                        }
+
                         fflush(f2);
                         fclose(f2);
                     }
@@ -1767,6 +1843,40 @@ namespace Patches::FormCaching
                                 for (int b = 0; b < 32; ++b) fprintf(f2, " %02X", ripBytes[b]);
                             fprintf(f2, "\n");
                         }
+
+                        // v1.22.85: Full register + memory dump for first 20 catch-alls
+                        if (count < 20) {
+                            fprintf(f2, "  REGS: RAX=%016llX RBX=%016llX RCX=%016llX RDX=%016llX\n",
+                                (unsigned long long)pep->ContextRecord->Rax,
+                                (unsigned long long)pep->ContextRecord->Rbx,
+                                (unsigned long long)pep->ContextRecord->Rcx,
+                                (unsigned long long)pep->ContextRecord->Rdx);
+                            fprintf(f2, "        RSI=%016llX RDI=%016llX R8 =%016llX R14=%016llX\n",
+                                (unsigned long long)pep->ContextRecord->Rsi,
+                                (unsigned long long)pep->ContextRecord->Rdi,
+                                (unsigned long long)pep->ContextRecord->R8,
+                                (unsigned long long)pep->ContextRecord->R14);
+                            // Dump memory at RSI (common source struct) if valid
+                            auto rsiVal = pep->ContextRecord->Rsi;
+                            if (rsiVal > 0x10000 && rsiVal <= 0x00007FFFFFFFFFFFULL) {
+                                auto* mem = reinterpret_cast<std::uint8_t*>(rsiVal);
+                                if (!IsBadReadPtr(mem, 128)) {
+                                    fprintf(f2, "  MEM[RSI=%016llX]:", (unsigned long long)rsiVal);
+                                    for (int b = 0; b < 128; ++b) {
+                                        if (b % 16 == 0 && b > 0)
+                                            fprintf(f2, "\n                              ");
+                                        fprintf(f2, " %02X", mem[b]);
+                                    }
+                                    fprintf(f2, "\n  ASCII: \"");
+                                    for (int b = 0; b < 128; ++b) {
+                                        char c = (char)mem[b];
+                                        fprintf(f2, "%c", (c >= 32 && c < 127) ? c : '.');
+                                    }
+                                    fprintf(f2, "\"\n");
+                                }
+                            }
+                        }
+
                         fflush(f2);
                         fclose(f2);
                     }
