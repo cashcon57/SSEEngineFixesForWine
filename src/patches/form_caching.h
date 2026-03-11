@@ -333,6 +333,16 @@ namespace Patches::FormCaching
         // SetAt variant A: +0x1945D0 (414 bytes)
         // SetAt variant B: +0x1947C0 (template duplicate)
         // ================================================================
+        // Sharded form cache — must be declared before SetAt wrappers
+        // so the cache-update code can reference it.
+        struct ShardedCache
+        {
+            mutable std::shared_mutex mutex;
+            std::unordered_map<std::uint32_t, RE::TESForm*> map;
+        };
+
+        inline ShardedCache g_formCache[256];
+
         inline std::atomic_flag g_hashMapSetAtLock = ATOMIC_FLAG_INIT;
         inline std::atomic<std::uint64_t> g_setAtCallCount{ 0 };
         inline std::atomic<std::uint64_t> g_setAtContentionCount{ 0 };
@@ -411,13 +421,6 @@ namespace Patches::FormCaching
             return result;
         }
 
-        struct ShardedCache
-        {
-            mutable std::shared_mutex mutex;
-            std::unordered_map<std::uint32_t, RE::TESForm*> map;
-        };
-
-        inline ShardedCache g_formCache[256];
         inline SafetyHookInline g_hk_GetFormByNumericId{};
 
         inline RE::TESForm* TESForm_GetFormByNumericId(RE::FormID a_formId)
