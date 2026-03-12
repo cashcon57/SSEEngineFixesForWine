@@ -190,6 +190,16 @@ namespace Patches::FormCaching
         // and the cache remains valid across sessions.
         inline std::atomic<bool> g_cacheAuthoritative{false};
 
+        // v1.22.90: BSTScatterTable sentinel pointer — the address of the
+        // game's BSTScatterTableSentinel bytes {0xDE,0xAD,0xBE,0xEF}.
+        // Captured lazily from the first grow() call.  Written into the
+        // low null guard page at offsets +0x10 and +0x28 so that when
+        // grow() steals entries (sets next = nullptr) and a concurrent
+        // find() follows the null chain pointer, it reads sentinel from
+        // the null page → cmp sentinel,sentinel → loop exits cleanly.
+        inline void* g_bstSentinel = nullptr;
+        inline std::atomic<std::uint64_t> g_growCallCount{ 0 };
+
         // v1.22.85: Lazy cache invalidation for New Game (DISABLED in v1.22.86).
         // Kept for reference.  ESM forms persist across New Game — clearing
         // the cache forces 900+ lookups to fall through to the corrupted
@@ -215,6 +225,46 @@ namespace Patches::FormCaching
                 auto stubAddr = reinterpret_cast<DWORD64>(g_stubFuncPage);
                 memcpy(page + 0x4B8, &stubAddr, 8);
             }
+        }
+
+        // v1.22.90: Write BST sentinel pointer into the low null guard page
+        // at chain-follow offsets (+0x10 for 24-byte entries, +0x28 for 48-byte).
+        // When grow() steals entries (next = nullptr) and a concurrent find()
+        // follows the null chain pointer, the MOV reads sentinel from the null
+        // page → cmp sentinel, [map+sentinel_offset] → match → loop exits.
+        // Must temporarily make the page writable (it's normally PAGE_READONLY).
+        inline void PatchNullPageWithSentinel()
+        {
+            if (!g_bstSentinel || !g_lowNullGuard) return;
+
+            auto sentAddr = reinterpret_cast<DWORD64>(g_bstSentinel);
+            auto* page = reinterpret_cast<std::uint8_t*>(g_lowNullGuard);
+
+            DWORD oldProt = 0;
+            if (!VirtualProtect(page, 0x10000, PAGE_READWRITE, &oldProt)) return;
+
+            // Write sentinel at +0x10 (24-byte entry next offset)
+            memcpy(page + 0x10, &sentAddr, 8);
+            // Write sentinel at +0x28 (48-byte entry next offset)
+            memcpy(page + 0x28, &sentAddr, 8);
+            // Also write sentinel at +0x30 in case the cascade from +0x10
+            // produces an intermediate value that chains to +0x20, then +0x30
+            memcpy(page + 0x30, &sentAddr, 8);
+
+            // Restore vtable and stub pointers that might have been overwritten
+            if (g_stubVtable) {
+                auto vtAddr = reinterpret_cast<DWORD64>(g_stubVtable);
+                memcpy(page + 0x00, &vtAddr, 8);
+            }
+            if (g_stubFuncPage) {
+                auto stubAddr = reinterpret_cast<DWORD64>(g_stubFuncPage);
+                memcpy(page + 0x4B8, &stubAddr, 8);
+            }
+
+            VirtualProtect(page, 0x10000, PAGE_READONLY, &oldProt);
+
+            logger::info("v1.22.90: Patched null page with BST sentinel 0x{:X} at +0x10, +0x28, +0x30",
+                reinterpret_cast<std::uintptr_t>(g_bstSentinel));
         }
 
         // v1.22.77: Cached DLL module range for fault recovery.
@@ -363,40 +413,54 @@ namespace Patches::FormCaching
         inline std::atomic<std::uint64_t> g_setAtContentionCount{ 0 };
         inline std::atomic<std::uint64_t> g_setAtCacheUpdates{ 0 };
 
-        // v1.22.88: grow/rehash hooks — skip grow after initial allocation.
-        // BSTHashMap::grow is NOT thread-safe: it rehashes entries by modifying
-        // chain links in the old bucket array while concurrent find() threads
-        // iterate those same links. Even without freeing the old array, the
-        // modified next pointers create cross-array cycles → infinite loops.
-        // Fix: allow the initial allocation (buckets == nullptr) but skip all
-        // subsequent grows. Chains get longer but stay valid.
+        // v1.22.90: grow/rehash hooks — passthrough + sentinel capture.
+        // BSTHashMap::grow is NOT thread-safe under Wine. When grow() steals
+        // entries (sets next = nullptr), concurrent find() threads follow the
+        // null chain pointer. The deallocate call inside grow is NOP'd (see
+        // Install()) so old arrays stay allocated with next = nullptr.
+        // The first grow call captures the BST sentinel pointer and writes it
+        // into the low null guard page, so null chain follows read sentinel
+        // and the find loop exits cleanly.
         inline SafetyHookInline g_hk_growA{};
         inline SafetyHookInline g_hk_growB{};
-        inline std::atomic<std::uint64_t> g_growSkipCount{ 0 };
 
         // grow signature: __fastcall(this) — rcx = BSTHashMap inner struct
-        // Layout: +0x04 = capacity (uint32), +0x20 = buckets pointer
+        // Layout: +0x04 = capacity (uint32), +0x10 = sentinel ptr, +0x20 = buckets pointer
         inline void __fastcall BSTHashMap_grow_A(void* a_this)
         {
-            auto* buckets = *reinterpret_cast<void**>(
-                reinterpret_cast<std::uint8_t*>(a_this) + 0x20);
-            if (buckets != nullptr) {
-                // Already allocated — skip grow to prevent rehash corruption.
-                g_growSkipCount.fetch_add(1, std::memory_order_relaxed);
-                return;
+            g_growCallCount.fetch_add(1, std::memory_order_relaxed);
+
+            // Capture BST sentinel on first call
+            if (!g_bstSentinel) {
+                auto* sentinel = *reinterpret_cast<void**>(
+                    reinterpret_cast<std::uint8_t*>(a_this) + 0x10);
+                if (sentinel) {
+                    g_bstSentinel = sentinel;
+                    logger::info("v1.22.90: Captured BST sentinel = 0x{:X}",
+                        reinterpret_cast<std::uintptr_t>(sentinel));
+                    PatchNullPageWithSentinel();
+                }
             }
-            // Initial allocation — call original.
+
+            // Passthrough — call original grow (deallocate is NOP'd)
             g_hk_growA.call<void>(a_this);
         }
 
         inline void __fastcall BSTHashMap_grow_B(void* a_this)
         {
-            auto* buckets = *reinterpret_cast<void**>(
-                reinterpret_cast<std::uint8_t*>(a_this) + 0x20);
-            if (buckets != nullptr) {
-                g_growSkipCount.fetch_add(1, std::memory_order_relaxed);
-                return;
+            g_growCallCount.fetch_add(1, std::memory_order_relaxed);
+
+            if (!g_bstSentinel) {
+                auto* sentinel = *reinterpret_cast<void**>(
+                    reinterpret_cast<std::uint8_t*>(a_this) + 0x10);
+                if (sentinel) {
+                    g_bstSentinel = sentinel;
+                    logger::info("v1.22.90: Captured BST sentinel = 0x{:X} (grow_B)",
+                        reinterpret_cast<std::uintptr_t>(sentinel));
+                    PatchNullPageWithSentinel();
+                }
             }
+
             g_hk_growB.call<void>(a_this);
         }
 
@@ -1495,6 +1559,84 @@ namespace Patches::FormCaching
             }
 
             const auto* ripBytes = reinterpret_cast<const std::uint8_t*>(rip);
+
+            // ─────────────────────────────────────────────────────────────
+            // CASE 0.5 (v1.22.90): BST chain-follow sentinel recovery.
+            //
+            // When grow() steals entries (next = nullptr) and a concurrent
+            // find() follows the null chain pointer, the MOV instruction
+            // faults. Instead of redirecting to the zero page (which causes
+            // an infinite loop — the find loop reads zero page data as entry
+            // pointers and cycles forever), we detect the specific chain-
+            // follow instruction pattern and set the destination register
+            // to the BST sentinel value. This makes the loop's sentinel
+            // comparison match → loop exits cleanly → find returns "not found".
+            //
+            // Pattern: [REX] 8B ModRM disp8  where disp8 = 0x10 or 0x28
+            //   e.g. 48 8B 52 10 = mov rdx, [rdx + 0x10]
+            // ─────────────────────────────────────────────────────────────
+            if (targetAddr < 0x10000 && g_bstSentinel &&
+                rip >= sImgBase && rip < sImgEnd &&
+                !IsBadReadPtr(ripBytes, 8)) {
+
+                const auto* ip = ripBytes;
+                int rex = 0;
+                if ((*ip & 0xF0) == 0x40) { rex = *ip; ip++; }
+
+                if (*ip == 0x8B) {  // MOV r, r/m
+                    ip++;
+                    int mod = (*ip >> 6) & 3;
+                    int reg = ((*ip >> 3) & 7) | ((rex & 4) ? 8 : 0);  // dest (REX.R)
+                    int rm  = (*ip & 7) | ((rex & 1) ? 8 : 0);          // src  (REX.B)
+                    ip++;
+
+                    bool hasSIB = (mod != 3 && (rm & 7) == 4);
+                    if (!hasSIB && mod == 1) {  // [reg + disp8]
+                        int disp = static_cast<std::int8_t>(*ip);
+
+                        if (disp == 0x10 || disp == 0x28) {
+                            // This is a BST chain-follow: mov reg, [reg + next_offset]
+                            // Set destination register to sentinel so loop exits.
+                            DWORD64 sentVal = reinterpret_cast<DWORD64>(g_bstSentinel);
+
+                            // Map register index to CONTEXT field
+                            DWORD64* regMap[] = {
+                                &pep->ContextRecord->Rax, &pep->ContextRecord->Rcx,
+                                &pep->ContextRecord->Rdx, &pep->ContextRecord->Rbx,
+                                &pep->ContextRecord->Rsp, &pep->ContextRecord->Rbp,
+                                &pep->ContextRecord->Rsi, &pep->ContextRecord->Rdi,
+                                &pep->ContextRecord->R8,  &pep->ContextRecord->R9,
+                                &pep->ContextRecord->R10, &pep->ContextRecord->R11,
+                                &pep->ContextRecord->R12, &pep->ContextRecord->R13,
+                                &pep->ContextRecord->R14, &pep->ContextRecord->R15,
+                            };
+
+                            if (reg < 16 && reg != 4) {  // don't touch RSP
+                                *regMap[reg] = sentVal;
+                                // Advance RIP past the instruction
+                                auto instrLen = x86_instr_len(ripBytes);
+                                pep->ContextRecord->Rip += instrLen;
+
+                                static std::atomic<int> s_chainFixCount{ 0 };
+                                auto cnt = s_chainFixCount.fetch_add(1, std::memory_order_relaxed);
+                                if (cnt < 100) {
+                                    FILE* f = nullptr;
+                                    fopen_s(&f, g_crashLogPath, "a");
+                                    if (f) {
+                                        fprintf(f, "CHAIN-SENTINEL #%d: RIP=+0x%llX disp=%d dest=R%d → sentinel=0x%llX\n",
+                                            cnt + 1, (unsigned long long)(rip - sImgBase),
+                                            disp, reg,
+                                            (unsigned long long)sentVal);
+                                        fflush(f);
+                                        fclose(f);
+                                    }
+                                }
+                                return EXCEPTION_CONTINUE_EXECUTION;
+                            }
+                        }
+                    }
+                }
+            }
 
             // ─────────────────────────────────────────────────────────────
             // CASE 1: Invalid pointer dereference — zero page substitution
@@ -5353,12 +5495,11 @@ namespace Patches::FormCaching
         detail::InitPaths();
         detail::ReplaceFormMapFunctions();
 
-        // v1.22.88: Hook grow_A and grow_B to skip rehash after initial alloc.
-        // BSTHashMap::grow is NOT thread-safe: it rehashes entries by modifying
-        // chain links in the old bucket array while concurrent find() iterates
-        // those same links. This creates cross-array cycles → infinite loops.
-        // Fix: allow initial allocation (buckets == null) but skip all resizes.
-        // Chains get longer but stay valid and corruption-free.
+        // v1.22.90: Hook grow_A and grow_B — passthrough + sentinel capture.
+        // grow() steals entries (sets next = nullptr), but with NOP'd deallocate
+        // the old array stays alive. The null page has sentinel at +0x10/+0x28,
+        // so concurrent find() following a stolen null chain reads sentinel →
+        // loop exits cleanly. The VEH also has chain-follow detection as backup.
         {
             auto imgBase = REL::Module::get().base();
             auto* growA = reinterpret_cast<void*>(imgBase + 0x198390);
@@ -5367,8 +5508,34 @@ namespace Patches::FormCaching
             detail::g_hk_growA = safetyhook::create_inline(growA, detail::BSTHashMap_grow_A);
             detail::g_hk_growB = safetyhook::create_inline(growB, detail::BSTHashMap_grow_B);
 
-            logger::info("v1.22.88: BSTHashMap::grow hooks installed — "
-                "grow_A=+0x198390, grow_B=+0x198610 (skip rehash after initial alloc)");
+            // NOP the deallocate (free) CALL instructions inside grow_A and grow_B.
+            // This prevents the old bucket array from being freed while concurrent
+            // find() threads may still be traversing its chains. The old entries
+            // have next = nullptr (from steal), and the null page returns sentinel,
+            // so find loops exit cleanly.
+            //
+            // grow_A: CALL at +0x1985F8 (offset 0x268 into function)
+            // grow_B: CALL at +0x198878 (offset 0x268 into function)
+            // Both call the same deallocate function (ScrapHeap::Free or CRT free).
+            auto nopCall = [&](std::uintptr_t callRva, const char* name) {
+                auto* site = reinterpret_cast<std::uint8_t*>(imgBase + callRva);
+                if (*site == 0xE8) {  // Verify it's a CALL rel32
+                    DWORD oldProt = 0;
+                    if (VirtualProtect(site, 5, PAGE_EXECUTE_READWRITE, &oldProt)) {
+                        memset(site, 0x90, 5);  // NOP × 5
+                        FlushInstructionCache(GetCurrentProcess(), site, 5);
+                        logger::info("v1.22.90: NOP'd {} deallocate CALL at +0x{:X}", name, callRva);
+                    }
+                } else {
+                    logger::warn("v1.22.90: {} at +0x{:X} is 0x{:02X}, not CALL (0xE8) — skipping NOP",
+                        name, callRva, *site);
+                }
+            };
+            nopCall(0x1985F8, "grow_A");
+            nopCall(0x198878, "grow_B");
+
+            logger::info("v1.22.90: BSTHashMap::grow hooks installed — "
+                "passthrough + NOP-free + sentinel capture");
         }
 
         logger::info("installed form caching patch"sv);
