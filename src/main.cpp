@@ -71,8 +71,8 @@ void MessageHandler(SKSE::MessagingInterface::Message* a_msg)
                 Patches::FormCaching::detail::g_cacheAuthoritative.store(true, std::memory_order_release);
                 logger::info("v1.22.86: Form cache is now AUTHORITATIVE — no native map fallback");
 
-                // v1.22.93: Diagnostic — verify sentinel state at kDataLoaded
-                logger::info("v1.22.93: sentinel={} grows={} zeroPage=0x{:X} zp+0x10=0x{:X}",
+                // v1.22.94: Diagnostic — verify sentinel state at kDataLoaded
+                logger::info("v1.22.94: sentinel={} grows={} zeroPage=0x{:X} zp+0x10=0x{:X}",
                     Patches::FormCaching::detail::g_bstSentinel ?
                         fmt::format("0x{:X}", reinterpret_cast<std::uintptr_t>(Patches::FormCaching::detail::g_bstSentinel)) : "null",
                     Patches::FormCaching::detail::g_growCallCount.load(std::memory_order_relaxed),
@@ -152,7 +152,7 @@ void MessageHandler(SKSE::MessagingInterface::Message* a_msg)
                 FILE* f = nullptr;
                 fopen_s(&f, Patches::FormCaching::detail::g_crashLogPath, "a");
                 if (f) {
-                    fprintf(f, "\n=== kNewGame (v1.22.93) === zpUse=%llu ws=%llu cf=%llu er=%llu setAt=%llu grows=%llu cacheAuth=%d sentinel=%p\n",
+                    fprintf(f, "\n=== kNewGame (v1.22.94) === zpUse=%llu ws=%llu cf=%llu er=%llu setAt=%llu grows=%llu cacheAuth=%d sentinel=%p\n",
                         (unsigned long long)Patches::FormCaching::detail::g_zeroPageUseCount.load(std::memory_order_relaxed),
                         (unsigned long long)Patches::FormCaching::detail::g_zeroPageWriteSkips.load(std::memory_order_relaxed),
                         (unsigned long long)Patches::FormCaching::detail::g_caveFaultCount.load(std::memory_order_relaxed),

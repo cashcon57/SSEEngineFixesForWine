@@ -5132,8 +5132,16 @@ namespace Patches::FormCaching
                                 auto vtAddr = reinterpret_cast<DWORD64>(g_stubVtable);
                                 memcpy(page + 0x00, &vtAddr, 8); // vtable at offset 0
                             }
-                            auto flags = static_cast<std::uint32_t>(0x20); // kDeleted
-                            memcpy(page + 0x10, &flags, 4);
+                            // v1.22.94: Write sentinel if available (includes kDeleted bit)
+                            if (g_bstSentinel) {
+                                auto sentAddr = reinterpret_cast<DWORD64>(g_bstSentinel);
+                                memcpy(page + 0x10, &sentAddr, 8);
+                                memcpy(page + 0x28, &sentAddr, 8);
+                                memcpy(page + 0x30, &sentAddr, 8);
+                            } else {
+                                auto flags = static_cast<std::uint32_t>(0x20); // kDeleted
+                                memcpy(page + 0x10, &flags, 4);
+                            }
                             if (g_stubFuncPage) {
                                 auto stubAddr = reinterpret_cast<DWORD64>(g_stubFuncPage);
                                 memcpy(page + 0x4B8, &stubAddr, 8);
@@ -5372,8 +5380,16 @@ namespace Patches::FormCaching
                                 auto vtAddr = reinterpret_cast<DWORD64>(g_stubVtable);
                                 memcpy(page + 0x00, &vtAddr, 8);
                             }
-                            auto flags = static_cast<std::uint32_t>(0x20); // kDeleted
-                            memcpy(page + 0x10, &flags, 4);
+                            // v1.22.94: Write sentinel (includes kDeleted bit) not just flags
+                            if (g_bstSentinel) {
+                                auto sentAddr = reinterpret_cast<DWORD64>(g_bstSentinel);
+                                memcpy(page + 0x10, &sentAddr, 8);
+                                memcpy(page + 0x28, &sentAddr, 8);
+                                memcpy(page + 0x30, &sentAddr, 8);
+                            } else {
+                                auto flags = static_cast<std::uint32_t>(0x20); // kDeleted
+                                memcpy(page + 0x10, &flags, 4);
+                            }
                             if (g_stubFuncPage) {
                                 auto stubAddr = reinterpret_cast<DWORD64>(g_stubFuncPage);
                                 memcpy(page + 0x4B8, &stubAddr, 8);
@@ -5467,8 +5483,20 @@ namespace Patches::FormCaching
                 auto* zpBytes = reinterpret_cast<std::uint8_t*>(g_zeroPage);
                 auto stubVtable = reinterpret_cast<DWORD64>(g_stubVtable);
                 std::memcpy(&zpBytes[0x0000], &stubVtable, 8); // vtable
-                auto flags = static_cast<std::uint32_t>(0x20);
-                std::memcpy(&zpBytes[0x0010], &flags, 4); // kDeleted
+                // v1.22.94: Write BST sentinel at +0x10 if available (also has kDeleted
+                // bit set in low 32 bits: 0x41FD5F3C & 0x20 == 0x20). Previous versions
+                // wrote a 4-byte kDeleted flag here, clobbering the sentinel pointer
+                // that PatchNullPageWithSentinel() had written — causing chain walks
+                // through g_zeroPage to never match sentinel and loop forever.
+                if (g_bstSentinel) {
+                    auto sentAddr = reinterpret_cast<DWORD64>(g_bstSentinel);
+                    std::memcpy(&zpBytes[0x0010], &sentAddr, 8);
+                    std::memcpy(&zpBytes[0x0028], &sentAddr, 8);
+                    std::memcpy(&zpBytes[0x0030], &sentAddr, 8);
+                } else {
+                    auto flags = static_cast<std::uint32_t>(0x20);
+                    std::memcpy(&zpBytes[0x0010], &flags, 4); // kDeleted fallback
+                }
                 if (g_stubFuncPage) {
                     auto stubAddr = reinterpret_cast<DWORD64>(g_stubFuncPage);
                     std::memcpy(&zpBytes[0x04B8], &stubAddr, 8);
