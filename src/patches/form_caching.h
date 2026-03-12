@@ -190,13 +190,13 @@ namespace Patches::FormCaching
         // and the cache remains valid across sessions.
         inline std::atomic<bool> g_cacheAuthoritative{false};
 
-        // v1.22.90: BSTScatterTable sentinel pointer — the address of the
+        // v1.22.91: BSTScatterTable sentinel pointer — the address of the
         // game's BSTScatterTableSentinel bytes {0xDE,0xAD,0xBE,0xEF}.
-        // Captured lazily from the first grow() call.  Written into the
-        // low null guard page at offsets +0x10 and +0x28 so that when
-        // grow() steals entries (sets next = nullptr) and a concurrent
-        // find() follows the null chain pointer, it reads sentinel from
-        // the null page → cmp sentinel,sentinel → loop exits cleanly.
+        // Captured from the global form map (in GetFormByNumericId hook)
+        // or from grow() hooks as fallback. Written into g_zeroPage at
+        // +0x10/+0x28 so that when VEH CASE 1 redirects a null chain
+        // follow to g_zeroPage, the find loop reads sentinel from
+        // [g_zeroPage+0x10] → sentinel comparison matches → loop exits.
         inline void* g_bstSentinel = nullptr;
         inline std::atomic<std::uint64_t> g_growCallCount{ 0 };
 
@@ -219,52 +219,66 @@ namespace Patches::FormCaching
                 auto vtAddr = reinterpret_cast<DWORD64>(g_stubVtable);
                 memcpy(page + 0x00, &vtAddr, 8);
             }
-            auto kDeleted = static_cast<std::uint32_t>(0x20);
-            memcpy(page + 0x10, &kDeleted, 4);
+            // v1.22.91: If BST sentinel is known, write it at +0x10 instead of
+            // formFlags=0x20. This breaks the VEH chain-follow infinite loop:
+            // VEH redirects null → zeroPage, find loop reads [zeroPage+0x10],
+            // gets sentinel → cmp matches → loop exits cleanly.
+            if (g_bstSentinel) {
+                auto sentAddr = reinterpret_cast<DWORD64>(g_bstSentinel);
+                memcpy(page + 0x10, &sentAddr, 8);
+                // Also at +0x28 and +0x30 for 48-byte entries
+                memcpy(page + 0x28, &sentAddr, 8);
+                memcpy(page + 0x30, &sentAddr, 8);
+            } else {
+                auto kDeleted = static_cast<std::uint32_t>(0x20);
+                memcpy(page + 0x10, &kDeleted, 4);
+            }
             if (g_stubFuncPage) {
                 auto stubAddr = reinterpret_cast<DWORD64>(g_stubFuncPage);
                 memcpy(page + 0x4B8, &stubAddr, 8);
             }
         }
 
-        // v1.22.90: Write BST sentinel pointer into the low null guard page
+        // v1.22.91: Write BST sentinel pointer into the ZERO PAGE (g_zeroPage)
         // at chain-follow offsets (+0x10 for 24-byte entries, +0x28 for 48-byte).
-        // When grow() steals entries (next = nullptr) and a concurrent find()
-        // follows the null chain pointer, the MOV reads sentinel from the null
-        // page → cmp sentinel, [map+sentinel_offset] → match → loop exits.
-        // Must temporarily make the page writable (it's normally PAGE_READONLY).
+        // VEH CASE 1 redirects null pointer faults to g_zeroPage. When a find
+        // loop follows a stolen null chain pointer, VEH sets the register to
+        // g_zeroPage. The find loop then reads [g_zeroPage + 0x10] as the
+        // "next" entry pointer. If this contains sentinel → loop exits cleanly.
+        // If it contains formFlags=0x20 → infinite cycle (the v1.22.90 bug).
+        // Also patches g_lowNullGuard (address ~0) if available.
         inline void PatchNullPageWithSentinel()
         {
-            if (!g_bstSentinel || !g_lowNullGuard) return;
+            if (!g_bstSentinel) return;
 
             auto sentAddr = reinterpret_cast<DWORD64>(g_bstSentinel);
-            auto* page = reinterpret_cast<std::uint8_t*>(g_lowNullGuard);
 
-            DWORD oldProt = 0;
-            if (!VirtualProtect(page, 0x10000, PAGE_READWRITE, &oldProt)) return;
+            // Patch the VEH redirect target (g_zeroPage) — this is the critical one
+            if (g_zeroPage) {
+                auto* page = reinterpret_cast<std::uint8_t*>(g_zeroPage);
+                // g_zeroPage is PAGE_READWRITE, no VirtualProtect needed
+                memcpy(page + 0x10, &sentAddr, 8);
+                memcpy(page + 0x28, &sentAddr, 8);
+                memcpy(page + 0x30, &sentAddr, 8);
 
-            // Write sentinel at +0x10 (24-byte entry next offset)
-            memcpy(page + 0x10, &sentAddr, 8);
-            // Write sentinel at +0x28 (48-byte entry next offset)
-            memcpy(page + 0x28, &sentAddr, 8);
-            // Also write sentinel at +0x30 in case the cascade from +0x10
-            // produces an intermediate value that chains to +0x20, then +0x30
-            memcpy(page + 0x30, &sentAddr, 8);
-
-            // Restore vtable and stub pointers that might have been overwritten
-            if (g_stubVtable) {
-                auto vtAddr = reinterpret_cast<DWORD64>(g_stubVtable);
-                memcpy(page + 0x00, &vtAddr, 8);
-            }
-            if (g_stubFuncPage) {
-                auto stubAddr = reinterpret_cast<DWORD64>(g_stubFuncPage);
-                memcpy(page + 0x4B8, &stubAddr, 8);
+                logger::info("v1.22.91: Patched g_zeroPage (0x{:X}) with BST sentinel 0x{:X} at +0x10, +0x28, +0x30",
+                    reinterpret_cast<std::uintptr_t>(g_zeroPage),
+                    reinterpret_cast<std::uintptr_t>(g_bstSentinel));
             }
 
-            VirtualProtect(page, 0x10000, PAGE_READONLY, &oldProt);
-
-            logger::info("v1.22.90: Patched null page with BST sentinel 0x{:X} at +0x10, +0x28, +0x30",
-                reinterpret_cast<std::uintptr_t>(g_bstSentinel));
+            // Also patch the low null guard (address ~0) if mapped
+            if (g_lowNullGuard) {
+                auto* page = reinterpret_cast<std::uint8_t*>(g_lowNullGuard);
+                DWORD oldProt = 0;
+                if (VirtualProtect(page, 0x10000, PAGE_READWRITE, &oldProt)) {
+                    memcpy(page + 0x10, &sentAddr, 8);
+                    memcpy(page + 0x28, &sentAddr, 8);
+                    memcpy(page + 0x30, &sentAddr, 8);
+                    VirtualProtect(page, 0x10000, PAGE_READONLY, &oldProt);
+                    logger::info("v1.22.91: Also patched g_lowNullGuard (0x{:X}) with sentinel",
+                        reinterpret_cast<std::uintptr_t>(g_lowNullGuard));
+                }
+            }
         }
 
         // v1.22.77: Cached DLL module range for fault recovery.
@@ -583,6 +597,20 @@ namespace Patches::FormCaching
                             "(formMap=0x{:X})",
                             reinterpret_cast<std::uintptr_t>(inner),
                             reinterpret_cast<std::uintptr_t>(formMap));
+
+                        // v1.22.91: Capture BST sentinel from form map inner struct.
+                        // inner = formMap + 8, sentinel is at inner + 0x10 = formMap + 0x18.
+                        // This is the game's BSTScatterTableSentinel address.
+                        if (!g_bstSentinel) {
+                            auto* sentPtr = *reinterpret_cast<void**>(
+                                reinterpret_cast<std::uint8_t*>(inner) + 0x10);
+                            if (sentPtr) {
+                                g_bstSentinel = sentPtr;
+                                logger::info("v1.22.91: Captured BST sentinel = 0x{:X} from form map",
+                                    reinterpret_cast<std::uintptr_t>(sentPtr));
+                                PatchNullPageWithSentinel();
+                            }
+                        }
                     }
                 }
             }
