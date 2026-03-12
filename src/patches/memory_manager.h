@@ -82,7 +82,14 @@ namespace Patches::WineMemoryManager
 
 			// Total: header (32) + alignment padding + user data
 			std::size_t totalSize = sizeof(AllocHeader) + align + a_size;
-			void* raw = mi_malloc(totalSize);
+			// v1.22.93: Use mi_zalloc (zeroed allocation) instead of mi_malloc.
+			// BSTHashMap::grow allocates a new entry array and updates the
+			// _entries pointer BEFORE initializing entries. Concurrent find()
+			// threads can read the new array while it has uninitialized "next"
+			// pointers — garbage values that happen to be valid addresses form
+			// infinite cycles. Zeroing ensures uninitialized next = nullptr,
+			// which faults to VEH → g_zeroPage → sentinel → loop exits.
+			void* raw = mi_zalloc(totalSize);
 			if (!raw) {
 				g_failCount.fetch_add(1, std::memory_order_relaxed);
 				return nullptr;
