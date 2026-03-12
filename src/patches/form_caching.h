@@ -5227,6 +5227,12 @@ namespace Patches::FormCaching
                     logger::info("  Sentinel form page at 0x{:X} (PAGE_READWRITE, kDeleted=0x20, vtable=0x{:X})",
                         g_zeroPageBase,
                         g_stubVtable ? reinterpret_cast<std::uintptr_t>(g_stubVtable) : 0);
+
+                    // v1.22.91: If BST sentinel was already captured (from
+                    // GetFormByNumericId during loading), patch g_zeroPage now.
+                    if (g_bstSentinel) {
+                        PatchNullPageWithSentinel();
+                    }
                 } else {
                     logger::error("  Failed to allocate sentinel form page!");
                 }
