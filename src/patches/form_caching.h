@@ -105,6 +105,11 @@ namespace Patches::FormCaching
         // v1.22.46: Main thread handle for watchdog RIP sampling
         inline HANDLE g_mainThreadHandle = nullptr;
         inline DWORD g_mainThreadId = 0;
+        // v1.22.95: Main thread stack bounds for direct stack scanning
+        // (fallback when GetThreadContext fails under Wine).
+        inline DWORD64 g_mainThreadStackBase = 0;   // high address (TEB+0x08)
+        inline DWORD64 g_mainThreadStackLimit = 0;   // low address (TEB+0x10)
+        inline DWORD64 g_mainThreadLastRsp = 0;       // from last successful GetThreadContext
         // Legacy sentinel (kept for FormReferenceFixupVEH compatibility)
         alignas(64) inline std::uint8_t g_sentinelForm[0x400] = {};
         inline std::atomic<std::uint64_t> g_sentinelUseCount{ 0 };
@@ -5920,6 +5925,17 @@ namespace Patches::FormCaching
                     }
                 }
 
+                // v1.22.95: Capture main thread stack bounds from TEB for
+                // direct stack scanning (works even when GetThreadContext fails).
+                {
+                    DWORD64 teb = __readgsqword(0x30);
+                    g_mainThreadStackBase = *reinterpret_cast<DWORD64*>(teb + 0x08);
+                    g_mainThreadStackLimit = *reinterpret_cast<DWORD64*>(teb + 0x10);
+                    logger::info("  Main thread stack: base=0x{:X} limit=0x{:X} ({}KB)",
+                        g_mainThreadStackBase, g_mainThreadStackLimit,
+                        (g_mainThreadStackBase - g_mainThreadStackLimit) / 1024);
+                }
+
                 // v1.22.36: Watchdog thread — logs VEH counters every 10 seconds.
                 // v1.22.46: Also samples main thread RIP when counters are stable
                 // (freeze detection — helps pinpoint infinite loops).
@@ -5928,6 +5944,8 @@ namespace Patches::FormCaching
                     std::uint64_t prevZp = 0, prevWs = 0, prevCa = 0;
                     int prevFi = 0;
                     int stableTicks = 0;     // how many ticks counters unchanged
+                    int zeroTicks = 0;       // how many ticks ALL counter deltas are zero
+                    std::uint64_t prevCf = 0, prevEr = 0;
                     auto imgBase = REL::Module::get().base();
 
                     while (true) {
@@ -5948,14 +5966,31 @@ namespace Patches::FormCaching
                         } else {
                             stableTicks = 0;
                         }
+                        // v1.22.95: Also detect zero-DELTA freezes (valid-pointer
+                        // circular chains that never trigger VEH). All counter
+                        // deltas must be zero after kDataLoaded = stuck in a tight
+                        // loop that touches no instrumented code.
+                        auto curCf = g_caveFaultCount.load(std::memory_order_relaxed);
+                        auto curEr = g_execRecoverCount.load(std::memory_order_relaxed);
+                        if (curZp == prevZp && curWs == prevWs &&
+                            curFi == prevFi && curCa == prevCa &&
+                            curCf == prevCf && curEr == prevEr &&
+                            g_cacheAuthoritative.load(std::memory_order_acquire)) {
+                            zeroTicks++;
+                        } else {
+                            zeroTicks = 0;
+                        }
+                        prevCf = curCf; prevEr = curEr;
 
                         prevZp = curZp; prevWs = curWs;
                         prevFi = curFi; prevCa = curCa;
 
                         // v1.22.76: Install INT3 probes after 3 stable ticks (30s freeze).
+                        // v1.22.95: Also trigger on 6 zero-counter ticks (60s) after kDataLoaded.
                         // Writes 0xCC at candidate loop entry points. VEH catches the
                         // breakpoint and logs which loop the main thread is stuck in.
-                        if (stableTicks >= 3 && !g_probesInstalled.load(std::memory_order_acquire)) {
+                        if ((stableTicks >= 3 || zeroTicks >= 6) &&
+                            !g_probesInstalled.load(std::memory_order_acquire)) {
                             int installed = 0;
                             for (int i = 0; i < g_numProbes; ++i) {
                                 auto* site = reinterpret_cast<std::uint8_t*>(imgBase + g_probes[i].offset);
@@ -6019,13 +6054,14 @@ namespace Patches::FormCaching
                         FILE* f = nullptr;
                         fopen_s(&f, g_crashLogPath, "a");
                         if (f) {
-                            fprintf(f, "WATCHDOG #%d (t=%ds): zp=%llu ws=%llu nc=%d fi=%d ca=%llu cf=%llu er=%llu",
+                            fprintf(f, "WATCHDOG #%d (t=%ds): zp=%llu ws=%llu nc=%d fi=%d ca=%llu cf=%llu er=%llu zt=%d",
                                 tick, tick * 10,
                                 curZp, curWs,
                                 g_nullSkipCount.load(std::memory_order_relaxed),
                                 curFi, curCa,
-                                (unsigned long long)g_caveFaultCount.load(std::memory_order_relaxed),
-                                (unsigned long long)g_execRecoverCount.load(std::memory_order_relaxed));
+                                (unsigned long long)curCf,
+                                (unsigned long long)curEr,
+                                zeroTicks);
 
                             // v1.22.72: Sample main thread RIP on every tick.
                             // Try SuspendThread first; if Wine blocks it (err=5),
@@ -6043,6 +6079,7 @@ namespace Patches::FormCaching
                                 if (GetThreadContext(g_mainThreadHandle, &ctx)) {
                                     DWORD64 rip = ctx.Rip;
                                     DWORD64 rsp = ctx.Rsp;
+                                    g_mainThreadLastRsp = rsp; // save for stack scan fallback
                                     if (rip >= (DWORD64)imgBase && rip < (DWORD64)imgBase + 0x4000000) {
                                         fprintf(f, " RIP=+0x%llX RSP=0x%llX",
                                             (unsigned long long)(rip - imgBase),
@@ -6074,6 +6111,41 @@ namespace Patches::FormCaching
                                 if (suspended) ResumeThread(g_mainThreadHandle);
                             } else {
                                 fprintf(f, " RIP=NO_HANDLE");
+                            }
+
+                            // v1.22.95: Direct stack scan — works even when
+                            // GetThreadContext fails (Wine err=31). Reads the main
+                            // thread's stack memory directly, scanning for return
+                            // addresses in the game image range. During a freeze
+                            // (tight find loop), the stack frame is stable.
+                            if (g_mainThreadStackBase > 0 && g_mainThreadStackLimit > 0) {
+                                DWORD64 scanLo = g_mainThreadStackLimit;
+                                DWORD64 scanHi = g_mainThreadStackBase;
+                                // If we have a known RSP, scan from there (current frame area)
+                                if (g_mainThreadLastRsp >= scanLo && g_mainThreadLastRsp < scanHi) {
+                                    // Scan 8KB below and above last known RSP
+                                    DWORD64 rspLo = g_mainThreadLastRsp > 0x2000 ?
+                                        g_mainThreadLastRsp - 0x2000 : scanLo;
+                                    if (rspLo < scanLo) rspLo = scanLo;
+                                    DWORD64 rspHi = g_mainThreadLastRsp + 0x2000;
+                                    if (rspHi > scanHi) rspHi = scanHi;
+                                    scanLo = rspLo;
+                                    scanHi = rspHi;
+                                }
+                                fprintf(f, " STKSCAN=[");
+                                int found = 0;
+                                for (DWORD64 addr = scanLo; addr + 8 <= scanHi && found < 24; addr += 8) {
+                                    if (!IsBadReadPtr(reinterpret_cast<void*>(addr), 8)) {
+                                        DWORD64 val = *reinterpret_cast<DWORD64*>(addr);
+                                        if (val >= (DWORD64)imgBase &&
+                                            val < (DWORD64)imgBase + 0x4000000) {
+                                            fprintf(f, "+0x%llX ",
+                                                (unsigned long long)(val - imgBase));
+                                            found++;
+                                        }
+                                    }
+                                }
+                                fprintf(f, "]");
                             }
 
                             fprintf(f, "\n");
