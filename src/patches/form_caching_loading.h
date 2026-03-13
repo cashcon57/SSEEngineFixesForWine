@@ -853,14 +853,16 @@ namespace Patches::FormCaching
                         FILE* f = nullptr;
                         fopen_s(&f, g_crashLogPath, "a");
                         if (f) {
-                            fprintf(f, "WATCHDOG #%d (t=%ds): zp=%llu ws=%llu nc=%d fi=%d ca=%llu cf=%llu er=%llu zt=%d",
+                            fprintf(f, "WATCHDOG #%d (t=%ds): zp=%llu ws=%llu nc=%d fi=%d ca=%llu cf=%llu er=%llu zt=%d setAt=%llu cUpd=%llu",
                                 tick, tick * 10,
                                 curZp, curWs,
                                 g_nullSkipCount.load(std::memory_order_relaxed),
                                 curFi, curCa,
                                 (unsigned long long)curCf,
                                 (unsigned long long)curEr,
-                                zeroTicks);
+                                zeroTicks,
+                                (unsigned long long)g_setAtCallCount.load(std::memory_order_relaxed),
+                                (unsigned long long)g_setAtCacheUpdates.load(std::memory_order_relaxed));
 
                             // v1.22.72: Sample main thread RIP on every tick.
                             // Try SuspendThread first; if Wine blocks it (err=5),

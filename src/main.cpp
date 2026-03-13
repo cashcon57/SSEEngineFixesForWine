@@ -140,27 +140,37 @@ void MessageHandler(SKSE::MessagingInterface::Message* a_msg)
             // through to the native BSTHashMap (corrupted under Wine) → freeze.
             // New forms from New Game come through SetAt hooks → cache updated.
 
-            logger::info(">>> kNewGame fired — sentinel zpWritable={} zeroPageUse={} writeSkips={} catchAll={} formIdSkips={} <<<",
-                Patches::FormCaching::detail::g_zpWritable.load(std::memory_order_relaxed),
+            logger::info(">>> kNewGame fired — zp={} ws={} ca={} fi={} setAt={} cacheUpd={} contention={} grows={} formMapInner={} <<<",
                 Patches::FormCaching::detail::g_zeroPageUseCount.load(std::memory_order_relaxed),
                 Patches::FormCaching::detail::g_zeroPageWriteSkips.load(std::memory_order_relaxed),
                 Patches::FormCaching::detail::g_catchAllCount.load(std::memory_order_relaxed),
-                Patches::FormCaching::detail::g_formIdSkipCount.load(std::memory_order_relaxed));
+                Patches::FormCaching::detail::g_formIdSkipCount.load(std::memory_order_relaxed),
+                Patches::FormCaching::detail::g_setAtCallCount.load(std::memory_order_relaxed),
+                Patches::FormCaching::detail::g_setAtCacheUpdates.load(std::memory_order_relaxed),
+                Patches::FormCaching::detail::g_setAtContentionCount.load(std::memory_order_relaxed),
+                Patches::FormCaching::detail::g_growCallCount.load(std::memory_order_relaxed),
+                Patches::FormCaching::detail::g_formMapInner.load(std::memory_order_relaxed));
 
             // Also write to crash log for guaranteed capture
             {
                 FILE* f = nullptr;
                 fopen_s(&f, Patches::FormCaching::detail::g_crashLogPath, "a");
                 if (f) {
-                    fprintf(f, "\n=== kNewGame (v1.22.96) === zpUse=%llu ws=%llu cf=%llu er=%llu setAt=%llu grows=%llu cacheAuth=%d sentinel=%p\n",
+                    fprintf(f, "\n=== kNewGame (v1.22.98) === zp=%llu ws=%llu cf=%llu er=%llu ca=%llu "
+                        "setAt=%llu cacheUpd=%llu contention=%llu grows=%llu "
+                        "cacheAuth=%d sentinel=%p formMapInner=%p\n",
                         (unsigned long long)Patches::FormCaching::detail::g_zeroPageUseCount.load(std::memory_order_relaxed),
                         (unsigned long long)Patches::FormCaching::detail::g_zeroPageWriteSkips.load(std::memory_order_relaxed),
                         (unsigned long long)Patches::FormCaching::detail::g_caveFaultCount.load(std::memory_order_relaxed),
                         (unsigned long long)Patches::FormCaching::detail::g_execRecoverCount.load(std::memory_order_relaxed),
+                        (unsigned long long)Patches::FormCaching::detail::g_catchAllCount.load(std::memory_order_relaxed),
                         (unsigned long long)Patches::FormCaching::detail::g_setAtCallCount.load(std::memory_order_relaxed),
+                        (unsigned long long)Patches::FormCaching::detail::g_setAtCacheUpdates.load(std::memory_order_relaxed),
+                        (unsigned long long)Patches::FormCaching::detail::g_setAtContentionCount.load(std::memory_order_relaxed),
                         (unsigned long long)Patches::FormCaching::detail::g_growCallCount.load(std::memory_order_relaxed),
                         Patches::FormCaching::detail::g_cacheAuthoritative.load(std::memory_order_relaxed) ? 1 : 0,
-                        Patches::FormCaching::detail::g_bstSentinel.load(std::memory_order_relaxed));
+                        Patches::FormCaching::detail::g_bstSentinel.load(std::memory_order_relaxed),
+                        Patches::FormCaching::detail::g_formMapInner.load(std::memory_order_relaxed));
                     fflush(f);
                     fclose(f);
                 }
