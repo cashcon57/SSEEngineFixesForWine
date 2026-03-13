@@ -240,3 +240,18 @@ if(COPY_BUILD)
         )
     endif()
 endif()
+
+# ── Unit Tests (opt-in) ──────────────────────────────────────────
+option(BUILD_TESTS "Build unit tests" OFF)
+if(BUILD_TESTS)
+    find_package(Catch2 CONFIG REQUIRED)
+    add_executable(sseef_tests
+        tests/test_x86_instr_len.cpp
+        tests/test_cave_encoding.cpp
+    )
+    target_link_libraries(sseef_tests PRIVATE Catch2::Catch2WithMain)
+    target_compile_features(sseef_tests PRIVATE cxx_std_17)
+    include(CTest)
+    include(Catch)
+    catch_discover_tests(sseef_tests)
+endif()

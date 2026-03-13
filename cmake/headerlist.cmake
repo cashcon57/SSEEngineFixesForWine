@@ -47,6 +47,11 @@ set(headers ${headers}
 	src/patches/editor_id_cache.h
 	src/patches/enable_achievements.h
 	src/patches/form_caching.h
+	src/patches/form_caching_globals.h
+	src/patches/form_caching_hooks.h
+	src/patches/form_caching_loading.h
+	src/patches/form_caching_patches.h
+	src/patches/form_caching_veh.h
 	src/patches/ini_setting_collection.h
 	src/patches/max_stdio.h
 	src/patches/memory_manager.h

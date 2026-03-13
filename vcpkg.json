@@ -11,7 +11,8 @@
     "simpleini",
     "toml11",
     "safetyhook",
-    "mimalloc"
+    "mimalloc",
+    "catch2"
   ],
   "builtin-baseline": "4bb07a326d9b9bce3703272a509e5bc25dd9cfd5"
 }
