@@ -4568,6 +4568,622 @@ namespace Patches::FormCaching
                     }
                 }
             }
+
+            // ── Patch Q8: Bounded find loop at +0x30AAB2 ─────────────────
+            // BSTHashMap::find with sentinel at [rbx+0x118] (different
+            // layout from Q1-Q7). Second-highest fault volume during
+            // New Game — hundreds of VEH dispatches per load cycle.
+            //
+            // +0x30AAB2: cmp qword [rdx+rax*8+0x10], 0  ; bucket empty?
+            // +0x30AAB8: lea rcx, [rdx+rax*8]            ; rcx = bucket
+            // +0x30AABC: je +0x30AADC                    ; not found
+            // +0x30AABE: nop (2 bytes)
+            // +0x30AAC0: cmp [rcx], edi                  ; key match?
+            // +0x30AAC2: je +0x30AAD3                    ; found
+            // +0x30AAC4: mov rcx, [rcx+0x10]             ; next
+            // +0x30AAC8: cmp rcx, [rbx+0x118]            ; sentinel
+            // +0x30AACF: jne +0x30AAC0                   ; loop
+            // +0x30AAD1: jmp +0x30AADC                   ; not found
+            {
+                auto* site = reinterpret_cast<std::uint8_t*>(base + 0x30AAB2);
+                static const std::uint8_t verify_Q8[] = { 0x48, 0x83, 0x7C, 0xC2, 0x10, 0x00 };
+                constexpr std::uint32_t patchSize = 33;
+
+                logger::info("PatchHashChain-Q8: bytes at +0x30AAB2: "
+                    "{:02X} {:02X} {:02X} {:02X} {:02X} {:02X}",
+                    site[0], site[1], site[2], site[3], site[4], site[5]);
+
+                if (std::memcmp(site, verify_Q8, 6) != 0) {
+                    logger::error("PatchHashChain-Q8: unexpected bytes — NOT patching");
+                } else {
+                    auto returnNullAddr = static_cast<std::uint64_t>(base + 0x30AADC);
+                    auto foundAddr      = static_cast<std::uint64_t>(base + 0x30AAD3);
+
+                    auto* cave = static_cast<std::uint8_t*>(trampoline.allocate(128));
+                    int off = 0;
+
+                    // Pre-loop: cmp qword [rdx+rax*8+0x10], 0  (48 83 7C C2 10 00)
+                    cave[off++] = 0x48; cave[off++] = 0x83;
+                    cave[off++] = 0x7C; cave[off++] = 0xC2;
+                    cave[off++] = 0x10; cave[off++] = 0x00;
+                    // lea rcx, [rdx+rax*8]  (48 8D 0C C2)
+                    cave[off++] = 0x48; cave[off++] = 0x8D;
+                    cave[off++] = 0x0C; cave[off++] = 0xC2;
+                    // je return_null
+                    cave[off++] = 0x74;
+                    int jeNullFixup1 = off;
+                    cave[off++] = 0x00;
+
+                    // mov r11d, 0x10000
+                    cave[off++] = 0x41; cave[off++] = 0xBB;
+                    cave[off++] = 0x00; cave[off++] = 0x00;
+                    cave[off++] = 0x01; cave[off++] = 0x00;
+
+                    int loopTop = off;
+                    // cmp [rcx], edi  (39 39)
+                    cave[off++] = 0x39; cave[off++] = 0x39;
+                    // je found
+                    cave[off++] = 0x74;
+                    int jeFoundFixup = off;
+                    cave[off++] = 0x00;
+                    // mov rcx, [rcx+0x10]  (48 8B 49 10)
+                    cave[off++] = 0x48; cave[off++] = 0x8B;
+                    cave[off++] = 0x49; cave[off++] = 0x10;
+                    // cmp rcx, [rbx+0x118]  (48 3B 8B 18 01 00 00)
+                    cave[off++] = 0x48; cave[off++] = 0x3B;
+                    cave[off++] = 0x8B; cave[off++] = 0x18;
+                    cave[off++] = 0x01; cave[off++] = 0x00; cave[off++] = 0x00;
+                    // je return_null
+                    cave[off++] = 0x74;
+                    int jeNullFixup2 = off;
+                    cave[off++] = 0x00;
+                    // dec r11d
+                    cave[off++] = 0x41; cave[off++] = 0xFF; cave[off++] = 0xCB;
+                    // jnz loop_top
+                    cave[off++] = 0x75;
+                    int loopBackOff = off;
+                    cave[off++] = 0x00;
+                    cave[loopBackOff] = static_cast<std::uint8_t>(
+                        static_cast<std::int8_t>(loopTop - (loopBackOff + 1)));
+
+                    int returnNullStart = off;
+                    cave[jeNullFixup1] = static_cast<std::uint8_t>(returnNullStart - (jeNullFixup1 + 1));
+                    cave[jeNullFixup2] = static_cast<std::uint8_t>(returnNullStart - (jeNullFixup2 + 1));
+                    cave[off++] = 0xFF; cave[off++] = 0x25;
+                    cave[off++] = 0x00; cave[off++] = 0x00;
+                    cave[off++] = 0x00; cave[off++] = 0x00;
+                    std::memcpy(&cave[off], &returnNullAddr, 8); off += 8;
+
+                    int foundStart = off;
+                    cave[jeFoundFixup] = static_cast<std::uint8_t>(foundStart - (jeFoundFixup + 1));
+                    cave[off++] = 0xFF; cave[off++] = 0x25;
+                    cave[off++] = 0x00; cave[off++] = 0x00;
+                    cave[off++] = 0x00; cave[off++] = 0x00;
+                    std::memcpy(&cave[off], &foundAddr, 8); off += 8;
+
+                    logger::info("PatchHashChain-Q8: cave {} bytes at 0x{:X}", off,
+                        reinterpret_cast<std::uintptr_t>(cave));
+
+                    DWORD oldProt;
+                    VirtualProtect(site, patchSize, PAGE_EXECUTE_READWRITE, &oldProt);
+                    auto jmpTarget = reinterpret_cast<std::intptr_t>(cave);
+                    auto jmpFrom   = reinterpret_cast<std::intptr_t>(site + 5);
+                    auto dist = jmpTarget - jmpFrom;
+                    if (dist > INT32_MAX || dist < INT32_MIN) {
+                        logger::error("PatchHashChain-Q8: JMP too far ({}) — NOT patching", dist);
+                    } else {
+                        auto rel32 = static_cast<std::int32_t>(dist);
+                        site[0] = 0xE9;
+                        std::memcpy(&site[1], &rel32, 4);
+                        for (std::uint32_t i = 5; i < patchSize; i++) site[i] = 0x90;
+                        FlushInstructionCache(GetCurrentProcess(), site, patchSize);
+                        RegisterCavePatch(cave, off, static_cast<std::uintptr_t>(returnNullAddr),
+                            "Q8", site, patchSize);
+                        logger::info("PatchHashChain-Q8: +0x30AAB2 patched — bounded find (max 65536, sentinel [rbx+0x118])");
+                    }
+                }
+            }
+
+            // ── Patch R1: +0x2F9440 — canonical guard on form ptr deref ──
+            // Small function loads form ptr from [rcx+0x40], null-checks it,
+            // then dereferences [rax+0x1A].  Under Wine the form ptr can be
+            // non-null garbage (redirected through g_zeroPage).  Replace the
+            // entire 21-byte function with a cave that adds canonical
+            // validation before the type-check dereference.
+            //
+            // +0x2F9440: mov rax, [rcx+0x40]
+            // +0x2F9444: test rax, rax
+            // +0x2F9447: je +0x2F9452
+            // +0x2F9449: cmp byte [rax+0x1A], 0x28  ← FAULT
+            // +0x2F944D: jne +0x2F9452
+            // +0x2F944F: mov al, 1 / ret
+            // +0x2F9452: xor al, al / ret
+            {
+                auto* site = reinterpret_cast<std::uint8_t*>(base + 0x2F9440);
+                static const std::uint8_t verify_R1[] = { 0x48, 0x8B, 0x41, 0x40 };
+                constexpr std::uint32_t patchSize = 21;
+
+                logger::info("PatchR1: bytes at +0x2F9440: "
+                    "{:02X} {:02X} {:02X} {:02X}",
+                    site[0], site[1], site[2], site[3]);
+
+                if (std::memcmp(site, verify_R1, 4) != 0) {
+                    logger::error("PatchR1: unexpected bytes — NOT patching");
+                } else {
+                    auto* cave = static_cast<std::uint8_t*>(trampoline.allocate(64));
+                    int off = 0;
+
+                    // mov rax, [rcx+0x40]  (48 8B 41 40)
+                    cave[off++] = 0x48; cave[off++] = 0x8B;
+                    cave[off++] = 0x41; cave[off++] = 0x40;
+                    // test rax, rax  (48 85 C0)
+                    cave[off++] = 0x48; cave[off++] = 0x85; cave[off++] = 0xC0;
+                    // je .false
+                    cave[off++] = 0x74;
+                    int jeFalse1 = off;
+                    cave[off++] = 0x00;
+                    // Canonical check: high dword in [1, 0x7F]
+                    // mov r10, rax  (49 89 C2)
+                    cave[off++] = 0x49; cave[off++] = 0x89; cave[off++] = 0xC2;
+                    // shr r10, 32  (49 C1 EA 20)
+                    cave[off++] = 0x49; cave[off++] = 0xC1;
+                    cave[off++] = 0xEA; cave[off++] = 0x20;
+                    // dec r10d  (41 FF CA)
+                    cave[off++] = 0x41; cave[off++] = 0xFF; cave[off++] = 0xCA;
+                    // cmp r10d, 0x7F  (41 83 FA 7F)
+                    cave[off++] = 0x41; cave[off++] = 0x83;
+                    cave[off++] = 0xFA; cave[off++] = 0x7F;
+                    // ja .false
+                    cave[off++] = 0x77;
+                    int jeFalse2 = off;
+                    cave[off++] = 0x00;
+                    // cmp byte [rax+0x1A], 0x28  (80 78 1A 28)
+                    cave[off++] = 0x80; cave[off++] = 0x78;
+                    cave[off++] = 0x1A; cave[off++] = 0x28;
+                    // jne .false
+                    cave[off++] = 0x75;
+                    int jeFalse3 = off;
+                    cave[off++] = 0x00;
+                    // mov al, 1  (B0 01)
+                    cave[off++] = 0xB0; cave[off++] = 0x01;
+                    // ret  (C3)
+                    cave[off++] = 0xC3;
+                    // .false:
+                    int falseStart = off;
+                    cave[jeFalse1] = static_cast<std::uint8_t>(falseStart - (jeFalse1 + 1));
+                    cave[jeFalse2] = static_cast<std::uint8_t>(falseStart - (jeFalse2 + 1));
+                    cave[jeFalse3] = static_cast<std::uint8_t>(falseStart - (jeFalse3 + 1));
+                    // xor al, al  (30 C0)
+                    cave[off++] = 0x30; cave[off++] = 0xC0;
+                    // ret  (C3)
+                    cave[off++] = 0xC3;
+
+                    logger::info("PatchR1: cave {} bytes at 0x{:X}", off,
+                        reinterpret_cast<std::uintptr_t>(cave));
+
+                    DWORD oldProt;
+                    VirtualProtect(site, patchSize, PAGE_EXECUTE_READWRITE, &oldProt);
+                    auto jmpTarget = reinterpret_cast<std::intptr_t>(cave);
+                    auto jmpFrom   = reinterpret_cast<std::intptr_t>(site + 5);
+                    auto dist = jmpTarget - jmpFrom;
+                    if (dist > INT32_MAX || dist < INT32_MIN) {
+                        logger::error("PatchR1: JMP too far ({}) — NOT patching", dist);
+                    } else {
+                        auto rel32 = static_cast<std::int32_t>(dist);
+                        site[0] = 0xE9;
+                        std::memcpy(&site[1], &rel32, 4);
+                        for (std::uint32_t i = 5; i < patchSize; i++) site[i] = 0x90;
+                        FlushInstructionCache(GetCurrentProcess(), site, patchSize);
+                        std::uint64_t falseAddr = static_cast<std::uint64_t>(base + 0x2F9452);
+                        RegisterCavePatch(cave, off, static_cast<std::uintptr_t>(falseAddr),
+                            "R1", site, patchSize);
+                        logger::info("PatchR1: +0x2F9440 patched — canonical guard on form type check");
+                    }
+                }
+            }
+
+            // ── Patch R2: +0x44150C — null guard on object→form deref ────
+            // +0x44150C: mov rcx, [rbx]        ; load object ptr
+            // +0x44150F: mov rax, [rcx+0x40]   ; load form ptr ← FAULT
+            // Cave validates rcx before the second load; if invalid, skip
+            // to +0x4415B0 (the existing bail-out block).
+            {
+                auto* site = reinterpret_cast<std::uint8_t*>(base + 0x44150C);
+                static const std::uint8_t verify_R2[] = { 0x48, 0x8B, 0x0B };
+                constexpr std::uint32_t patchSize = 7;
+
+                logger::info("PatchR2: bytes at +0x44150C: "
+                    "{:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X}",
+                    site[0], site[1], site[2], site[3], site[4], site[5], site[6]);
+
+                if (std::memcmp(site, verify_R2, 3) != 0) {
+                    logger::error("PatchR2: unexpected bytes — NOT patching");
+                } else {
+                    auto continueAddr = static_cast<std::uint64_t>(base + 0x441513);
+                    auto skipAddr     = static_cast<std::uint64_t>(base + 0x4415B0);
+
+                    auto* cave = static_cast<std::uint8_t*>(trampoline.allocate(64));
+                    int off = 0;
+
+                    // mov rcx, [rbx]  (48 8B 0B)
+                    cave[off++] = 0x48; cave[off++] = 0x8B; cave[off++] = 0x0B;
+                    // test rcx, rcx  (48 85 C9)
+                    cave[off++] = 0x48; cave[off++] = 0x85; cave[off++] = 0xC9;
+                    // je .skip
+                    cave[off++] = 0x74;
+                    int jeSkip1 = off;
+                    cave[off++] = 0x00;
+                    // Canonical: mov r10, rcx / shr r10, 32 / dec r10d / cmp r10d, 0x7F / ja .skip
+                    cave[off++] = 0x49; cave[off++] = 0x89; cave[off++] = 0xCA; // mov r10, rcx
+                    cave[off++] = 0x49; cave[off++] = 0xC1; cave[off++] = 0xEA; cave[off++] = 0x20; // shr r10, 32
+                    cave[off++] = 0x41; cave[off++] = 0xFF; cave[off++] = 0xCA; // dec r10d
+                    cave[off++] = 0x41; cave[off++] = 0x83; cave[off++] = 0xFA; cave[off++] = 0x7F; // cmp r10d, 0x7F
+                    cave[off++] = 0x77; // ja .skip
+                    int jaSkip2 = off;
+                    cave[off++] = 0x00;
+                    // mov rax, [rcx+0x40]  (48 8B 41 40)
+                    cave[off++] = 0x48; cave[off++] = 0x8B;
+                    cave[off++] = 0x41; cave[off++] = 0x40;
+                    // jmp [rip+0] → continue
+                    cave[off++] = 0xFF; cave[off++] = 0x25;
+                    cave[off++] = 0x00; cave[off++] = 0x00;
+                    cave[off++] = 0x00; cave[off++] = 0x00;
+                    std::memcpy(&cave[off], &continueAddr, 8); off += 8;
+
+                    int skipStart = off;
+                    cave[jeSkip1] = static_cast<std::uint8_t>(skipStart - (jeSkip1 + 1));
+                    cave[jaSkip2] = static_cast<std::uint8_t>(skipStart - (jaSkip2 + 1));
+                    cave[off++] = 0xFF; cave[off++] = 0x25;
+                    cave[off++] = 0x00; cave[off++] = 0x00;
+                    cave[off++] = 0x00; cave[off++] = 0x00;
+                    std::memcpy(&cave[off], &skipAddr, 8); off += 8;
+
+                    logger::info("PatchR2: cave {} bytes at 0x{:X}", off,
+                        reinterpret_cast<std::uintptr_t>(cave));
+
+                    DWORD oldProt;
+                    VirtualProtect(site, patchSize, PAGE_EXECUTE_READWRITE, &oldProt);
+                    auto jmpTarget = reinterpret_cast<std::intptr_t>(cave);
+                    auto jmpFrom   = reinterpret_cast<std::intptr_t>(site + 5);
+                    auto dist = jmpTarget - jmpFrom;
+                    if (dist > INT32_MAX || dist < INT32_MIN) {
+                        logger::error("PatchR2: JMP too far ({}) — NOT patching", dist);
+                    } else {
+                        auto rel32 = static_cast<std::int32_t>(dist);
+                        site[0] = 0xE9;
+                        std::memcpy(&site[1], &rel32, 4);
+                        for (std::uint32_t i = 5; i < patchSize; i++) site[i] = 0x90;
+                        FlushInstructionCache(GetCurrentProcess(), site, patchSize);
+                        RegisterCavePatch(cave, off, static_cast<std::uintptr_t>(skipAddr),
+                            "R2", site, patchSize);
+                        logger::info("PatchR2: +0x44150C patched — canonical guard on [rcx+0x40]");
+                    }
+                }
+            }
+
+            // ── Patch R3: +0x49CAED — canonical guard on refcount inc ────
+            // +0x49CAED: test rax, rax
+            // +0x49CAF0: je +0x49CAFA
+            // +0x49CAF2: lock inc [rax+0x28]  ← FAULT (rax non-null garbage)
+            // The existing null check passes but the pointer is invalid
+            // (Wine/g_zeroPage redirect artifact). Add canonical validation.
+            {
+                auto* site = reinterpret_cast<std::uint8_t*>(base + 0x49CAED);
+                static const std::uint8_t verify_R3[] = { 0x48, 0x85, 0xC0 };
+                constexpr std::uint32_t patchSize = 9;
+
+                logger::info("PatchR3: bytes at +0x49CAED: "
+                    "{:02X} {:02X} {:02X} {:02X} {:02X}",
+                    site[0], site[1], site[2], site[3], site[4]);
+
+                if (std::memcmp(site, verify_R3, 3) != 0) {
+                    logger::error("PatchR3: unexpected bytes — NOT patching");
+                } else {
+                    auto continueAddr = static_cast<std::uint64_t>(base + 0x49CAF6);
+                    auto skipAddr     = static_cast<std::uint64_t>(base + 0x49CAFA);
+
+                    auto* cave = static_cast<std::uint8_t*>(trampoline.allocate(64));
+                    int off = 0;
+
+                    // test rax, rax  (48 85 C0)
+                    cave[off++] = 0x48; cave[off++] = 0x85; cave[off++] = 0xC0;
+                    // je .skip
+                    cave[off++] = 0x74;
+                    int jeSkip1 = off;
+                    cave[off++] = 0x00;
+                    // Canonical: mov r10, rax / shr r10, 32 / dec r10d / cmp r10d, 0x7F / ja .skip
+                    cave[off++] = 0x49; cave[off++] = 0x89; cave[off++] = 0xC2;
+                    cave[off++] = 0x49; cave[off++] = 0xC1; cave[off++] = 0xEA; cave[off++] = 0x20;
+                    cave[off++] = 0x41; cave[off++] = 0xFF; cave[off++] = 0xCA;
+                    cave[off++] = 0x41; cave[off++] = 0x83; cave[off++] = 0xFA; cave[off++] = 0x7F;
+                    cave[off++] = 0x77;
+                    int jaSkip2 = off;
+                    cave[off++] = 0x00;
+                    // lock inc dword [rax+0x28]  (F0 FF 40 28)
+                    cave[off++] = 0xF0; cave[off++] = 0xFF;
+                    cave[off++] = 0x40; cave[off++] = 0x28;
+                    // jmp [rip+0] → continue (after lock inc)
+                    cave[off++] = 0xFF; cave[off++] = 0x25;
+                    cave[off++] = 0x00; cave[off++] = 0x00;
+                    cave[off++] = 0x00; cave[off++] = 0x00;
+                    std::memcpy(&cave[off], &continueAddr, 8); off += 8;
+
+                    int skipStart = off;
+                    cave[jeSkip1] = static_cast<std::uint8_t>(skipStart - (jeSkip1 + 1));
+                    cave[jaSkip2] = static_cast<std::uint8_t>(skipStart - (jaSkip2 + 1));
+                    cave[off++] = 0xFF; cave[off++] = 0x25;
+                    cave[off++] = 0x00; cave[off++] = 0x00;
+                    cave[off++] = 0x00; cave[off++] = 0x00;
+                    std::memcpy(&cave[off], &skipAddr, 8); off += 8;
+
+                    logger::info("PatchR3: cave {} bytes at 0x{:X}", off,
+                        reinterpret_cast<std::uintptr_t>(cave));
+
+                    DWORD oldProt;
+                    VirtualProtect(site, patchSize, PAGE_EXECUTE_READWRITE, &oldProt);
+                    auto jmpTarget = reinterpret_cast<std::intptr_t>(cave);
+                    auto jmpFrom   = reinterpret_cast<std::intptr_t>(site + 5);
+                    auto dist = jmpTarget - jmpFrom;
+                    if (dist > INT32_MAX || dist < INT32_MIN) {
+                        logger::error("PatchR3: JMP too far ({}) — NOT patching", dist);
+                    } else {
+                        auto rel32 = static_cast<std::int32_t>(dist);
+                        site[0] = 0xE9;
+                        std::memcpy(&site[1], &rel32, 4);
+                        for (std::uint32_t i = 5; i < patchSize; i++) site[i] = 0x90;
+                        FlushInstructionCache(GetCurrentProcess(), site, patchSize);
+                        RegisterCavePatch(cave, off, static_cast<std::uintptr_t>(skipAddr),
+                            "R3", site, patchSize);
+                        logger::info("PatchR3: +0x49CAED patched — canonical guard on refcount inc");
+                    }
+                }
+            }
+
+            // ── Patch R4: +0x49CB2B — canonical guard on refcount dec ────
+            // +0x49CB2B: lea rcx, [rax+0x20]
+            // +0x49CB2F: mov ebx, 0xFFFFFFFF
+            // +0x49CB34: lock xadd [rcx+8], ebx  ← FAULT (rax garbage)
+            // Skip entire refcount decrement if rax is invalid.
+            {
+                auto* site = reinterpret_cast<std::uint8_t*>(base + 0x49CB2B);
+                static const std::uint8_t verify_R4[] = { 0x48, 0x8D, 0x48, 0x20 };
+                constexpr std::uint32_t patchSize = 14;
+
+                logger::info("PatchR4: bytes at +0x49CB2B: "
+                    "{:02X} {:02X} {:02X} {:02X}",
+                    site[0], site[1], site[2], site[3]);
+
+                if (std::memcmp(site, verify_R4, 4) != 0) {
+                    logger::error("PatchR4: unexpected bytes — NOT patching");
+                } else {
+                    auto continueAddr = static_cast<std::uint64_t>(base + 0x49CB39);
+                    auto skipAddr     = static_cast<std::uint64_t>(base + 0x49CB4A);
+
+                    auto* cave = static_cast<std::uint8_t*>(trampoline.allocate(80));
+                    int off = 0;
+
+                    // test rax, rax  (48 85 C0)
+                    cave[off++] = 0x48; cave[off++] = 0x85; cave[off++] = 0xC0;
+                    // je .skip
+                    cave[off++] = 0x74;
+                    int jeSkip1 = off;
+                    cave[off++] = 0x00;
+                    // Canonical check
+                    cave[off++] = 0x49; cave[off++] = 0x89; cave[off++] = 0xC2; // mov r10, rax
+                    cave[off++] = 0x49; cave[off++] = 0xC1; cave[off++] = 0xEA; cave[off++] = 0x20; // shr r10, 32
+                    cave[off++] = 0x41; cave[off++] = 0xFF; cave[off++] = 0xCA; // dec r10d
+                    cave[off++] = 0x41; cave[off++] = 0x83; cave[off++] = 0xFA; cave[off++] = 0x7F; // cmp r10d, 0x7F
+                    cave[off++] = 0x77; // ja .skip
+                    int jaSkip2 = off;
+                    cave[off++] = 0x00;
+                    // lea rcx, [rax+0x20]  (48 8D 48 20)
+                    cave[off++] = 0x48; cave[off++] = 0x8D;
+                    cave[off++] = 0x48; cave[off++] = 0x20;
+                    // mov ebx, 0xFFFFFFFF  (BB FF FF FF FF)
+                    cave[off++] = 0xBB; cave[off++] = 0xFF;
+                    cave[off++] = 0xFF; cave[off++] = 0xFF; cave[off++] = 0xFF;
+                    // lock xadd [rcx+8], ebx  (F0 0F C1 59 08)
+                    cave[off++] = 0xF0; cave[off++] = 0x0F;
+                    cave[off++] = 0xC1; cave[off++] = 0x59; cave[off++] = 0x08;
+                    // jmp [rip+0] → continue
+                    cave[off++] = 0xFF; cave[off++] = 0x25;
+                    cave[off++] = 0x00; cave[off++] = 0x00;
+                    cave[off++] = 0x00; cave[off++] = 0x00;
+                    std::memcpy(&cave[off], &continueAddr, 8); off += 8;
+
+                    int skipStart = off;
+                    cave[jeSkip1] = static_cast<std::uint8_t>(skipStart - (jeSkip1 + 1));
+                    cave[jaSkip2] = static_cast<std::uint8_t>(skipStart - (jaSkip2 + 1));
+                    cave[off++] = 0xFF; cave[off++] = 0x25;
+                    cave[off++] = 0x00; cave[off++] = 0x00;
+                    cave[off++] = 0x00; cave[off++] = 0x00;
+                    std::memcpy(&cave[off], &skipAddr, 8); off += 8;
+
+                    logger::info("PatchR4: cave {} bytes at 0x{:X}", off,
+                        reinterpret_cast<std::uintptr_t>(cave));
+
+                    DWORD oldProt;
+                    VirtualProtect(site, patchSize, PAGE_EXECUTE_READWRITE, &oldProt);
+                    auto jmpTarget = reinterpret_cast<std::intptr_t>(cave);
+                    auto jmpFrom   = reinterpret_cast<std::intptr_t>(site + 5);
+                    auto dist = jmpTarget - jmpFrom;
+                    if (dist > INT32_MAX || dist < INT32_MIN) {
+                        logger::error("PatchR4: JMP too far ({}) — NOT patching", dist);
+                    } else {
+                        auto rel32 = static_cast<std::int32_t>(dist);
+                        site[0] = 0xE9;
+                        std::memcpy(&site[1], &rel32, 4);
+                        for (std::uint32_t i = 5; i < patchSize; i++) site[i] = 0x90;
+                        FlushInstructionCache(GetCurrentProcess(), site, patchSize);
+                        RegisterCavePatch(cave, off, static_cast<std::uintptr_t>(skipAddr),
+                            "R4", site, patchSize);
+                        logger::info("PatchR4: +0x49CB2B patched — canonical guard on refcount dec");
+                    }
+                }
+            }
+
+            // ── Patch R5: +0x2EFAC9 — canonical guard on flags deref ─────
+            // +0x2EFAC9: test rcx, rcx
+            // +0x2EFACC: je +0x2EFAE8
+            // +0x2EFACE: test dword [rcx+0x28], 0x3FF  ← FAULT
+            // Existing null check passes but rcx is non-null garbage.
+            // Cave adds canonical validation, then executes the test dword
+            // and jumps back to the jne at +0x2EFAD5 (flags preserved).
+            {
+                auto* site = reinterpret_cast<std::uint8_t*>(base + 0x2EFAC9);
+                static const std::uint8_t verify_R5[] = { 0x48, 0x85, 0xC9 };
+                constexpr std::uint32_t patchSize = 12;
+
+                logger::info("PatchR5: bytes at +0x2EFAC9: "
+                    "{:02X} {:02X} {:02X} {:02X} {:02X}",
+                    site[0], site[1], site[2], site[3], site[4]);
+
+                if (std::memcmp(site, verify_R5, 3) != 0) {
+                    logger::error("PatchR5: unexpected bytes — NOT patching");
+                } else {
+                    auto continueAddr = static_cast<std::uint64_t>(base + 0x2EFAD5);
+                    auto skipAddr     = static_cast<std::uint64_t>(base + 0x2EFAE8);
+
+                    auto* cave = static_cast<std::uint8_t*>(trampoline.allocate(80));
+                    int off = 0;
+
+                    // test rcx, rcx  (48 85 C9)
+                    cave[off++] = 0x48; cave[off++] = 0x85; cave[off++] = 0xC9;
+                    // je .skip
+                    cave[off++] = 0x74;
+                    int jeSkip1 = off;
+                    cave[off++] = 0x00;
+                    // Canonical check on rcx
+                    cave[off++] = 0x49; cave[off++] = 0x89; cave[off++] = 0xCA; // mov r10, rcx
+                    cave[off++] = 0x49; cave[off++] = 0xC1; cave[off++] = 0xEA; cave[off++] = 0x20; // shr r10, 32
+                    cave[off++] = 0x41; cave[off++] = 0xFF; cave[off++] = 0xCA; // dec r10d
+                    cave[off++] = 0x41; cave[off++] = 0x83; cave[off++] = 0xFA; cave[off++] = 0x7F; // cmp r10d, 0x7F
+                    cave[off++] = 0x77; // ja .skip
+                    int jaSkip2 = off;
+                    cave[off++] = 0x00;
+                    // test dword [rcx+0x28], 0x3FF  (F7 41 28 FF 03 00 00)
+                    cave[off++] = 0xF7; cave[off++] = 0x41;
+                    cave[off++] = 0x28; cave[off++] = 0xFF;
+                    cave[off++] = 0x03; cave[off++] = 0x00; cave[off++] = 0x00;
+                    // jmp [rip+0] → +0x2EFAD5 (jne uses FLAGS from test above)
+                    cave[off++] = 0xFF; cave[off++] = 0x25;
+                    cave[off++] = 0x00; cave[off++] = 0x00;
+                    cave[off++] = 0x00; cave[off++] = 0x00;
+                    std::memcpy(&cave[off], &continueAddr, 8); off += 8;
+
+                    int skipStart = off;
+                    cave[jeSkip1] = static_cast<std::uint8_t>(skipStart - (jeSkip1 + 1));
+                    cave[jaSkip2] = static_cast<std::uint8_t>(skipStart - (jaSkip2 + 1));
+                    cave[off++] = 0xFF; cave[off++] = 0x25;
+                    cave[off++] = 0x00; cave[off++] = 0x00;
+                    cave[off++] = 0x00; cave[off++] = 0x00;
+                    std::memcpy(&cave[off], &skipAddr, 8); off += 8;
+
+                    logger::info("PatchR5: cave {} bytes at 0x{:X}", off,
+                        reinterpret_cast<std::uintptr_t>(cave));
+
+                    DWORD oldProt;
+                    VirtualProtect(site, patchSize, PAGE_EXECUTE_READWRITE, &oldProt);
+                    auto jmpTarget = reinterpret_cast<std::intptr_t>(cave);
+                    auto jmpFrom   = reinterpret_cast<std::intptr_t>(site + 5);
+                    auto dist = jmpTarget - jmpFrom;
+                    if (dist > INT32_MAX || dist < INT32_MIN) {
+                        logger::error("PatchR5: JMP too far ({}) — NOT patching", dist);
+                    } else {
+                        auto rel32 = static_cast<std::int32_t>(dist);
+                        site[0] = 0xE9;
+                        std::memcpy(&site[1], &rel32, 4);
+                        for (std::uint32_t i = 5; i < patchSize; i++) site[i] = 0x90;
+                        FlushInstructionCache(GetCurrentProcess(), site, patchSize);
+                        RegisterCavePatch(cave, off, static_cast<std::uintptr_t>(skipAddr),
+                            "R5", site, patchSize);
+                        logger::info("PatchR5: +0x2EFAC9 patched — canonical guard on flags deref");
+                    }
+                }
+            }
+
+            // ── Patch R6: +0x2D0C33 — canonical guard on struct field sub ─
+            // +0x2D0C33: mov eax, [rsi+0x94]
+            // +0x2D0C39: sub eax, [rsi+0x98]  ← FAULT
+            // RSI is a struct pointer that can be garbage under Wine.
+            // Cave validates rsi, executes both loads, then jumps to the
+            // cmp at +0x2D0C3F. On invalid rsi, skips to +0x2D0C53.
+            {
+                auto* site = reinterpret_cast<std::uint8_t*>(base + 0x2D0C33);
+                static const std::uint8_t verify_R6[] = { 0x8B, 0x86, 0x94, 0x00, 0x00, 0x00 };
+                constexpr std::uint32_t patchSize = 12;
+
+                logger::info("PatchR6: bytes at +0x2D0C33: "
+                    "{:02X} {:02X} {:02X} {:02X} {:02X} {:02X}",
+                    site[0], site[1], site[2], site[3], site[4], site[5]);
+
+                if (std::memcmp(site, verify_R6, 6) != 0) {
+                    logger::error("PatchR6: unexpected bytes — NOT patching");
+                } else {
+                    auto continueAddr = static_cast<std::uint64_t>(base + 0x2D0C3F);
+                    auto skipAddr     = static_cast<std::uint64_t>(base + 0x2D0C53);
+
+                    auto* cave = static_cast<std::uint8_t*>(trampoline.allocate(80));
+                    int off = 0;
+
+                    // test rsi, rsi  (48 85 F6)
+                    cave[off++] = 0x48; cave[off++] = 0x85; cave[off++] = 0xF6;
+                    // je .skip
+                    cave[off++] = 0x74;
+                    int jeSkip1 = off;
+                    cave[off++] = 0x00;
+                    // Canonical check on rsi
+                    cave[off++] = 0x49; cave[off++] = 0x89; cave[off++] = 0xF2; // mov r10, rsi
+                    cave[off++] = 0x49; cave[off++] = 0xC1; cave[off++] = 0xEA; cave[off++] = 0x20; // shr r10, 32
+                    cave[off++] = 0x41; cave[off++] = 0xFF; cave[off++] = 0xCA; // dec r10d
+                    cave[off++] = 0x41; cave[off++] = 0x83; cave[off++] = 0xFA; cave[off++] = 0x7F; // cmp r10d, 0x7F
+                    cave[off++] = 0x77; // ja .skip
+                    int jaSkip2 = off;
+                    cave[off++] = 0x00;
+                    // mov eax, [rsi+0x94]  (8B 86 94 00 00 00)
+                    cave[off++] = 0x8B; cave[off++] = 0x86;
+                    cave[off++] = 0x94; cave[off++] = 0x00;
+                    cave[off++] = 0x00; cave[off++] = 0x00;
+                    // sub eax, [rsi+0x98]  (2B 86 98 00 00 00)
+                    cave[off++] = 0x2B; cave[off++] = 0x86;
+                    cave[off++] = 0x98; cave[off++] = 0x00;
+                    cave[off++] = 0x00; cave[off++] = 0x00;
+                    // jmp [rip+0] → +0x2D0C3F (continue with cmp eax, 1)
+                    cave[off++] = 0xFF; cave[off++] = 0x25;
+                    cave[off++] = 0x00; cave[off++] = 0x00;
+                    cave[off++] = 0x00; cave[off++] = 0x00;
+                    std::memcpy(&cave[off], &continueAddr, 8); off += 8;
+
+                    int skipStart = off;
+                    cave[jeSkip1] = static_cast<std::uint8_t>(skipStart - (jeSkip1 + 1));
+                    cave[jaSkip2] = static_cast<std::uint8_t>(skipStart - (jaSkip2 + 1));
+                    cave[off++] = 0xFF; cave[off++] = 0x25;
+                    cave[off++] = 0x00; cave[off++] = 0x00;
+                    cave[off++] = 0x00; cave[off++] = 0x00;
+                    std::memcpy(&cave[off], &skipAddr, 8); off += 8;
+
+                    logger::info("PatchR6: cave {} bytes at 0x{:X}", off,
+                        reinterpret_cast<std::uintptr_t>(cave));
+
+                    DWORD oldProt;
+                    VirtualProtect(site, patchSize, PAGE_EXECUTE_READWRITE, &oldProt);
+                    auto jmpTarget = reinterpret_cast<std::intptr_t>(cave);
+                    auto jmpFrom   = reinterpret_cast<std::intptr_t>(site + 5);
+                    auto dist = jmpTarget - jmpFrom;
+                    if (dist > INT32_MAX || dist < INT32_MIN) {
+                        logger::error("PatchR6: JMP too far ({}) — NOT patching", dist);
+                    } else {
+                        auto rel32 = static_cast<std::int32_t>(dist);
+                        site[0] = 0xE9;
+                        std::memcpy(&site[1], &rel32, 4);
+                        for (std::uint32_t i = 5; i < patchSize; i++) site[i] = 0x90;
+                        FlushInstructionCache(GetCurrentProcess(), site, patchSize);
+                        RegisterCavePatch(cave, off, static_cast<std::uintptr_t>(skipAddr),
+                            "R6", site, patchSize);
+                        logger::info("PatchR6: +0x2D0C33 patched — canonical guard on struct field sub");
+                    }
+                }
+            }
 #endif
         }
 
