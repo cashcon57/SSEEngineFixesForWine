@@ -6,6 +6,10 @@ namespace Patches::FormCaching
 {
     namespace detail
     {
+        // Forward declaration — defined in form_caching_hooks.h.
+        // VEH handlers call this to resolve form IDs found in registers.
+        inline RE::TESForm* TESForm_GetFormByNumericId(RE::FormID a_formId);
+
         // ================================================================
         // v1.22.31: x86-64 instruction length decoder.
         // Used by ForceLoadVEH and FormReferenceFixupVEH to advance RIP
