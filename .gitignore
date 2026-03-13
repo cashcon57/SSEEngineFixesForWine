@@ -21,6 +21,9 @@ vcpkg_installed/
 .DS_Store
 Thumbs.db
 
+# Misc
+.vite/
+
 # Compiled
 *.obj
 *.pdb

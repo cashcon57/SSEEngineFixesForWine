@@ -127,9 +127,9 @@ bWaterflowAnimation = true
 fWaterflowSpeed = 20.0
 
 [Memory]
-# Replace the engine's memory allocator with Wine-compatible HeapAlloc.
+# Replace the engine's memory allocator with Wine-compatible mimalloc (mi_zalloc).
 # The original SSE Engine Fixes uses Intel TBB which crashes under Wine.
-# This provides an unlimited-size growable heap via the Windows API.
+# mimalloc uses per-thread caches and avoids global lock contention.
 # Essential for large mod lists (1000+ plugins) that exhaust the default heap.
 bReplaceAllocator = true
 # Expand the per-thread ScrapHeap reserve from 64MB to the value below.
@@ -146,9 +146,9 @@ bPrecomputedPathHasErrors = true
 # Warn when approaching reference handle limit
 bRefHandleLimit = true
 # Reference handle warning threshold at main menu
-bRefrMainMenuLimit = 800000
+uRefrMainMenuLimit = 800000
 # Reference handle warning threshold in loaded game
-bRefrLoadedGameLimit = 1000000
+uRefrLoadedGameLimit = 1000000
 
 [Debug]
 # Print detailed precomputed path information

@@ -41,6 +41,7 @@ set(headers ${headers}
 	src/fixes/tree_reflections.h
 	src/fixes/vertical_look_sensitivity.h
 	src/fixes/weapon_block_scaling.h
+	src/fixes/wine_null_actor_base_crash.h
 	src/patches/disable_chargen_precache.h
 	src/patches/disable_snow_flag.h
 	src/patches/editor_id_cache.h

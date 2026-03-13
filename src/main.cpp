@@ -73,8 +73,8 @@ void MessageHandler(SKSE::MessagingInterface::Message* a_msg)
 
                 // v1.22.96: Diagnostic — verify sentinel state at kDataLoaded
                 logger::info("v1.22.96: sentinel={} grows={} zeroPage=0x{:X} zp+0x10=0x{:X}",
-                    Patches::FormCaching::detail::g_bstSentinel ?
-                        fmt::format("0x{:X}", reinterpret_cast<std::uintptr_t>(Patches::FormCaching::detail::g_bstSentinel)) : "null",
+                    Patches::FormCaching::detail::g_bstSentinel.load(std::memory_order_acquire) ?
+                        fmt::format("0x{:X}", reinterpret_cast<std::uintptr_t>(Patches::FormCaching::detail::g_bstSentinel.load(std::memory_order_relaxed))) : "null",
                     Patches::FormCaching::detail::g_growCallCount.load(std::memory_order_relaxed),
                     Patches::FormCaching::detail::g_zeroPage ?
                         reinterpret_cast<std::uintptr_t>(Patches::FormCaching::detail::g_zeroPage) : 0,
@@ -160,7 +160,7 @@ void MessageHandler(SKSE::MessagingInterface::Message* a_msg)
                         (unsigned long long)Patches::FormCaching::detail::g_setAtCallCount.load(std::memory_order_relaxed),
                         (unsigned long long)Patches::FormCaching::detail::g_growCallCount.load(std::memory_order_relaxed),
                         Patches::FormCaching::detail::g_cacheAuthoritative.load(std::memory_order_relaxed) ? 1 : 0,
-                        Patches::FormCaching::detail::g_bstSentinel);
+                        Patches::FormCaching::detail::g_bstSentinel.load(std::memory_order_relaxed));
                     fflush(f);
                     fclose(f);
                 }
@@ -180,9 +180,9 @@ void MessageHandler(SKSE::MessagingInterface::Message* a_msg)
                     DWORD oldProt;
                     if (VirtualProtect(site, 1, PAGE_EXECUTE_READWRITE, &oldProt)) {
                         Patches::FormCaching::detail::g_probes[i].origByte = *site;
-                        *site = 0xCC;  // INT3
-                        FlushInstructionCache(GetCurrentProcess(), site, 1);
                         Patches::FormCaching::detail::g_probes[i].active.store(true, std::memory_order_release);
+                        *site = 0xCC;  // INT3 — VEH already recognizes this probe
+                        FlushInstructionCache(GetCurrentProcess(), site, 1);
                         installed++;
                     }
                 }
@@ -246,7 +246,7 @@ void OpenLog()
 #ifdef SKYRIM_AE
 extern "C" __declspec(dllexport) constinit auto SKSEPlugin_Version = []() {
     SKSE::PluginVersionData v;
-    v.PluginVersion(Version::MAJOR);
+    v.PluginVersion({ Version::MAJOR, Version::MINOR, Version::PATCH, 0 });
     v.PluginName(Version::PROJECT);
     v.AuthorName("Corkscrew");
     v.UsesAddressLibrary();
@@ -260,7 +260,7 @@ extern "C" __declspec(dllexport) bool SKSEAPI SKSEPlugin_Query(const SKSE::Query
 {
     a_info->infoVersion = SKSE::PluginInfo::kVersion;
     a_info->name = Version::PROJECT.data();
-    a_info->version = Version::MAJOR;
+    a_info->version = Version::MAJOR * 10000 + Version::MINOR * 100 + Version::PATCH;
 
     return true;
 }
@@ -285,7 +285,7 @@ extern "C" __declspec(dllexport) bool SKSEAPI SKSEPlugin_Load(const SKSE::LoadIn
     }
 
     auto& trampoline = SKSE::GetTrampoline();
-    trampoline.create(1 << 13);  // 8KB — needed for 13+ code caves + other patches
+    trampoline.create(1 << 13);  // 8KB — needed for 30+ code caves + other patches
 
     Settings::Load();
 

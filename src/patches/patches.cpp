@@ -1,5 +1,7 @@
 #include "patches.h"
 
+#include <cmath>
+
 #include "disable_chargen_precache.h"
 #include "suppress_address_library_dialog.h"
 #include "disable_snow_flag.h"
@@ -56,13 +58,13 @@ namespace Patches
         if (Settings::Patches::bSaveAddedSoundCategories.GetValue())
             SaveAddedSoundCategories::Install();
 
-        if (Settings::Patches::iSaveGameMaxSize.GetValue() != 64)
+        if (Settings::Patches::iSaveGameMaxSize.GetValue() != 128)
             SaveGameMaxSize::Install();
 
         if (Settings::Patches::bScrollingDoesntSwitchPOV.GetValue())
             ScrollingDoesntSwitchPOV::Install();
 
-        if (Settings::Patches::fSleepWaitTimeModifier.GetValue() != 1.0f)
+        if (std::abs(Settings::Patches::fSleepWaitTimeModifier.GetValue() - 1.0f) > 0.001f)
             SleepWaitTime::Install();
 
         if (Settings::Patches::bFormCaching.GetValue() && Settings::Patches::bTreeLodReferenceCaching.GetValue())

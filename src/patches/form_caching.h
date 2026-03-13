@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdarg>
+#include <cstdio>
 #include <cstring>
 #include <map>
 #include <set>
@@ -110,8 +112,6 @@ namespace Patches::FormCaching
         inline DWORD64 g_mainThreadStackBase = 0;   // high address (TEB+0x08)
         inline DWORD64 g_mainThreadStackLimit = 0;   // low address (TEB+0x10)
         inline DWORD64 g_mainThreadLastRsp = 0;       // from last successful GetThreadContext
-        // Legacy sentinel (kept for FormReferenceFixupVEH compatibility)
-        alignas(64) inline std::uint8_t g_sentinelForm[0x400] = {};
         inline std::atomic<std::uint64_t> g_sentinelUseCount{ 0 };
 
         // v1.22.51: Persistent VEH handles — stored for potential cleanup.
@@ -149,19 +149,23 @@ namespace Patches::FormCaching
                                       std::uint8_t* patchSite = nullptr, int patchSize = 0)
         {
             constexpr int kMaxCavePatches = static_cast<int>(sizeof(g_cavePatches) / sizeof(g_cavePatches[0]));
+            // Atomically claim a slot via CAS — safe even if called concurrently
             int idx = g_numCavePatches.load(std::memory_order_relaxed);
-            if (idx < kMaxCavePatches) {
-                g_cavePatches[idx].caveStart = reinterpret_cast<std::uintptr_t>(caveStart);
-                g_cavePatches[idx].caveEnd = reinterpret_cast<std::uintptr_t>(caveStart) + caveSize;
-                g_cavePatches[idx].nullReturnAddr = nullReturnAddr;
-                g_cavePatches[idx].name = name;
-                g_cavePatches[idx].patchSite = patchSite;
-                g_cavePatches[idx].patchSize = patchSize;
-                g_numCavePatches.store(idx + 1, std::memory_order_release);
-            } else {
+            while (idx < kMaxCavePatches) {
+                if (g_numCavePatches.compare_exchange_weak(idx, idx + 1, std::memory_order_acq_rel))
+                    break;
+            }
+            if (idx >= kMaxCavePatches) {
                 logger::error("RegisterCavePatch: OVERFLOW — {} not registered (idx={}, max={})",
                     name, idx, kMaxCavePatches);
+                return;
             }
+            g_cavePatches[idx].caveStart = reinterpret_cast<std::uintptr_t>(caveStart);
+            g_cavePatches[idx].caveEnd = reinterpret_cast<std::uintptr_t>(caveStart) + caveSize;
+            g_cavePatches[idx].nullReturnAddr = nullReturnAddr;
+            g_cavePatches[idx].name = name;
+            g_cavePatches[idx].patchSite = patchSite;
+            g_cavePatches[idx].patchSize = patchSize;
         }
 
         // v1.22.76: INT3 probing for freeze detection.
@@ -202,7 +206,7 @@ namespace Patches::FormCaching
         // +0x10/+0x28 so that when VEH CASE 1 redirects a null chain
         // follow to g_zeroPage, the find loop reads sentinel from
         // [g_zeroPage+0x10] → sentinel comparison matches → loop exits.
-        inline void* g_bstSentinel = nullptr;
+        inline std::atomic<void*> g_bstSentinel{nullptr};
         inline std::atomic<std::uint64_t> g_growCallCount{ 0 };
 
         // v1.22.85: Lazy cache invalidation for New Game (DISABLED in v1.22.86).
@@ -211,6 +215,10 @@ namespace Patches::FormCaching
         // native map, causing the freeze.
         inline std::atomic<bool> g_needsCacheClear{false};
 
+        // v1.22.97: Guard flag to prevent VEH/watchdog from tearing g_zeroPage
+        // concurrently. Best-effort: VEH cannot take a mutex.
+        inline std::atomic<bool> g_sentinelRepairInProgress{false};
+
         // v1.22.77: Sentinel repair helper — zeroes first 0x500 bytes and
         // restores vtable, kDeleted flag, and stub function pointer.
         // Called from VEH redirect paths to prevent corrupted sentinel data
@@ -218,6 +226,9 @@ namespace Patches::FormCaching
         inline void RepairSentinel()
         {
             if (!g_zeroPage) return;
+            // Best-effort guard: skip if another thread is already repairing
+            if (g_sentinelRepairInProgress.exchange(true, std::memory_order_acquire))
+                return;
             auto* page = reinterpret_cast<std::uint8_t*>(g_zeroPage);
             memset(page, 0, 0x500);
             if (g_stubVtable) {
@@ -228,8 +239,9 @@ namespace Patches::FormCaching
             // formFlags=0x20. This breaks the VEH chain-follow infinite loop:
             // VEH redirects null → zeroPage, find loop reads [zeroPage+0x10],
             // gets sentinel → cmp matches → loop exits cleanly.
-            if (g_bstSentinel) {
-                auto sentAddr = reinterpret_cast<DWORD64>(g_bstSentinel);
+            auto* sentinel = g_bstSentinel.load(std::memory_order_acquire);
+            if (sentinel) {
+                auto sentAddr = reinterpret_cast<DWORD64>(sentinel);
                 memcpy(page + 0x10, &sentAddr, 8);
                 // Also at +0x28 and +0x30 for 48-byte entries
                 memcpy(page + 0x28, &sentAddr, 8);
@@ -242,6 +254,7 @@ namespace Patches::FormCaching
                 auto stubAddr = reinterpret_cast<DWORD64>(g_stubFuncPage);
                 memcpy(page + 0x4B8, &stubAddr, 8);
             }
+            g_sentinelRepairInProgress.store(false, std::memory_order_release);
         }
 
         // v1.22.91: Write BST sentinel pointer into the ZERO PAGE (g_zeroPage)
@@ -254,9 +267,10 @@ namespace Patches::FormCaching
         // Also patches g_lowNullGuard (address ~0) if available.
         inline void PatchNullPageWithSentinel()
         {
-            if (!g_bstSentinel) return;
+            auto* sentinel = g_bstSentinel.load(std::memory_order_acquire);
+            if (!sentinel) return;
 
-            auto sentAddr = reinterpret_cast<DWORD64>(g_bstSentinel);
+            auto sentAddr = reinterpret_cast<DWORD64>(sentinel);
 
             // Patch the VEH redirect target (g_zeroPage) — this is the critical one
             if (g_zeroPage) {
@@ -268,7 +282,7 @@ namespace Patches::FormCaching
 
                 logger::info("v1.22.91: Patched g_zeroPage (0x{:X}) with BST sentinel 0x{:X} at +0x10, +0x28, +0x30",
                     reinterpret_cast<std::uintptr_t>(g_zeroPage),
-                    reinterpret_cast<std::uintptr_t>(g_bstSentinel));
+                    reinterpret_cast<std::uintptr_t>(sentinel));
             }
 
             // Also patch the low null guard (address ~0) if mapped
@@ -317,9 +331,42 @@ namespace Patches::FormCaching
             }
         }
 
+        // v1.22.97: Namespace-scope RIP dedup arrays for VEH byte dumps.
+        // Promoted from function-local statics to avoid thread-safety issues.
+        inline DWORD64 g_zeroDumpedRips[32] = {};
+        inline std::atomic<int> g_zeroDumpCount{0};
+        inline DWORD64 g_catchAllDumpedRips[32] = {};
+        inline std::atomic<int> g_catchAllDumpCount{0};
+
         // v1.22.51: Dynamic log paths — resolved once at init from SKSE log dir.
         // Fixed-size char arrays are safe to read from VEH handlers (no allocation).
         inline char g_crashLogPath[MAX_PATH] = {};
+
+        // v1.22.97: Pre-opened file handle for VEH logging — avoids CRT
+        // heap allocations (fopen_s/fprintf) inside exception handlers.
+        // WriteFile + stack-local buffer is VEH-safe.
+        inline HANDLE g_vehLogHandle = INVALID_HANDLE_VALUE;
+
+        inline void VehLogInit(const char* path)
+        {
+            g_vehLogHandle = CreateFileA(path, FILE_APPEND_DATA,
+                FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        }
+
+        inline void VehLog(const char* fmt, ...)
+        {
+            if (g_vehLogHandle == INVALID_HANDLE_VALUE) return;
+            char buf[512];
+            va_list ap;
+            va_start(ap, fmt);
+            int len = vsnprintf(buf, sizeof(buf), fmt, ap);
+            va_end(ap);
+            if (len > 0) {
+                DWORD written;
+                WriteFile(g_vehLogHandle, buf, static_cast<DWORD>(len), &written, nullptr);
+            }
+        }
 
         inline void InitPaths()
         {
@@ -329,6 +376,8 @@ namespace Patches::FormCaching
                 strncpy_s(g_crashLogPath, crashPath.string().c_str(), _TRUNCATE);
             }
             logger::info("Crash log path: {}", g_crashLogPath);
+            // Open persistent handle for VEH-safe logging
+            VehLogInit(g_crashLogPath);
         }
 
         // v1.22.51: RAII guard for temporary VEH handlers.
@@ -345,6 +394,23 @@ namespace Patches::FormCaching
             VehGuard(const VehGuard&) = delete;
             VehGuard& operator=(const VehGuard&) = delete;
         };
+
+        // v1.22.97: VEH-safe memory readability check — replaces IsBadReadPtr
+        // which can recurse/deadlock inside VEH handlers. VirtualQuery does
+        // not install an exception handler, making it safe for VEH context.
+        inline bool IsReadableMemory(const void* ptr, size_t len)
+        {
+            MEMORY_BASIC_INFORMATION mbi;
+            if (!VirtualQuery(ptr, &mbi, sizeof(mbi))) return false;
+            if (mbi.State != MEM_COMMIT) return false;
+            constexpr DWORD readable = PAGE_READONLY | PAGE_READWRITE |
+                PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE;
+            if (!(mbi.Protect & readable)) return false;
+            // Check that the entire range fits within this region
+            auto regionEnd = reinterpret_cast<std::uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+            auto queryEnd = reinterpret_cast<std::uintptr_t>(ptr) + len;
+            return queryEnd <= regionEnd;
+        }
 
         // v1.22.10: Enhanced ClearData diagnostic — dumps files list state
         // when ClearData fires, to see what the engine knew about before compile
@@ -449,15 +515,17 @@ namespace Patches::FormCaching
         {
             g_growCallCount.fetch_add(1, std::memory_order_relaxed);
 
-            // Capture BST sentinel on first call
-            if (!g_bstSentinel) {
+            // Capture BST sentinel on first call (atomic CAS — first writer wins)
+            if (!g_bstSentinel.load(std::memory_order_acquire)) {
                 auto* sentinel = *reinterpret_cast<void**>(
                     reinterpret_cast<std::uint8_t*>(a_this) + 0x10);
                 if (sentinel) {
-                    g_bstSentinel = sentinel;
-                    logger::info("v1.22.90: Captured BST sentinel = 0x{:X}",
-                        reinterpret_cast<std::uintptr_t>(sentinel));
-                    PatchNullPageWithSentinel();
+                    void* expected = nullptr;
+                    if (g_bstSentinel.compare_exchange_strong(expected, sentinel, std::memory_order_release, std::memory_order_relaxed)) {
+                        logger::info("v1.22.90: Captured BST sentinel = 0x{:X}",
+                            reinterpret_cast<std::uintptr_t>(sentinel));
+                        PatchNullPageWithSentinel();
+                    }
                 }
             }
 
@@ -469,14 +537,16 @@ namespace Patches::FormCaching
         {
             g_growCallCount.fetch_add(1, std::memory_order_relaxed);
 
-            if (!g_bstSentinel) {
+            if (!g_bstSentinel.load(std::memory_order_acquire)) {
                 auto* sentinel = *reinterpret_cast<void**>(
                     reinterpret_cast<std::uint8_t*>(a_this) + 0x10);
                 if (sentinel) {
-                    g_bstSentinel = sentinel;
-                    logger::info("v1.22.90: Captured BST sentinel = 0x{:X} (grow_B)",
-                        reinterpret_cast<std::uintptr_t>(sentinel));
-                    PatchNullPageWithSentinel();
+                    void* expected = nullptr;
+                    if (g_bstSentinel.compare_exchange_strong(expected, sentinel, std::memory_order_release, std::memory_order_relaxed)) {
+                        logger::info("v1.22.90: Captured BST sentinel = 0x{:X} (grow_B)",
+                            reinterpret_cast<std::uintptr_t>(sentinel));
+                        PatchNullPageWithSentinel();
+                    }
                 }
             }
 
@@ -500,10 +570,13 @@ namespace Patches::FormCaching
         {
             g_setAtCallCount.fetch_add(1, std::memory_order_relaxed);
             if (g_hashMapSetAtLock.test_and_set(std::memory_order_acquire)) {
-                // Contended — spin with pause
+                // Contended — spin with pause + backoff (Sleep(0) yields after 64 spins)
                 g_setAtContentionCount.fetch_add(1, std::memory_order_relaxed);
-                do { _mm_pause(); }
-                while (g_hashMapSetAtLock.test_and_set(std::memory_order_acquire));
+                int spins = 0;
+                do {
+                    _mm_pause();
+                    if (++spins > 64) { Sleep(0); spins = 0; }
+                } while (g_hashMapSetAtLock.test_and_set(std::memory_order_acquire));
             }
             auto result = g_hk_SetAtA.call<std::uint64_t>(a_this, a_key, a_value, a_extra);
             g_hashMapSetAtLock.clear(std::memory_order_release);
@@ -533,8 +606,11 @@ namespace Patches::FormCaching
             g_setAtCallCount.fetch_add(1, std::memory_order_relaxed);
             if (g_hashMapSetAtLock.test_and_set(std::memory_order_acquire)) {
                 g_setAtContentionCount.fetch_add(1, std::memory_order_relaxed);
-                do { _mm_pause(); }
-                while (g_hashMapSetAtLock.test_and_set(std::memory_order_acquire));
+                int spins = 0;
+                do {
+                    _mm_pause();
+                    if (++spins > 64) { Sleep(0); spins = 0; }
+                } while (g_hashMapSetAtLock.test_and_set(std::memory_order_acquire));
             }
             auto result = g_hk_SetAtB.call<std::uint64_t>(a_this, a_key, a_value, a_extra);
             g_hashMapSetAtLock.clear(std::memory_order_release);
@@ -606,14 +682,16 @@ namespace Patches::FormCaching
                         // v1.22.91: Capture BST sentinel from form map inner struct.
                         // inner = formMap + 8, sentinel is at inner + 0x10 = formMap + 0x18.
                         // This is the game's BSTScatterTableSentinel address.
-                        if (!g_bstSentinel) {
+                        if (!g_bstSentinel.load(std::memory_order_acquire)) {
                             auto* sentPtr = *reinterpret_cast<void**>(
                                 reinterpret_cast<std::uint8_t*>(inner) + 0x10);
                             if (sentPtr) {
-                                g_bstSentinel = sentPtr;
-                                logger::info("v1.22.91: Captured BST sentinel = 0x{:X} from form map",
-                                    reinterpret_cast<std::uintptr_t>(sentPtr));
-                                PatchNullPageWithSentinel();
+                                void* expected = nullptr;
+                                if (g_bstSentinel.compare_exchange_strong(expected, sentPtr, std::memory_order_release, std::memory_order_relaxed)) {
+                                    logger::info("v1.22.91: Captured BST sentinel = 0x{:X} from form map",
+                                        reinterpret_cast<std::uintptr_t>(sentPtr));
+                                    PatchNullPageWithSentinel();
+                                }
                             }
                         }
                     }
@@ -1216,39 +1294,33 @@ namespace Patches::FormCaching
                     if (g_probes[i].active.load(std::memory_order_acquire) &&
                         rip == sImgBase2 + g_probes[i].offset) {
                         // Log the probe hit with full register context
-                        FILE* f = nullptr;
-                        fopen_s(&f, g_crashLogPath, "a");
-                        if (f) {
-                            fprintf(f, "PROBE-HIT: +0x%llX",
-                                (unsigned long long)g_probes[i].offset);
-                            fprintf(f, " RAX=0x%llX RCX=0x%llX RDX=0x%llX RDI=0x%llX RSI=0x%llX R14=0x%llX RBP=0x%llX R8=0x%llX R9=0x%llX R15=0x%llX",
-                                (unsigned long long)pep->ContextRecord->Rax,
-                                (unsigned long long)pep->ContextRecord->Rcx,
-                                (unsigned long long)pep->ContextRecord->Rdx,
-                                (unsigned long long)pep->ContextRecord->Rdi,
-                                (unsigned long long)pep->ContextRecord->Rsi,
-                                (unsigned long long)pep->ContextRecord->R14,
-                                (unsigned long long)pep->ContextRecord->Rbp,
-                                (unsigned long long)pep->ContextRecord->R8,
-                                (unsigned long long)pep->ContextRecord->R9,
-                                (unsigned long long)pep->ContextRecord->R15);
-                            // Log return address from stack
-                            auto* rspPtr = reinterpret_cast<DWORD64*>(pep->ContextRecord->Rsp);
-                            if (!IsBadReadPtr(rspPtr, 64)) {
-                                fprintf(f, " STK=[");
-                                for (int s = 0; s < 8; ++s) {
-                                    DWORD64 val = rspPtr[s];
-                                    if (val >= (DWORD64)sImgBase2 &&
-                                        val < (DWORD64)sImgBase2 + 0x4000000) {
-                                        fprintf(f, "+0x%llX ", (unsigned long long)(val - sImgBase2));
-                                    }
+                        VehLog("PROBE-HIT: +0x%llX",
+                            (unsigned long long)g_probes[i].offset);
+                        VehLog(" RAX=0x%llX RCX=0x%llX RDX=0x%llX RDI=0x%llX RSI=0x%llX R14=0x%llX RBP=0x%llX R8=0x%llX R9=0x%llX R15=0x%llX",
+                            (unsigned long long)pep->ContextRecord->Rax,
+                            (unsigned long long)pep->ContextRecord->Rcx,
+                            (unsigned long long)pep->ContextRecord->Rdx,
+                            (unsigned long long)pep->ContextRecord->Rdi,
+                            (unsigned long long)pep->ContextRecord->Rsi,
+                            (unsigned long long)pep->ContextRecord->R14,
+                            (unsigned long long)pep->ContextRecord->Rbp,
+                            (unsigned long long)pep->ContextRecord->R8,
+                            (unsigned long long)pep->ContextRecord->R9,
+                            (unsigned long long)pep->ContextRecord->R15);
+                        // Log return address from stack
+                        auto* rspPtr = reinterpret_cast<DWORD64*>(pep->ContextRecord->Rsp);
+                        if (IsReadableMemory(rspPtr, 64)) {
+                            VehLog(" STK=[");
+                            for (int s = 0; s < 8; ++s) {
+                                DWORD64 val = rspPtr[s];
+                                if (val >= (DWORD64)sImgBase2 &&
+                                    val < (DWORD64)sImgBase2 + 0x4000000) {
+                                    VehLog("+0x%llX ", (unsigned long long)(val - sImgBase2));
                                 }
-                                fprintf(f, "]");
                             }
-                            fprintf(f, "\n");
-                            fflush(f);
-                            fclose(f);
+                            VehLog("]");
                         }
+                        VehLog("\n");
                         // Restore original byte and mark as fired
                         auto* site = reinterpret_cast<std::uint8_t*>(sImgBase2 + g_probes[i].offset);
                         *site = g_probes[i].origByte;
@@ -1268,16 +1340,10 @@ namespace Patches::FormCaching
                 static std::atomic<int> s_nonAvCount{ 0 };
                 auto cnt = s_nonAvCount.fetch_add(1, std::memory_order_relaxed);
                 if (cnt < 5) {
-                    FILE* f = nullptr;
-                    fopen_s(&f, g_crashLogPath, "a");
-                    if (f) {
-                        auto imgBase = REL::Module::get().base();
-                        auto rip2 = pep->ContextRecord->Rip;
-                        fprintf(f, "NON-AV EXCEPTION #%d: code=0x%08lX RIP=0x%llX (+0x%llX)\n",
-                            cnt + 1, code, rip2, rip2 - imgBase);
-                        fflush(f);
-                        fclose(f);
-                    }
+                    auto imgBase = REL::Module::get().base();
+                    auto rip2 = pep->ContextRecord->Rip;
+                    VehLog("NON-AV EXCEPTION #%d: code=0x%08lX RIP=0x%llX (+0x%llX)\n",
+                        cnt + 1, code, rip2, rip2 - imgBase);
                 }
                 return EXCEPTION_CONTINUE_SEARCH;
             }
@@ -1316,15 +1382,9 @@ namespace Patches::FormCaching
                 // ESM forms persist — clearing the cache caused 900+ native
                 // map lookups → freeze on corrupted bucket chains.
 
-                FILE* pf = nullptr;
-                fopen_s(&pf, g_crashLogPath, "a");
-                if (pf) {
-                    fprintf(pf, "PROBES: installed %d/%d INT3 probes on first VEH event\n"
-                                "CACHE-CLEAR: flagged for lazy invalidation\n",
-                        installed, g_numProbes);
-                    fflush(pf);
-                    fclose(pf);
-                }
+                VehLog("PROBES: installed %d/%d INT3 probes on first VEH event\n"
+                       "CACHE-CLEAR: flagged for lazy invalidation\n",
+                    installed, g_numProbes);
             }
 
             // ─────────────────────────────────────────────────────────────
@@ -1338,22 +1398,15 @@ namespace Patches::FormCaching
                 targetAddr < g_zeroPageEnd) {
                 auto rip2 = pep->ContextRecord->Rip;
                 const auto* ripBytes2 = reinterpret_cast<const std::uint8_t*>(rip2);
-                if (!IsBadReadPtr(ripBytes2, 16)) {
+                if (IsReadableMemory(ripBytes2, 16)) {
                     auto instrLen = x86_instr_len(ripBytes2);
                     pep->ContextRecord->Rip += instrLen;
 
                     auto count = g_zeroPageWriteSkips.fetch_add(1, std::memory_order_relaxed);
                     if (count < 200) {
-                        const char* logPath = g_crashLogPath;
-                        FILE* f2 = nullptr;
-                        fopen_s(&f2, logPath, "a");
-                        if (f2) {
-                            fprintf(f2, "ZERO-WRITE-SKIP #%d: RIP=+0x%llX target=0x%llX +%dB\n",
-                                count + 1, rip2 - REL::Module::get().base(),
-                                (unsigned long long)targetAddr, instrLen);
-                            fflush(f2);
-                            fclose(f2);
-                        }
+                        VehLog("ZERO-WRITE-SKIP #%d: RIP=+0x%llX target=0x%llX +%dB\n",
+                            count + 1, rip2 - REL::Module::get().base(),
+                            (unsigned long long)targetAddr, instrLen);
                     }
                     return EXCEPTION_CONTINUE_EXECUTION;
                 }
@@ -1377,22 +1430,15 @@ namespace Patches::FormCaching
             // ─────────────────────────────────────────────────────────────
             if (rip < 0x10000) {
                 auto* rspPtr = reinterpret_cast<DWORD64*>(pep->ContextRecord->Rsp);
-                if (!IsBadReadPtr(rspPtr, 8)) {
+                if (IsReadableMemory(rspPtr, 8)) {
                     pep->ContextRecord->Rip = *rspPtr;
                     pep->ContextRecord->Rsp += 8;
                     pep->ContextRecord->Rax = 0;
 
                     auto count = g_nullSkipCount.fetch_add(1, std::memory_order_relaxed);
                     if (count < 50) {
-                        const char* logPath = g_crashLogPath;
-                        FILE* f2 = nullptr;
-                        fopen_s(&f2, logPath, "a");
-                        if (f2) {
-                            fprintf(f2, "NULL-CALL-RET #%d: RIP=0x%llX returning to 0x%llX\n",
-                                count + 1, rip, *rspPtr);
-                            fflush(f2);
-                            fclose(f2);
-                        }
+                        VehLog("NULL-CALL-RET #%d: RIP=0x%llX returning to 0x%llX\n",
+                            count + 1, rip, *rspPtr);
                     }
                     return EXCEPTION_CONTINUE_EXECUTION;
                 }
@@ -1407,7 +1453,7 @@ namespace Patches::FormCaching
                 bool isInvalidCodeAddr = (rip > 0x00007FFFFFFFFFFFULL) || (rip < 0x10000);
                 if (isInvalidCodeAddr) {
                     auto* rspPtr = reinterpret_cast<DWORD64*>(pep->ContextRecord->Rsp);
-                    if (!IsBadReadPtr(rspPtr, 8)) {
+                    if (IsReadableMemory(rspPtr, 8)) {
                         DWORD64 retAddr = *rspPtr;
                         pep->ContextRecord->Rip = retAddr;
                         pep->ContextRecord->Rsp += 8;
@@ -1418,15 +1464,8 @@ namespace Patches::FormCaching
                         static std::atomic<int> s_extFixCount{ 0 };
                         auto cnt2 = s_extFixCount.fetch_add(1, std::memory_order_relaxed);
                         if (cnt2 < 50) {
-                            const char* logPath = g_crashLogPath;
-                            FILE* f = nullptr;
-                            fopen_s(&f, logPath, "a");
-                            if (f) {
-                                fprintf(f, "EXT-CALL-RET #%d: RIP=0x%llX → returning to 0x%llX RAX=0\n",
-                                    cnt2 + 1, rip, retAddr);
-                                fflush(f);
-                                fclose(f);
-                            }
+                            VehLog("EXT-CALL-RET #%d: RIP=0x%llX → returning to 0x%llX RAX=0\n",
+                                cnt2 + 1, rip, retAddr);
                         }
                         return EXCEPTION_CONTINUE_EXECUTION;
                     }
@@ -1448,18 +1487,11 @@ namespace Patches::FormCaching
 
                             auto count = g_caveFaultCount.fetch_add(1, std::memory_order_relaxed);
                             if (count < 200) {
-                                const char* logPath = g_crashLogPath;
-                                FILE* f = nullptr;
-                                fopen_s(&f, logPath, "a");
-                                if (f) {
-                                    fprintf(f, "CAVE-FAULT #%llu: RIP=0x%llX (%s) target=0x%llX → redirect 0x%llX\n",
-                                        (unsigned long long)(count + 1), (unsigned long long)rip,
-                                        g_cavePatches[i].name,
-                                        (unsigned long long)targetAddr,
-                                        (unsigned long long)g_cavePatches[i].nullReturnAddr);
-                                    fflush(f);
-                                    fclose(f);
-                                }
+                                VehLog("CAVE-FAULT #%llu: RIP=0x%llX (%s) target=0x%llX → redirect 0x%llX\n",
+                                    (unsigned long long)(count + 1), (unsigned long long)rip,
+                                    g_cavePatches[i].name,
+                                    (unsigned long long)targetAddr,
+                                    (unsigned long long)g_cavePatches[i].nullReturnAddr);
                             }
                             return EXCEPTION_CONTINUE_EXECUTION;
                         }
@@ -1474,7 +1506,7 @@ namespace Patches::FormCaching
                 // CALL through a bad pointer — pop the return addr and continue.
                 if (rip == targetAddr && accessType != 1) {
                     auto* rspPtr2 = reinterpret_cast<DWORD64*>(pep->ContextRecord->Rsp);
-                    if (!IsBadReadPtr(rspPtr2, 8)) {
+                    if (IsReadableMemory(rspPtr2, 8)) {
                         DWORD64 retAddr = *rspPtr2;
 
                         // v1.22.64: Also accept return addresses inside our code caves.
@@ -1507,20 +1539,13 @@ namespace Patches::FormCaching
 
                             auto cnt3 = static_cast<int>(g_execRecoverCount.fetch_add(1, std::memory_order_relaxed));
                             if (cnt3 < 50) {
-                                const char* logPath = g_crashLogPath;
-                                FILE* f = nullptr;
-                                fopen_s(&f, logPath, "a");
-                                if (f) {
-                                    fprintf(f, "EXT-EXEC-RECOVER #%d: RIP=0x%llX (bad call target) → returning to 0x%llX (%s%s) RAX=0\n",
-                                        cnt3 + 1, rip,
-                                        (unsigned long long)pep->ContextRecord->Rip,
-                                        inCave ? "cave:" : "+0x",
-                                        inCave ? g_cavePatches[caveIdx].name : "");
-                                    if (!inCave) {
-                                        fprintf(f, "  (offset +0x%llX)\n", retAddr - sImgBase);
-                                    }
-                                    fflush(f);
-                                    fclose(f);
+                                VehLog("EXT-EXEC-RECOVER #%d: RIP=0x%llX (bad call target) → returning to 0x%llX (%s%s) RAX=0\n",
+                                    cnt3 + 1, rip,
+                                    (unsigned long long)pep->ContextRecord->Rip,
+                                    inCave ? "cave:" : "+0x",
+                                    inCave ? g_cavePatches[caveIdx].name : "");
+                                if (!inCave) {
+                                    VehLog("  (offset +0x%llX)\n", retAddr - sImgBase);
                                 }
                             }
                             return EXCEPTION_CONTINUE_EXECUTION;
@@ -1534,7 +1559,7 @@ namespace Patches::FormCaching
                 // (like a failed CALL) and returning 0 to caller.
                 if (g_dllBase && rip >= g_dllBase && rip < g_dllEnd) {
                     auto* rspPtr = reinterpret_cast<DWORD64*>(pep->ContextRecord->Rsp);
-                    if (!IsBadReadPtr(rspPtr, 8)) {
+                    if (IsReadableMemory(rspPtr, 8)) {
                         DWORD64 retAddr = *rspPtr;
                         pep->ContextRecord->Rip = retAddr;
                         pep->ContextRecord->Rsp += 8;
@@ -1544,18 +1569,11 @@ namespace Patches::FormCaching
                         static std::atomic<int> s_dllFaultCount{ 0 };
                         auto cnt = s_dllFaultCount.fetch_add(1, std::memory_order_relaxed);
                         if (cnt < 50) {
-                            const char* logPath = g_crashLogPath;
-                            FILE* f = nullptr;
-                            fopen_s(&f, logPath, "a");
-                            if (f) {
-                                fprintf(f, "DLL-FAULT-RECOVER #%d: RIP=0x%llX target=0x%llX RAX=0x%llX → returning to 0x%llX\n",
-                                    cnt + 1, rip,
-                                    (unsigned long long)targetAddr,
-                                    (unsigned long long)pep->ContextRecord->Rax,
-                                    (unsigned long long)retAddr);
-                                fflush(f);
-                                fclose(f);
-                            }
+                            VehLog("DLL-FAULT-RECOVER #%d: RIP=0x%llX target=0x%llX RAX=0x%llX → returning to 0x%llX\n",
+                                cnt + 1, rip,
+                                (unsigned long long)targetAddr,
+                                (unsigned long long)pep->ContextRecord->Rax,
+                                (unsigned long long)retAddr);
                         }
                         return EXCEPTION_CONTINUE_EXECUTION;
                     }
@@ -1575,18 +1593,11 @@ namespace Patches::FormCaching
                         GetModuleFileNameA(hMod, modName, MAX_PATH);
                     }
 
-                    const char* logPath = g_crashLogPath;
-                    FILE* f = nullptr;
-                    fopen_s(&f, logPath, "a");
-                    if (f) {
-                        fprintf(f, "EXT-CRASH #%d: RIP=0x%llX (module: %s) target=0x%llX RAX=0x%llX\n",
-                            cnt + 1, rip,
-                            modName,
-                            (unsigned long long)targetAddr,
-                            (unsigned long long)pep->ContextRecord->Rax);
-                        fflush(f);
-                        fclose(f);
-                    }
+                    VehLog("EXT-CRASH #%d: RIP=0x%llX (module: %s) target=0x%llX RAX=0x%llX\n",
+                        cnt + 1, rip,
+                        modName,
+                        (unsigned long long)targetAddr,
+                        (unsigned long long)pep->ContextRecord->Rax);
                 }
                 return EXCEPTION_CONTINUE_SEARCH;
             }
@@ -1608,9 +1619,9 @@ namespace Patches::FormCaching
             // Pattern: [REX] 8B ModRM disp8  where disp8 = 0x10 or 0x28
             //   e.g. 48 8B 52 10 = mov rdx, [rdx + 0x10]
             // ─────────────────────────────────────────────────────────────
-            if (targetAddr < 0x10000 && g_bstSentinel &&
+            if (targetAddr < 0x10000 && g_bstSentinel.load(std::memory_order_acquire) &&
                 rip >= sImgBase && rip < sImgEnd &&
-                !IsBadReadPtr(ripBytes, 8)) {
+                IsReadableMemory(ripBytes, 8)) {
 
                 const auto* ip = ripBytes;
                 int rex = 0;
@@ -1630,7 +1641,7 @@ namespace Patches::FormCaching
                         if (disp == 0x10 || disp == 0x28) {
                             // This is a BST chain-follow: mov reg, [reg + next_offset]
                             // Set destination register to sentinel so loop exits.
-                            DWORD64 sentVal = reinterpret_cast<DWORD64>(g_bstSentinel);
+                            DWORD64 sentVal = reinterpret_cast<DWORD64>(g_bstSentinel.load(std::memory_order_relaxed));
 
                             // Map register index to CONTEXT field
                             DWORD64* regMap[] = {
@@ -1653,16 +1664,10 @@ namespace Patches::FormCaching
                                 static std::atomic<int> s_chainFixCount{ 0 };
                                 auto cnt = s_chainFixCount.fetch_add(1, std::memory_order_relaxed);
                                 if (cnt < 100) {
-                                    FILE* f = nullptr;
-                                    fopen_s(&f, g_crashLogPath, "a");
-                                    if (f) {
-                                        fprintf(f, "CHAIN-SENTINEL #%d: RIP=+0x%llX disp=%d dest=R%d → sentinel=0x%llX\n",
-                                            cnt + 1, (unsigned long long)(rip - sImgBase),
-                                            disp, reg,
-                                            (unsigned long long)sentVal);
-                                        fflush(f);
-                                        fclose(f);
-                                    }
+                                    VehLog("CHAIN-SENTINEL #%d: RIP=+0x%llX disp=%d dest=R%d → sentinel=0x%llX\n",
+                                        cnt + 1, (unsigned long long)(rip - sImgBase),
+                                        disp, reg,
+                                        (unsigned long long)sentVal);
                                 }
                                 return EXCEPTION_CONTINUE_EXECUTION;
                             }
@@ -1754,106 +1759,102 @@ namespace Patches::FormCaching
                 auto count = g_zeroPageUseCount.fetch_add(1, std::memory_order_relaxed);
 
                 if (count < 600) {
-                    const char* logPath = g_crashLogPath;
-                    FILE* f2 = nullptr;
-                    fopen_s(&f2, logPath, "a");
-                    if (f2) {
-                        fprintf(f2, "ZERO-PAGE #%d: RIP=+0x%llX target=0x%llX %s → zeroPage=0x%llX\n",
-                            count + 1, rip - sImgBase,
-                            (unsigned long long)targetAddr,
-                            isNullAccess ? "null" : "high-invalid",
-                            (unsigned long long)zp);
-                        // Byte dump: first time we see each RIP, dump 32 bytes
-                        static DWORD64 s_dumpedRips[32] = {};
-                        static int s_dumpCount = 0;
+                    VehLog("ZERO-PAGE #%d: RIP=+0x%llX target=0x%llX %s → zeroPage=0x%llX\n",
+                        count + 1, rip - sImgBase,
+                        (unsigned long long)targetAddr,
+                        isNullAccess ? "null" : "high-invalid",
+                        (unsigned long long)zp);
+                    // Byte dump: first time we see each RIP, dump 32 bytes
+                    {
+                        int cnt = g_zeroDumpCount.load(std::memory_order_relaxed);
                         bool alreadyDumped = false;
-                        for (int d = 0; d < s_dumpCount; ++d)
-                            if (s_dumpedRips[d] == rip) { alreadyDumped = true; break; }
-                        if (!alreadyDumped && s_dumpCount < 32) {
-                            s_dumpedRips[s_dumpCount++] = rip;
-                            fprintf(f2, "  BYTES[+0x%llX]:", rip - sImgBase);
-                            if (!IsBadReadPtr(ripBytes, 32))
-                                for (int b = 0; b < 32; ++b) fprintf(f2, " %02X", ripBytes[b]);
-                            fprintf(f2, "\n");
+                        for (int d = 0; d < cnt; ++d)
+                            if (g_zeroDumpedRips[d] == rip) { alreadyDumped = true; break; }
+                        if (!alreadyDumped && cnt < 32) {
+                            int slot = g_zeroDumpCount.fetch_add(1, std::memory_order_relaxed);
+                            if (slot < 32) {
+                                g_zeroDumpedRips[slot] = rip;
+                                VehLog("  BYTES[+0x%llX]:", rip - sImgBase);
+                                if (IsReadableMemory(ripBytes, 32))
+                                    for (int b = 0; b < 32; ++b) VehLog(" %02X", ripBytes[b]);
+                                VehLog("\n");
+                            }
+                        }
+                    }
+
+                    // v1.22.85: Enhanced diagnostics for high-invalid
+                    // targets — dump full register state + memory around
+                    // corrupted pointer to identify corruption source.
+                    if (isHighInvalid && count < 50) {
+                        VehLog("  REGS: RAX=%016llX RBX=%016llX RCX=%016llX RDX=%016llX\n",
+                            (unsigned long long)pep->ContextRecord->Rax,
+                            (unsigned long long)pep->ContextRecord->Rbx,
+                            (unsigned long long)pep->ContextRecord->Rcx,
+                            (unsigned long long)pep->ContextRecord->Rdx);
+                        VehLog("        RSI=%016llX RDI=%016llX RBP=%016llX RSP=%016llX\n",
+                            (unsigned long long)pep->ContextRecord->Rsi,
+                            (unsigned long long)pep->ContextRecord->Rdi,
+                            (unsigned long long)pep->ContextRecord->Rbp,
+                            (unsigned long long)pep->ContextRecord->Rsp);
+                        VehLog("        R8 =%016llX R9 =%016llX R10=%016llX R11=%016llX\n",
+                            (unsigned long long)pep->ContextRecord->R8,
+                            (unsigned long long)pep->ContextRecord->R9,
+                            (unsigned long long)pep->ContextRecord->R10,
+                            (unsigned long long)pep->ContextRecord->R11);
+                        VehLog("        R12=%016llX R13=%016llX R14=%016llX R15=%016llX\n",
+                            (unsigned long long)pep->ContextRecord->R12,
+                            (unsigned long long)pep->ContextRecord->R13,
+                            (unsigned long long)pep->ContextRecord->R14,
+                            (unsigned long long)pep->ContextRecord->R15);
+
+                        // Dump stack (return addresses)
+                        auto* stk = reinterpret_cast<DWORD64*>(pep->ContextRecord->Rsp);
+                        if (IsReadableMemory(stk, 64)) {
+                            VehLog("  STACK:");
+                            for (int s = 0; s < 8; ++s)
+                                VehLog(" %016llX", (unsigned long long)stk[s]);
+                            VehLog("\n");
                         }
 
-                        // v1.22.85: Enhanced diagnostics for high-invalid
-                        // targets — dump full register state + memory around
-                        // corrupted pointer to identify corruption source.
-                        if (isHighInvalid && count < 50) {
-                            fprintf(f2, "  REGS: RAX=%016llX RBX=%016llX RCX=%016llX RDX=%016llX\n",
-                                (unsigned long long)pep->ContextRecord->Rax,
-                                (unsigned long long)pep->ContextRecord->Rbx,
-                                (unsigned long long)pep->ContextRecord->Rcx,
-                                (unsigned long long)pep->ContextRecord->Rdx);
-                            fprintf(f2, "        RSI=%016llX RDI=%016llX RBP=%016llX RSP=%016llX\n",
-                                (unsigned long long)pep->ContextRecord->Rsi,
-                                (unsigned long long)pep->ContextRecord->Rdi,
-                                (unsigned long long)pep->ContextRecord->Rbp,
-                                (unsigned long long)pep->ContextRecord->Rsp);
-                            fprintf(f2, "        R8 =%016llX R9 =%016llX R10=%016llX R11=%016llX\n",
-                                (unsigned long long)pep->ContextRecord->R8,
-                                (unsigned long long)pep->ContextRecord->R9,
-                                (unsigned long long)pep->ContextRecord->R10,
-                                (unsigned long long)pep->ContextRecord->R11);
-                            fprintf(f2, "        R12=%016llX R13=%016llX R14=%016llX R15=%016llX\n",
-                                (unsigned long long)pep->ContextRecord->R12,
-                                (unsigned long long)pep->ContextRecord->R13,
-                                (unsigned long long)pep->ContextRecord->R14,
-                                (unsigned long long)pep->ContextRecord->R15);
-
-                            // Dump stack (return addresses)
-                            auto* stk = reinterpret_cast<DWORD64*>(pep->ContextRecord->Rsp);
-                            if (!IsBadReadPtr(stk, 64)) {
-                                fprintf(f2, "  STACK:");
-                                for (int s = 0; s < 8; ++s)
-                                    fprintf(f2, " %016llX", (unsigned long long)stk[s]);
-                                fprintf(f2, "\n");
-                            }
-
-                            // For each register that looks like a valid
-                            // pointer, dump 64 bytes at that address so we
-                            // can see the data structure it points to.
-                            const char* regNames[] = {
-                                "RAX","RBX","RCX","RDX","RSI","RDI",
-                                "R8","R9","R10","R11","R12","R13","R14","R15"
-                            };
-                            DWORD64 regVals[] = {
-                                pep->ContextRecord->Rax, pep->ContextRecord->Rbx,
-                                pep->ContextRecord->Rcx, pep->ContextRecord->Rdx,
-                                pep->ContextRecord->Rsi, pep->ContextRecord->Rdi,
-                                pep->ContextRecord->R8,  pep->ContextRecord->R9,
-                                pep->ContextRecord->R10, pep->ContextRecord->R11,
-                                pep->ContextRecord->R12, pep->ContextRecord->R13,
-                                pep->ContextRecord->R14, pep->ContextRecord->R15
-                            };
-                            for (int r = 0; r < 14; ++r) {
-                                DWORD64 rv = regVals[r];
-                                // Valid user-mode heap pointer?
-                                if (rv > 0x10000 && rv <= 0x00007FFFFFFFFFFFULL) {
-                                    auto* mem = reinterpret_cast<std::uint8_t*>(rv);
-                                    if (!IsBadReadPtr(mem, 64)) {
-                                        fprintf(f2, "  MEM[%s=%016llX]:", regNames[r],
-                                            (unsigned long long)rv);
-                                        for (int b = 0; b < 64; ++b) {
-                                            if (b % 16 == 0 && b > 0)
-                                                fprintf(f2, "\n                              ");
-                                            fprintf(f2, " %02X", mem[b]);
-                                        }
-                                        // Also print as ASCII for string detection
-                                        fprintf(f2, "\n  ASCII: \"");
-                                        for (int b = 0; b < 64; ++b) {
-                                            char c = (char)mem[b];
-                                            fprintf(f2, "%c", (c >= 32 && c < 127) ? c : '.');
-                                        }
-                                        fprintf(f2, "\"\n");
+                        // For each register that looks like a valid
+                        // pointer, dump 64 bytes at that address so we
+                        // can see the data structure it points to.
+                        const char* regNames[] = {
+                            "RAX","RBX","RCX","RDX","RSI","RDI",
+                            "R8","R9","R10","R11","R12","R13","R14","R15"
+                        };
+                        DWORD64 regVals[] = {
+                            pep->ContextRecord->Rax, pep->ContextRecord->Rbx,
+                            pep->ContextRecord->Rcx, pep->ContextRecord->Rdx,
+                            pep->ContextRecord->Rsi, pep->ContextRecord->Rdi,
+                            pep->ContextRecord->R8,  pep->ContextRecord->R9,
+                            pep->ContextRecord->R10, pep->ContextRecord->R11,
+                            pep->ContextRecord->R12, pep->ContextRecord->R13,
+                            pep->ContextRecord->R14, pep->ContextRecord->R15
+                        };
+                        for (int r = 0; r < 14; ++r) {
+                            DWORD64 rv = regVals[r];
+                            // Valid user-mode heap pointer?
+                            if (rv > 0x10000 && rv <= 0x00007FFFFFFFFFFFULL) {
+                                auto* mem = reinterpret_cast<std::uint8_t*>(rv);
+                                if (IsReadableMemory(mem, 64)) {
+                                    VehLog("  MEM[%s=%016llX]:", regNames[r],
+                                        (unsigned long long)rv);
+                                    for (int b = 0; b < 64; ++b) {
+                                        if (b % 16 == 0 && b > 0)
+                                            VehLog("\n                              ");
+                                        VehLog(" %02X", mem[b]);
                                     }
+                                    // Also print as ASCII for string detection
+                                    VehLog("\n  ASCII: \"");
+                                    for (int b = 0; b < 64; ++b) {
+                                        char c = (char)mem[b];
+                                        VehLog("%c", (c >= 32 && c < 127) ? c : '.');
+                                    }
+                                    VehLog("\"\n");
                                 }
                             }
                         }
-
-                        fflush(f2);
-                        fclose(f2);
                     }
                 }
                 return EXCEPTION_CONTINUE_EXECUTION;
@@ -1906,16 +1907,9 @@ namespace Patches::FormCaching
                         *regs[i] = reinterpret_cast<DWORD64>(resolved);
                         auto count = g_formIdSkipCount.fetch_add(1, std::memory_order_relaxed);
                         if (count < 20) {
-                            const char* logPath = g_crashLogPath;
-                            FILE* f2 = nullptr;
-                            fopen_s(&f2, logPath, "a");
-                            if (f2) {
-                                fprintf(f2, "FORM-RESOLVE #%d: RIP=+0x%llX formID=0x%08X → 0x%llX\n",
-                                    count + 1, rip - sImgBase, formId,
-                                    reinterpret_cast<unsigned long long>(resolved));
-                                fflush(f2);
-                                fclose(f2);
-                            }
+                            VehLog("FORM-RESOLVE #%d: RIP=+0x%llX formID=0x%08X → 0x%llX\n",
+                                count + 1, rip - sImgBase, formId,
+                                reinterpret_cast<unsigned long long>(resolved));
                         }
                         return EXCEPTION_CONTINUE_EXECUTION;
                     }
@@ -1934,15 +1928,8 @@ namespace Patches::FormCaching
 
                         auto count = g_formIdSkipCount.fetch_add(1, std::memory_order_relaxed);
                         if (count < 50) {
-                            const char* logPath = g_crashLogPath;
-                            FILE* f2 = nullptr;
-                            fopen_s(&f2, logPath, "a");
-                            if (f2) {
-                                fprintf(f2, "FORM-ZEROPAGE #%d: RIP=+0x%llX formID=0x%08X NOT FOUND → zeroPage=0x%llX\n",
-                                    count + 1, rip - sImgBase, formId, (unsigned long long)zp);
-                                fflush(f2);
-                                fclose(f2);
-                            }
+                            VehLog("FORM-ZEROPAGE #%d: RIP=+0x%llX formID=0x%08X NOT FOUND → zeroPage=0x%llX\n",
+                                count + 1, rip - sImgBase, formId, (unsigned long long)zp);
                         }
                         return EXCEPTION_CONTINUE_EXECUTION; // Retry with zero page
                     }
@@ -2026,65 +2013,61 @@ namespace Patches::FormCaching
 
                 auto count = g_catchAllCount.fetch_add(1, std::memory_order_relaxed);
                 if (count < 200) {
-                    const char* logPath = g_crashLogPath;
-                    FILE* f2 = nullptr;
-                    fopen_s(&f2, logPath, "a");
-                    if (f2) {
-                        fprintf(f2, "CATCH-ALL #%d: RIP=+0x%llX target=0x%llX patched=%s RAX=0x%llX R14=0x%llX\n",
-                            count + 1, rip - sImgBase,
-                            (unsigned long long)targetAddr,
-                            patched ? "redirect" : "FAILED",
-                            (unsigned long long)pep->ContextRecord->Rax,
-                            (unsigned long long)pep->ContextRecord->R14);
-                        // Byte dump: first time per unique RIP
-                        static DWORD64 s_dumpedRips[32] = {};
-                        static int s_dumpCount = 0;
+                    VehLog("CATCH-ALL #%d: RIP=+0x%llX target=0x%llX patched=%s RAX=0x%llX R14=0x%llX\n",
+                        count + 1, rip - sImgBase,
+                        (unsigned long long)targetAddr,
+                        patched ? "redirect" : "FAILED",
+                        (unsigned long long)pep->ContextRecord->Rax,
+                        (unsigned long long)pep->ContextRecord->R14);
+                    // Byte dump: first time per unique RIP
+                    {
+                        int cnt = g_catchAllDumpCount.load(std::memory_order_relaxed);
                         bool alreadyDumped = false;
-                        for (int d = 0; d < s_dumpCount; ++d)
-                            if (s_dumpedRips[d] == rip) { alreadyDumped = true; break; }
-                        if (!alreadyDumped && s_dumpCount < 32) {
-                            s_dumpedRips[s_dumpCount++] = rip;
-                            fprintf(f2, "  BYTES[+0x%llX]:", rip - sImgBase);
-                            if (!IsBadReadPtr(ripBytes, 32))
-                                for (int b = 0; b < 32; ++b) fprintf(f2, " %02X", ripBytes[b]);
-                            fprintf(f2, "\n");
-                        }
-
-                        // v1.22.85: Full register + memory dump for first 20 catch-alls
-                        if (count < 20) {
-                            fprintf(f2, "  REGS: RAX=%016llX RBX=%016llX RCX=%016llX RDX=%016llX\n",
-                                (unsigned long long)pep->ContextRecord->Rax,
-                                (unsigned long long)pep->ContextRecord->Rbx,
-                                (unsigned long long)pep->ContextRecord->Rcx,
-                                (unsigned long long)pep->ContextRecord->Rdx);
-                            fprintf(f2, "        RSI=%016llX RDI=%016llX R8 =%016llX R14=%016llX\n",
-                                (unsigned long long)pep->ContextRecord->Rsi,
-                                (unsigned long long)pep->ContextRecord->Rdi,
-                                (unsigned long long)pep->ContextRecord->R8,
-                                (unsigned long long)pep->ContextRecord->R14);
-                            // Dump memory at RSI (common source struct) if valid
-                            auto rsiVal = pep->ContextRecord->Rsi;
-                            if (rsiVal > 0x10000 && rsiVal <= 0x00007FFFFFFFFFFFULL) {
-                                auto* mem = reinterpret_cast<std::uint8_t*>(rsiVal);
-                                if (!IsBadReadPtr(mem, 128)) {
-                                    fprintf(f2, "  MEM[RSI=%016llX]:", (unsigned long long)rsiVal);
-                                    for (int b = 0; b < 128; ++b) {
-                                        if (b % 16 == 0 && b > 0)
-                                            fprintf(f2, "\n                              ");
-                                        fprintf(f2, " %02X", mem[b]);
-                                    }
-                                    fprintf(f2, "\n  ASCII: \"");
-                                    for (int b = 0; b < 128; ++b) {
-                                        char c = (char)mem[b];
-                                        fprintf(f2, "%c", (c >= 32 && c < 127) ? c : '.');
-                                    }
-                                    fprintf(f2, "\"\n");
-                                }
+                        for (int d = 0; d < cnt; ++d)
+                            if (g_catchAllDumpedRips[d] == rip) { alreadyDumped = true; break; }
+                        if (!alreadyDumped && cnt < 32) {
+                            int slot = g_catchAllDumpCount.fetch_add(1, std::memory_order_relaxed);
+                            if (slot < 32) {
+                                g_catchAllDumpedRips[slot] = rip;
+                                VehLog("  BYTES[+0x%llX]:", rip - sImgBase);
+                                if (IsReadableMemory(ripBytes, 32))
+                                    for (int b = 0; b < 32; ++b) VehLog(" %02X", ripBytes[b]);
+                                VehLog("\n");
                             }
                         }
+                    }
 
-                        fflush(f2);
-                        fclose(f2);
+                    // v1.22.85: Full register + memory dump for first 20 catch-alls
+                    if (count < 20) {
+                        VehLog("  REGS: RAX=%016llX RBX=%016llX RCX=%016llX RDX=%016llX\n",
+                            (unsigned long long)pep->ContextRecord->Rax,
+                            (unsigned long long)pep->ContextRecord->Rbx,
+                            (unsigned long long)pep->ContextRecord->Rcx,
+                            (unsigned long long)pep->ContextRecord->Rdx);
+                        VehLog("        RSI=%016llX RDI=%016llX R8 =%016llX R14=%016llX\n",
+                            (unsigned long long)pep->ContextRecord->Rsi,
+                            (unsigned long long)pep->ContextRecord->Rdi,
+                            (unsigned long long)pep->ContextRecord->R8,
+                            (unsigned long long)pep->ContextRecord->R14);
+                        // Dump memory at RSI (common source struct) if valid
+                        auto rsiVal = pep->ContextRecord->Rsi;
+                        if (rsiVal > 0x10000 && rsiVal <= 0x00007FFFFFFFFFFFULL) {
+                            auto* mem = reinterpret_cast<std::uint8_t*>(rsiVal);
+                            if (IsReadableMemory(mem, 128)) {
+                                VehLog("  MEM[RSI=%016llX]:", (unsigned long long)rsiVal);
+                                for (int b = 0; b < 128; ++b) {
+                                    if (b % 16 == 0 && b > 0)
+                                        VehLog("\n                              ");
+                                    VehLog(" %02X", mem[b]);
+                                }
+                                VehLog("\n  ASCII: \"");
+                                for (int b = 0; b < 128; ++b) {
+                                    char c = (char)mem[b];
+                                    VehLog("%c", (c >= 32 && c < 127) ? c : '.');
+                                }
+                                VehLog("\"\n");
+                            }
+                        }
                     }
                 }
                 // Safety valve: after 10000 catch-all redirects, stop handling
@@ -2098,57 +2081,54 @@ namespace Patches::FormCaching
 
             // Write crash details to SKSE log directory
             {
-                const char* logPath = g_crashLogPath;
-                FILE* f = nullptr;
-                fopen_s(&f, logPath, "a");
-                if (f) {
-                    // rip, targetAddr, sImgBase already computed above
-                    auto offset = rip - sImgBase;
-                    bool inModule = true; // We already verified RIP is in SkyrimSE.exe
+                // rip, targetAddr, sImgBase already computed above
+                auto offset = rip - sImgBase;
 
-                    fprintf(f, "\n=== SSEEngineFixesForWine CRASH LOG (v1.22.64) ===\n");
-                    fprintf(f, "Exception: 0x%08lX at RIP=0x%llX (SkyrimSE.exe+0x%llX)\n",
-                        code, rip, offset);
-                    fprintf(f, "Target address: 0x%llX\n", (unsigned long long)targetAddr);
-                    fprintf(f, "Registers:\n");
-                    fprintf(f, "  RAX=0x%016llX  RBX=0x%016llX  RCX=0x%016llX  RDX=0x%016llX\n",
-                        pep->ContextRecord->Rax, pep->ContextRecord->Rbx,
-                        pep->ContextRecord->Rcx, pep->ContextRecord->Rdx);
-                    fprintf(f, "  RSI=0x%016llX  RDI=0x%016llX  RBP=0x%016llX  RSP=0x%016llX\n",
-                        pep->ContextRecord->Rsi, pep->ContextRecord->Rdi,
-                        pep->ContextRecord->Rbp, pep->ContextRecord->Rsp);
-                    fprintf(f, "  R8 =0x%016llX  R9 =0x%016llX  R10=0x%016llX  R11=0x%016llX\n",
-                        pep->ContextRecord->R8, pep->ContextRecord->R9,
-                        pep->ContextRecord->R10, pep->ContextRecord->R11);
-                    fprintf(f, "  R12=0x%016llX  R13=0x%016llX  R14=0x%016llX  R15=0x%016llX\n",
-                        pep->ContextRecord->R12, pep->ContextRecord->R13,
-                        pep->ContextRecord->R14, pep->ContextRecord->R15);
-
-                    // Dump bytes at RIP for disassembly
-                    fprintf(f, "Bytes at RIP:");
-                    if (!IsBadReadPtr(ripBytes, 16)) {
-                        for (int i = 0; i < 16; ++i)
-                            fprintf(f, " %02X", ripBytes[i]);
-                    } else {
-                        fprintf(f, " <unreadable>");
-                    }
-                    fprintf(f, "\n");
-
-                    // Stack dump (16 entries)
-                    fprintf(f, "Stack (RSP):");
-                    auto* rspPtr = reinterpret_cast<const DWORD64*>(pep->ContextRecord->Rsp);
-                    if (!IsBadReadPtr(rspPtr, 128)) {
-                        fprintf(f, "\n");
-                        for (int i = 0; i < 16; ++i)
-                            fprintf(f, "  [RSP+0x%02X] = 0x%016llX\n", i * 8, rspPtr[i]);
-                    } else {
-                        fprintf(f, " <unreadable>\n");
-                    }
-
-                    fprintf(f, "=== END CRASH LOG ===\n");
-                    fflush(f);
-                    fclose(f);
+                {
+                    char verBuf[64];
+                    snprintf(verBuf, sizeof(verBuf), "\n=== SSEEngineFixesForWine CRASH LOG (v%zu.%zu.%zu) ===\n",
+                        Version::MAJOR, Version::MINOR, Version::PATCH);
+                    VehLog("%s", verBuf);
                 }
+                VehLog("Exception: 0x%08lX at RIP=0x%llX (SkyrimSE.exe+0x%llX)\n",
+                    code, rip, offset);
+                VehLog("Target address: 0x%llX\n", (unsigned long long)targetAddr);
+                VehLog("Registers:\n");
+                VehLog("  RAX=0x%016llX  RBX=0x%016llX  RCX=0x%016llX  RDX=0x%016llX\n",
+                    pep->ContextRecord->Rax, pep->ContextRecord->Rbx,
+                    pep->ContextRecord->Rcx, pep->ContextRecord->Rdx);
+                VehLog("  RSI=0x%016llX  RDI=0x%016llX  RBP=0x%016llX  RSP=0x%016llX\n",
+                    pep->ContextRecord->Rsi, pep->ContextRecord->Rdi,
+                    pep->ContextRecord->Rbp, pep->ContextRecord->Rsp);
+                VehLog("  R8 =0x%016llX  R9 =0x%016llX  R10=0x%016llX  R11=0x%016llX\n",
+                    pep->ContextRecord->R8, pep->ContextRecord->R9,
+                    pep->ContextRecord->R10, pep->ContextRecord->R11);
+                VehLog("  R12=0x%016llX  R13=0x%016llX  R14=0x%016llX  R15=0x%016llX\n",
+                    pep->ContextRecord->R12, pep->ContextRecord->R13,
+                    pep->ContextRecord->R14, pep->ContextRecord->R15);
+
+                // Dump bytes at RIP for disassembly
+                VehLog("Bytes at RIP:");
+                if (IsReadableMemory(ripBytes, 16)) {
+                    for (int i = 0; i < 16; ++i)
+                        VehLog(" %02X", ripBytes[i]);
+                } else {
+                    VehLog(" <unreadable>");
+                }
+                VehLog("\n");
+
+                // Stack dump (16 entries)
+                VehLog("Stack (RSP):");
+                auto* rspPtr = reinterpret_cast<const DWORD64*>(pep->ContextRecord->Rsp);
+                if (IsReadableMemory(rspPtr, 128)) {
+                    VehLog("\n");
+                    for (int i = 0; i < 16; ++i)
+                        VehLog("  [RSP+0x%02X] = 0x%016llX\n", i * 8, rspPtr[i]);
+                } else {
+                    VehLog(" <unreadable>\n");
+                }
+
+                VehLog("=== END CRASH LOG ===\n");
             }
 
             // Also try to flush spdlog
@@ -2413,13 +2393,13 @@ namespace Patches::FormCaching
         // Cached plugins.txt data (parsed once, reused across idempotent calls)
         inline std::set<std::string> g_enabledNames;   // lowercase enabled plugin names
         inline std::set<std::string> g_disabledNames;  // lowercase disabled plugin names
-        inline bool g_pluginsTxtParsed = false;
-        inline bool g_pluginsTxtLoaded = false;
+        inline std::atomic<bool> g_pluginsTxtParsed{false};
+        inline std::atomic<bool> g_pluginsTxtLoaded{false};
 
         inline void EnsurePluginsTxtLoaded()
         {
-            if (g_pluginsTxtLoaded) return;
-            g_pluginsTxtLoaded = true;
+            if (g_pluginsTxtLoaded.load(std::memory_order_acquire)) return;
+            g_pluginsTxtLoaded.store(true, std::memory_order_release);
 
             WCHAR localAppData[MAX_PATH] = {};
             HRESULT hr = SHGetFolderPathW(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, localAppData);
@@ -2458,13 +2438,13 @@ namespace Patches::FormCaching
                             g_disabledNames.insert(std::move(name));
                         }
                     }
-                    g_pluginsTxtParsed = true;
+                    g_pluginsTxtParsed.store(true, std::memory_order_release);
                 }
             }
             CloseHandle(hFile);
 
             logger::info("ManuallyCompileFiles: plugins.txt parsed={}, {} enabled, {} disabled",
-                g_pluginsTxtParsed, g_enabledNames.size(), g_disabledNames.size());
+                g_pluginsTxtParsed.load(std::memory_order_relaxed), g_enabledNames.size(), g_disabledNames.size());
         }
 
         // Manual compilation: assign compile indices to all enabled files
@@ -2524,7 +2504,7 @@ namespace Patches::FormCaching
 
                 // Determine if this file should be compiled
                 bool shouldCompile;
-                if (g_pluginsTxtParsed) {
+                if (g_pluginsTxtParsed.load(std::memory_order_acquire)) {
                     std::string lowerName(file->fileName);
                     std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(),
                         [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
@@ -3921,81 +3901,15 @@ namespace Patches::FormCaching
                 }
             }
 
-            // ── Patch M: +0x2D0C33 ──────────────────────────────────────
-            // Reading field — mov eax, [rsi+0x94]. RSI is corrupted.
-            // Safe default: xor eax, eax.
-            // Overwrite 6 bytes: 8B 86 94 00 00 00 (exact fit for JMP rel32 + NOP).
-            // Continue at +0x2D0C39.
-            {
-                auto* site = reinterpret_cast<std::uint8_t*>(base + 0x2D0C33);
+            // ── Patch M: REMOVED (v1.22.97) ─────────────────────────────
+            // PatchM previously patched +0x2D0C33 (6 bytes, mov eax,[rsi+0x94]).
+            // It overlapped with PatchR6 which also targets +0x2D0C33 but covers
+            // 12 bytes (both the mov AND the sub eax,[rsi+0x98] at +0x2D0C39).
+            // PatchM ran first and overwrote the bytes, so PatchR6's byte
+            // verification always failed silently. Since R6 is strictly more
+            // comprehensive (validates RSI, executes both loads, skips on invalid),
+            // PatchM is now removed to let R6 apply.
 
-                logger::info("PatchHotSpotM: bytes at +0x2D0C33: "
-                    "{:02X} {:02X} {:02X} {:02X} {:02X} {:02X}",
-                    site[0], site[1], site[2], site[3], site[4], site[5]);
-
-                // Expected: 8B 86 94 00 00 00
-                if (site[0] != 0x8B || site[1] != 0x86 || site[2] != 0x94 ||
-                    site[3] != 0x00 || site[4] != 0x00 || site[5] != 0x00) {
-                    logger::error("PatchHotSpotM: unexpected bytes — NOT patching");
-                } else {
-                    std::uint64_t continueAddr = static_cast<std::uint64_t>(base + 0x2D0C39);
-
-                    auto* cave = static_cast<std::uint8_t*>(trampoline.allocate(48));
-                    int off = 0;
-
-                    // 64-bit validation: high dword == 0 → invalid
-                    // mov r10, rsi
-                    cave[off++] = 0x49; cave[off++] = 0x89; cave[off++] = 0xF2;
-                    // shr r10, 32
-                    cave[off++] = 0x49; cave[off++] = 0xC1; cave[off++] = 0xEA; cave[off++] = 0x20;
-                    // test r10d, r10d
-                    cave[off++] = 0x45; cave[off++] = 0x85; cave[off++] = 0xD2;
-                    // jz .invalid
-                    cave[off++] = 0x74;
-                    int jzInvalidOff = off;
-                    cave[off++] = 0x00;
-
-                    // .valid: original mov eax, [rsi+0x94]
-                    cave[off++] = 0x8B; cave[off++] = 0x86;
-                    cave[off++] = 0x94; cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00;
-                    // jmp [rip+0] → continueAddr
-                    cave[off++] = 0xFF; cave[off++] = 0x25;
-                    cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00;
-                    std::memcpy(&cave[off], &continueAddr, 8); off += 8;
-
-                    // .invalid: xor eax, eax (safe default)
-                    int invalidStart = off;
-                    cave[jzInvalidOff] = static_cast<std::uint8_t>(invalidStart - (jzInvalidOff + 1));
-                    cave[off++] = 0x31; cave[off++] = 0xC0;
-                    // jmp [rip+0] → continueAddr
-                    cave[off++] = 0xFF; cave[off++] = 0x25;
-                    cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00; cave[off++] = 0x00;
-                    std::memcpy(&cave[off], &continueAddr, 8); off += 8;
-
-                    logger::info("PatchHotSpotM: cave {} bytes at 0x{:X}", off,
-                        reinterpret_cast<std::uintptr_t>(cave));
-
-                    // Patch: JMP rel32 (5 bytes) + 1 NOP (overwrite all 6 bytes)
-                    DWORD oldProt;
-                    VirtualProtect(site, 6, PAGE_EXECUTE_READWRITE, &oldProt);
-                    auto jmpTarget = reinterpret_cast<std::intptr_t>(cave);
-                    auto jmpFrom = reinterpret_cast<std::intptr_t>(site + 5);
-                    auto dist = jmpTarget - jmpFrom;
-                    if (dist > INT32_MAX || dist < INT32_MIN) {
-                        logger::error("PatchHotSpotM: JMP too far ({}) — NOT patching", dist);
-                        VirtualProtect(site, 6, oldProt, &oldProt);
-                    } else {
-                        auto rel32 = static_cast<std::int32_t>(dist);
-                        site[0] = 0xE9;
-                        std::memcpy(&site[1], &rel32, 4);
-                        site[5] = 0x90;
-                        FlushInstructionCache(GetCurrentProcess(), site, 6);
-                        RegisterCavePatch(cave, off, static_cast<std::uintptr_t>(continueAddr), "PatchM", site, 6);
-                        logger::info("PatchHotSpotM: +0x2D0C33 patched (rel32={}) verify={:02X}",
-                            rel32, site[0]);
-                    }
-                }
-            }
             // ── Patch N: +0x2D5E15 ──────────────────────────────────────
             // Hash table bucket probe: cmp qword [rcx+8], 0.
             // RCX = rbp + index*16 where rbp may be stale/corrupted (stack addr
@@ -5556,7 +5470,7 @@ namespace Patches::FormCaching
                             auto* entry = entryBase + i * 24;
 
                             if (i % 4096 == 0) {
-                                if (IsBadReadPtr(entry, static_cast<UINT_PTR>(
+                                if (!IsReadableMemory(entry, static_cast<size_t>(
                                     std::min(std::size_t((capacity - i) * 24), std::size_t(4096 * 24)))))
                                     break;
                             }
@@ -5570,7 +5484,7 @@ namespace Patches::FormCaching
                             }
 
                             auto* formObj = reinterpret_cast<const std::uint8_t*>(formPtr);
-                            if (IsBadReadPtr(formObj, 0x20)) {
+                            if (!IsReadableMemory(formObj, 0x20)) {
                                 ++skipCount;
                                 continue;
                             }
@@ -5754,14 +5668,17 @@ namespace Patches::FormCaching
                                 memcpy(page + 0x00, &vtAddr, 8); // vtable at offset 0
                             }
                             // v1.22.94: Write sentinel if available (includes kDeleted bit)
-                            if (g_bstSentinel) {
-                                auto sentAddr = reinterpret_cast<DWORD64>(g_bstSentinel);
-                                memcpy(page + 0x10, &sentAddr, 8);
-                                memcpy(page + 0x28, &sentAddr, 8);
-                                memcpy(page + 0x30, &sentAddr, 8);
-                            } else {
-                                auto flags = static_cast<std::uint32_t>(0x20); // kDeleted
-                                memcpy(page + 0x10, &flags, 4);
+                            {
+                                auto* sent = g_bstSentinel.load(std::memory_order_acquire);
+                                if (sent) {
+                                    auto sentAddr = reinterpret_cast<DWORD64>(sent);
+                                    memcpy(page + 0x10, &sentAddr, 8);
+                                    memcpy(page + 0x28, &sentAddr, 8);
+                                    memcpy(page + 0x30, &sentAddr, 8);
+                                } else {
+                                    auto flags = static_cast<std::uint32_t>(0x20); // kDeleted
+                                    memcpy(page + 0x10, &flags, 4);
+                                }
                             }
                             if (g_stubFuncPage) {
                                 auto stubAddr = reinterpret_cast<DWORD64>(g_stubFuncPage);
@@ -5859,7 +5776,7 @@ namespace Patches::FormCaching
 
                     // v1.22.91: If BST sentinel was already captured (from
                     // GetFormByNumericId during loading), patch g_zeroPage now.
-                    if (g_bstSentinel) {
+                    if (g_bstSentinel.load(std::memory_order_acquire)) {
                         PatchNullPageWithSentinel();
                     }
                 } else {
@@ -5939,6 +5856,8 @@ namespace Patches::FormCaching
                 // v1.22.36: Watchdog thread — logs VEH counters every 10 seconds.
                 // v1.22.46: Also samples main thread RIP when counters are stable
                 // (freeze detection — helps pinpoint infinite loops).
+                // v1.22.97: g_watchdogRunning flag allows clean shutdown.
+                static std::atomic<bool> g_watchdogRunning{true};
                 std::thread([]() {
                     int tick = 0;
                     std::uint64_t prevZp = 0, prevWs = 0, prevCa = 0;
@@ -5948,7 +5867,7 @@ namespace Patches::FormCaching
                     std::uint64_t prevCf = 0, prevEr = 0;
                     auto imgBase = REL::Module::get().base();
 
-                    while (true) {
+                    while (g_watchdogRunning.load(std::memory_order_relaxed)) {
                         Sleep(10000);
                         tick++;
 
@@ -5997,9 +5916,9 @@ namespace Patches::FormCaching
                                 DWORD oldProt;
                                 if (VirtualProtect(site, 1, PAGE_EXECUTE_READWRITE, &oldProt)) {
                                     g_probes[i].origByte = *site;
-                                    *site = 0xCC;  // INT3
-                                    FlushInstructionCache(GetCurrentProcess(), site, 1);
                                     g_probes[i].active.store(true, std::memory_order_release);
+                                    *site = 0xCC;  // INT3 — VEH already recognizes this probe
+                                    FlushInstructionCache(GetCurrentProcess(), site, 1);
                                     installed++;
                                     // Do NOT restore protection (Wine page reversion)
                                 }
@@ -6022,30 +5941,9 @@ namespace Patches::FormCaching
                         // By zeroing the entire page and re-writing only critical fields,
                         // any "next pointer" read returns 0, which existing code cave
                         // null checks catch without VEH involvement.
-                        if (g_zeroPage) {
-                            auto* page = reinterpret_cast<std::uint8_t*>(g_zeroPage);
-                            // Zero entire first 0x500 bytes (covers all form field offsets)
-                            memset(page, 0, 0x500);
-                            // Re-write critical fields
-                            if (g_stubVtable) {
-                                auto vtAddr = reinterpret_cast<DWORD64>(g_stubVtable);
-                                memcpy(page + 0x00, &vtAddr, 8);
-                            }
-                            // v1.22.94: Write sentinel (includes kDeleted bit) not just flags
-                            if (g_bstSentinel) {
-                                auto sentAddr = reinterpret_cast<DWORD64>(g_bstSentinel);
-                                memcpy(page + 0x10, &sentAddr, 8);
-                                memcpy(page + 0x28, &sentAddr, 8);
-                                memcpy(page + 0x30, &sentAddr, 8);
-                            } else {
-                                auto flags = static_cast<std::uint32_t>(0x20); // kDeleted
-                                memcpy(page + 0x10, &flags, 4);
-                            }
-                            if (g_stubFuncPage) {
-                                auto stubAddr = reinterpret_cast<DWORD64>(g_stubFuncPage);
-                                memcpy(page + 0x4B8, &stubAddr, 8);
-                            }
-                        }
+                        // v1.22.97: Use shared RepairSentinel() instead of inline
+                        // duplicate — prevents data race with VEH handler.
+                        RepairSentinel();
 
                         // v1.22.62: Verify code cave patches still have JMP opcode.
                         // Wine may revert file-backed code pages; re-apply if needed.
@@ -6091,7 +5989,7 @@ namespace Patches::FormCaching
                                     }
                                     if (!suspended) fprintf(f, "(unsuspended)");
                                     auto* rspPtr = reinterpret_cast<DWORD64*>(rsp);
-                                    if (!IsBadReadPtr(rspPtr, 64)) {
+                                    if (IsReadableMemory(rspPtr, 64)) {
                                         fprintf(f, " STK=[");
                                         for (int i = 0; i < 8; ++i) {
                                             DWORD64 val = rspPtr[i];
@@ -6165,14 +6063,17 @@ namespace Patches::FormCaching
                 // wrote a 4-byte kDeleted flag here, clobbering the sentinel pointer
                 // that PatchNullPageWithSentinel() had written — causing chain walks
                 // through g_zeroPage to never match sentinel and loop forever.
-                if (g_bstSentinel) {
-                    auto sentAddr = reinterpret_cast<DWORD64>(g_bstSentinel);
-                    std::memcpy(&zpBytes[0x0010], &sentAddr, 8);
-                    std::memcpy(&zpBytes[0x0028], &sentAddr, 8);
-                    std::memcpy(&zpBytes[0x0030], &sentAddr, 8);
-                } else {
-                    auto flags = static_cast<std::uint32_t>(0x20);
-                    std::memcpy(&zpBytes[0x0010], &flags, 4); // kDeleted fallback
+                {
+                    auto* sent = g_bstSentinel.load(std::memory_order_acquire);
+                    if (sent) {
+                        auto sentAddr = reinterpret_cast<DWORD64>(sent);
+                        std::memcpy(&zpBytes[0x0010], &sentAddr, 8);
+                        std::memcpy(&zpBytes[0x0028], &sentAddr, 8);
+                        std::memcpy(&zpBytes[0x0030], &sentAddr, 8);
+                    } else {
+                        auto flags = static_cast<std::uint32_t>(0x20);
+                        std::memcpy(&zpBytes[0x0010], &flags, 4); // kDeleted fallback
+                    }
                 }
                 if (g_stubFuncPage) {
                     auto stubAddr = reinterpret_cast<DWORD64>(g_stubFuncPage);
