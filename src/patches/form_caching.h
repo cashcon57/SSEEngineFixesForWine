@@ -6113,36 +6113,25 @@ namespace Patches::FormCaching
                                 fprintf(f, " RIP=NO_HANDLE");
                             }
 
-                            // v1.22.95: Direct stack scan — works even when
-                            // GetThreadContext fails (Wine err=31). Reads the main
-                            // thread's stack memory directly, scanning for return
-                            // addresses in the game image range. During a freeze
-                            // (tight find loop), the stack frame is stable.
+                            // v1.22.96: Full-stack scan for .text return addresses.
+                            // Previous version narrowed to RSP ± 0x2000, but Wine blocks
+                            // GetThreadContext after 2-3 calls, making RSP stale.
+                            // Now scans full stack and filters to .text section only
+                            // (0x1000-0x174F000) to avoid data/resource false positives.
                             if (g_mainThreadStackBase > 0 && g_mainThreadStackLimit > 0) {
                                 DWORD64 scanLo = g_mainThreadStackLimit;
                                 DWORD64 scanHi = g_mainThreadStackBase;
-                                // If we have a known RSP, scan from there (current frame area)
-                                if (g_mainThreadLastRsp >= scanLo && g_mainThreadLastRsp < scanHi) {
-                                    // Scan 8KB below and above last known RSP
-                                    DWORD64 rspLo = g_mainThreadLastRsp > 0x2000 ?
-                                        g_mainThreadLastRsp - 0x2000 : scanLo;
-                                    if (rspLo < scanLo) rspLo = scanLo;
-                                    DWORD64 rspHi = g_mainThreadLastRsp + 0x2000;
-                                    if (rspHi > scanHi) rspHi = scanHi;
-                                    scanLo = rspLo;
-                                    scanHi = rspHi;
-                                }
+                                // .text section bounds (from PE headers)
+                                DWORD64 textLo = (DWORD64)imgBase + 0x1000;
+                                DWORD64 textHi = (DWORD64)imgBase + 0x174F000;
                                 fprintf(f, " STKSCAN=[");
                                 int found = 0;
-                                for (DWORD64 addr = scanLo; addr + 8 <= scanHi && found < 24; addr += 8) {
-                                    if (!IsBadReadPtr(reinterpret_cast<void*>(addr), 8)) {
-                                        DWORD64 val = *reinterpret_cast<DWORD64*>(addr);
-                                        if (val >= (DWORD64)imgBase &&
-                                            val < (DWORD64)imgBase + 0x4000000) {
-                                            fprintf(f, "+0x%llX ",
-                                                (unsigned long long)(val - imgBase));
-                                            found++;
-                                        }
+                                for (DWORD64 addr = scanLo; addr + 8 <= scanHi && found < 32; addr += 8) {
+                                    DWORD64 val = *reinterpret_cast<DWORD64*>(addr);
+                                    if (val >= textLo && val < textHi) {
+                                        fprintf(f, "+0x%llX ",
+                                            (unsigned long long)(val - (DWORD64)imgBase));
+                                        found++;
                                     }
                                 }
                                 fprintf(f, "]");
