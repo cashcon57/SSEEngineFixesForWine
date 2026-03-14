@@ -42,13 +42,14 @@ namespace Patches::FormCaching
         detail::InitPaths();
         detail::ReplaceFormMapFunctions();
 
+        auto imgBase = REL::Module::get().base();
+
         // v1.22.90: Hook grow_A and grow_B — passthrough + sentinel capture.
         // grow() steals entries (sets next = nullptr), but with NOP'd deallocate
         // the old array stays alive. The null page has sentinel at +0x10/+0x28,
         // so concurrent find() following a stolen null chain reads sentinel →
         // loop exits cleanly. The VEH also has chain-follow detection as backup.
         {
-            auto imgBase = REL::Module::get().base();
             auto* growA = reinterpret_cast<void*>(imgBase + 0x198390);
             auto* growB = reinterpret_cast<void*>(imgBase + 0x198610);
 
@@ -83,6 +84,59 @@ namespace Patches::FormCaching
 
             logger::info("v1.22.90: BSTHashMap::grow hooks installed — "
                 "passthrough + NOP-free + sentinel capture");
+        }
+
+        // v1.22.98: Fix MSVC magic-static deadlock in concurrent reader lock init.
+        // +0xCEE130 is a lazily-initialized 512KB shard array used by the engine's
+        // scalable reader-writer lock. MSVC's thread-safe static init uses
+        // _Init_thread_header/_Init_thread_footer with a guard variable. Under Wine,
+        // the initializing thread can die or deadlock during the init (memset of
+        // 0x80000 bytes + atexit registration), leaving the guard at -1 permanently.
+        // Any thread that then calls this function spins in Sleep(100) forever.
+        //
+        // Fix: NOP the `jg` branch at +0xCEE160 that enters the slow (lock) path.
+        // The static object lives in .bss (zero-initialized by the PE loader), so
+        // the memset(obj, 0, 0x80000) in the init path is redundant. With the jg
+        // NOP'd, the function always returns the pointer to the pre-zeroed object.
+        //
+        // Also zero the guard variable (+0x3257ED8) from -1 to 0 in case a prior
+        // session left it stuck. And explicitly zero the static object (+0x31D7DD0)
+        // to be safe.
+        {
+            auto* jgSite = reinterpret_cast<std::uint8_t*>(imgBase + 0xCEE160);
+            // Verify: 7F 0D (jg +0x0D)
+            if (jgSite[0] == 0x7F && jgSite[1] == 0x0D) {
+                DWORD oldProt = 0;
+                if (VirtualProtect(jgSite, 2, PAGE_EXECUTE_READWRITE, &oldProt)) {
+                    jgSite[0] = 0x90;  // NOP
+                    jgSite[1] = 0x90;  // NOP
+                    FlushInstructionCache(GetCurrentProcess(), jgSite, 2);
+                    logger::info("v1.22.98: NOP'd magic-static jg at +0xCEE160 — bypasses _Init_thread_header deadlock");
+                }
+            } else {
+                logger::warn("v1.22.98: +0xCEE160 bytes are {:02X} {:02X} (expected 7F 0D) — NOT patching",
+                    jgSite[0], jgSite[1]);
+            }
+
+            // Zero the static object (0x80000 bytes at +0x31D7DD0) — replicates
+            // what the init path does, ensuring the shard array is clean.
+            auto* staticObj = reinterpret_cast<std::uint8_t*>(imgBase + 0x31D7DD0);
+            DWORD oldProt2 = 0;
+            if (VirtualProtect(staticObj, 0x80000, PAGE_READWRITE, &oldProt2)) {
+                memset(staticObj, 0, 0x80000);
+                logger::info("v1.22.98: Zeroed static shard array at +0x31D7DD0 (512KB)");
+            }
+
+            // Clear the guard variable (+0x3257ED8) — if a previous session left
+            // it at -1, the NOP'd jg already bypasses it, but clear it anyway so
+            // any other code checking the guard sees a clean state.
+            auto* guard = reinterpret_cast<std::int32_t*>(imgBase + 0x3257ED8);
+            DWORD oldProt3 = 0;
+            if (VirtualProtect(guard, 4, PAGE_READWRITE, &oldProt3)) {
+                // Set to 1 (positive = initialized) rather than 0 (= uninit)
+                *guard = 1;
+                logger::info("v1.22.98: Set magic-static guard at +0x3257ED8 to 1 (initialized)");
+            }
         }
 
         logger::info("installed form caching patch"sv);
